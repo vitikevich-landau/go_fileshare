@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"errors"
+
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/vitikevich-landau/go_fileshare/internal/client"
@@ -23,10 +25,18 @@ func dialCmd(addr string, opts client.Options, prof Profile) tea.Cmd {
 	}
 }
 
-// listRemoteCmd fetches a remote directory listing.
-func listRemoteCmd(c *client.Client, path string) tea.Cmd {
+// listRemote fetches a remote directory listing, holding the client mutex so it
+// cannot race with the event pump or a download.
+func (m *Model) listRemote(path string) tea.Cmd {
 	return func() tea.Msg {
+		m.clientMu.Lock()
+		c := m.client
+		if c == nil {
+			m.clientMu.Unlock()
+			return remoteErrMsg{err: errors.New("not connected")}
+		}
 		clean, entries, err := c.ListDir(path)
+		m.clientMu.Unlock()
 		if err != nil {
 			return remoteErrMsg{err: err}
 		}
@@ -37,4 +47,21 @@ func listRemoteCmd(c *client.Client, path string) tea.Cmd {
 // waitForActivity blocks until the next message arrives on the events channel.
 func waitForActivity(events chan tea.Msg) tea.Cmd {
 	return func() tea.Msg { return <-events }
+}
+
+// isConnLost reports whether err indicates a dropped connection rather than an
+// application-level (server ERROR / AUTH_FAIL) failure.
+func isConnLost(err error) bool {
+	if err == nil {
+		return false
+	}
+	var re *client.RemoteError
+	if errors.As(err, &re) {
+		return false
+	}
+	var ae *client.AuthError
+	if errors.As(err, &ae) {
+		return false
+	}
+	return true
 }

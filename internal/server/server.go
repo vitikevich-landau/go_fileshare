@@ -114,6 +114,7 @@ func (s *Server) Addr() net.Addr { return s.ln.Addr() }
 // Serve runs the accept loop until ctx is cancelled, then drains active
 // connections for up to grace before force-closing them.
 func (s *Server) Serve(ctx context.Context, grace time.Duration) error {
+	s.startWatcher(ctx)
 	go func() {
 		<-ctx.Done()
 		s.ln.Close()

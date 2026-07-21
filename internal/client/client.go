@@ -77,6 +77,12 @@ func Dial(addr string, opts Options) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	return handshake(conn, opts)
+}
+
+// handshake performs HELLO/AUTH over an already-connected socket and returns a
+// ready client. On failure it closes conn.
+func handshake(conn net.Conn, opts Options) (*Client, error) {
 	c := &Client{conn: conn, eventHandler: opts.EventHandler}
 
 	name := opts.ClientName
@@ -237,8 +243,40 @@ func (c *Client) Subscribe(mask uint32) error {
 }
 
 // Ping sends a keepalive. The PONG is absorbed as an async frame by the next
-// recvExpect.
+// recvExpect or PollEvents.
 func (c *Client) Ping() error { return c.writeMsg(proto.Ping{}) }
+
+// PollEvents waits up to timeout for one asynchronous frame (EVENT_*/PONG),
+// routing it to the event handler. It returns whether a frame was received. A
+// timeout is reported as (false, nil). It must not run concurrently with a
+// request method — a single goroutine owns all reads (docs/tz/09-go-port.md §5.8).
+func (c *Client) PollEvents(timeout time.Duration) (bool, error) {
+	_ = c.conn.SetReadDeadline(time.Now().Add(timeout))
+	defer c.conn.SetReadDeadline(time.Time{})
+
+	m, err := c.readMsg()
+	if err != nil {
+		if isTimeout(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if isAsync(m) {
+		if c.eventHandler != nil {
+			c.eventHandler(m)
+		}
+		return true, nil
+	}
+	if e, ok := m.(proto.Error); ok {
+		return false, &RemoteError{Code: e.Code, Message: e.Message}
+	}
+	return false, fmt.Errorf("unexpected frame while idle: %s", m.Type())
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
 
 // Progress is reported during a download.
 type Progress struct {

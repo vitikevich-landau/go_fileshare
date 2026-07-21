@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
@@ -63,10 +64,20 @@ type Model struct {
 	busy     bool
 	link     linkState
 
+	clientMu   sync.Mutex // serializes all client I/O across goroutines
 	client     *client.Client
 	profile    Profile
 	serverName string
 	role       proto.Role
+
+	// reconnect state
+	host             string
+	port             int
+	password         string
+	reconnecting     bool
+	backoff          time.Duration
+	pumpStop         chan struct{}
+	remoteKeepCursor int // >=0 restores the cursor after a live remote refresh
 
 	events   chan tea.Msg
 	quitting bool
@@ -97,12 +108,14 @@ func New(prefill Profile) *Model {
 	pw.Width = 20
 
 	m := &Model{
-		screen:   screenConnect,
-		fields:   []textinput.Model{host, port, login, pw},
-		profiles: LoadProfiles(),
-		prog:     progress.New(progress.WithDefaultGradient()),
-		events:   make(chan tea.Msg, 16),
-		link:     linkDown,
+		screen:           screenConnect,
+		fields:           []textinput.Model{host, port, login, pw},
+		profiles:         LoadProfiles(),
+		prog:             progress.New(progress.WithDefaultGradient()),
+		events:           make(chan tea.Msg, 64),
+		link:             linkDown,
+		backoff:          time.Second,
+		remoteKeepCursor: -1,
 	}
 	if prefill.Name != "" {
 		if pr, ok := m.profiles.Find(prefill.Name); ok {
@@ -156,8 +169,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.onRemoteListing(msg)
 		cmd = m.afterRemoteOp()
 	case remoteErrMsg:
-		m.log(lineErr, "remote: "+msg.err.Error())
-		cmd = m.afterRemoteOp()
+		if isConnLost(msg.err) {
+			cmd = m.beginReconnect(msg.err)
+		} else {
+			m.log(lineErr, "remote: "+msg.err.Error())
+			cmd = m.afterRemoteOp()
+		}
 	case progressMsg:
 		if m.transfer != nil && m.transfer.name == msg.name {
 			m.transfer.received, m.transfer.total = msg.received, msg.total
@@ -168,9 +185,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshLocal(m.localIdx())
 		cmd = m.afterRemoteOp()
 	case downloadErrMsg:
-		m.log(lineErr, fmt.Sprintf("download %s failed: %v", msg.name, msg.err))
 		m.transfer = nil
-		cmd = m.afterRemoteOp()
+		if isConnLost(msg.err) {
+			cmd = m.beginReconnect(msg.err)
+		} else {
+			m.log(lineErr, fmt.Sprintf("download %s failed: %v", msg.name, msg.err))
+			cmd = m.afterRemoteOp()
+		}
+	case eventMsg:
+		cmd = m.onEvent(msg.m)
+	case connLostMsg:
+		cmd = m.beginReconnect(msg.err)
+	case reconnectedMsg:
+		cmd = m.onReconnected(msg)
+	case reconnectFailedMsg:
+		cmd = m.onReconnectFailed(msg)
 	}
 
 	if fromChannel(msg) {
@@ -285,9 +314,13 @@ func (m *Model) doConnect() tea.Cmd {
 	if name == "" {
 		name = host
 	}
+	// Remember connection details for auto-reconnect.
+	m.host, m.port, m.password = host, port, pw
+
 	prof := Profile{Name: name, Host: host, Port: port, Login: login, LastSeen: m.profile.LastSeen, DownloadsDir: m.profile.DownloadsDir}
 	addr := fmt.Sprintf("%s:%d", host, port)
-	return dialCmd(addr, client.Options{Login: login, Password: pw, ClientName: "fshare-commander"}, prof)
+	opts := client.Options{Login: login, Password: pw, ClientName: "fshare-commander", EventHandler: m.eventForwarder()}
+	return dialCmd(addr, opts, prof)
 }
 
 // ---- commander ----
@@ -317,8 +350,10 @@ func (m *Model) onConnected(msg connectedMsg) tea.Cmd {
 	}
 	m.log(lineOK, "connected to "+m.serverName+" as "+m.role.String())
 
+	m.subscribeFS()
+	m.startPump()
 	m.busy = true
-	return listRemoteCmd(m.client, "/")
+	return m.listRemote("/")
 }
 
 func (m *Model) handleCommanderKey(k tea.KeyMsg) tea.Cmd {
@@ -401,7 +436,7 @@ func (m *Model) cdRemote(newPath string) tea.Cmd {
 		return nil
 	}
 	m.busy = true
-	return listRemoteCmd(m.client, newPath)
+	return m.listRemote(newPath)
 }
 
 func (m *Model) cdLocal(idx int, dir string) {
@@ -446,8 +481,15 @@ func (m *Model) onRemoteListing(msg remoteListingMsg) {
 	}
 	p.Path = msg.path
 	p.Label = m.profile.Name + ":" + msg.path
-	p.Cursor, p.Top = 0, 0
+	keep := m.remoteKeepCursor
+	m.remoteKeepCursor = -1
+	if keep < 0 {
+		p.Cursor, p.Top = 0, 0
+	}
 	p.SetEntries(toEntries(msg.entries), msg.path != "/")
+	if keep >= 0 {
+		p.MoveTo(keep, m.panelRows) // preserve cursor across a live refresh
+	}
 }
 
 func (m *Model) afterRemoteOp() tea.Cmd {
@@ -497,14 +539,21 @@ func (m *Model) startNext() {
 	m.busy = true
 	m.transfer = &transferState{name: job.name}
 	m.log(lineInfo, "downloading "+job.name+"…")
-	c := m.client
 	ev := m.events
 	go func() {
+		m.clientMu.Lock()
+		c := m.client
+		if c == nil {
+			m.clientMu.Unlock()
+			ev <- downloadErrMsg{name: job.name, err: errClientClosed}
+			return
+		}
 		var last uint64
 		err := c.Download(job.remote, job.local, func(p client.Progress) {
 			last = p.Total
 			ev <- progressMsg{name: job.name, received: p.Received, total: p.Total}
 		})
+		m.clientMu.Unlock()
 		if err != nil {
 			ev <- downloadErrMsg{name: job.name, err: err}
 			return
@@ -514,12 +563,15 @@ func (m *Model) startNext() {
 }
 
 func (m *Model) quit() tea.Cmd {
+	m.stopPump()
 	if m.client != nil {
 		pr := m.profile
 		pr.LastSeen = time.Now().Unix()
 		m.profiles.Upsert(pr)
 		_ = m.profiles.Save()
+		m.clientMu.Lock()
 		m.client.Close()
+		m.clientMu.Unlock()
 	}
 	m.quitting = true
 	return tea.Quit

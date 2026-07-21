@@ -67,11 +67,22 @@ type downloadErrMsg struct {
 	err  error
 }
 
+// eventMsg carries an async EVENT_*/PONG frame from the connection pump.
+type eventMsg struct{ m proto.Message }
+
+// connLostMsg is posted by the pump when the connection drops.
+type connLostMsg struct{ err error }
+
+// reconnectedMsg / reconnectFailedMsg are results of a reconnect attempt (Cmd,
+// not channel-sourced).
+type reconnectedMsg struct{ client *client.Client }
+type reconnectFailedMsg struct{ err error }
+
 // fromChannel reports whether a message arrives via the events channel and thus
 // requires re-arming the listener.
 func fromChannel(msg tea.Msg) bool {
 	switch msg.(type) {
-	case progressMsg, downloadDoneMsg, downloadErrMsg:
+	case progressMsg, downloadDoneMsg, downloadErrMsg, eventMsg, connLostMsg:
 		return true
 	}
 	return false
