@@ -116,6 +116,19 @@ func (db *DB) SetPassword(login, password string, iters int) error {
 	return nil
 }
 
+// SetEnabled toggles a user's enabled flag. It errors if the user is absent.
+func (db *DB) SetEnabled(login string, enabled bool) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	r, ok := db.byLogin[login]
+	if !ok {
+		return ErrNoSuchUser
+	}
+	r.Enabled = enabled
+	db.byLogin[login] = r
+	return nil
+}
+
 // Save atomically writes the DB to its file (temp + rename).
 func (db *DB) Save() error {
 	db.mu.RLock()
