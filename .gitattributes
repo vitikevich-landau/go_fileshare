@@ -1,0 +1,12 @@
+# Normalize line endings: source/text files use LF in the repo
+* text=auto eol=lf
+*.go text eol=lf
+*.md text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+*.json text eol=lf
+Dockerfile text eol=lf
+
+# Binary
+*.exe binary
+*.cache binary

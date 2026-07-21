@@ -1,0 +1,30 @@
+# Binaries
+/bin/
+*.exe
+*.exe~
+fshare-daemon
+fshare-commander
+fshare-daemon.exe
+fshare-commander.exe
+
+# Test / build artifacts
+*.test
+*.out
+coverage.*
+
+# Runtime data (server)
+/data/
+*.cache
+checksums.cache
+users.json
+config.json
+
+# Client runtime
+profiles.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
