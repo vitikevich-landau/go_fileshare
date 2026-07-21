@@ -15,6 +15,7 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/auth"
 	"github.com/vitikevich-landau/go_fileshare/internal/config"
 	"github.com/vitikevich-landau/go_fileshare/internal/proto"
+	"github.com/vitikevich-landau/go_fileshare/internal/ratelimit"
 	"github.com/vitikevich-landau/go_fileshare/internal/vfs"
 )
 
@@ -27,6 +28,9 @@ type Options struct {
 	Logger     *slog.Logger
 	ServerName string
 	Version    string
+	// ConfigPath, when set, is where accepted ADMIN_SET/reload changes are
+	// persisted atomically so they survive a restart.
+	ConfigPath string
 	// AuthFailDelay is slept after each failed authentication to slow brute
 	// force (docs/tz/06-security.md §3). Tests set 0.
 	AuthFailDelay time.Duration
@@ -43,9 +47,14 @@ type Server struct {
 	version       string
 	start         time.Time
 	authFailDelay time.Duration
+	configPath    string
+	limiter       *ratelimit.Limiter
 
 	reg *Registry
 	ln  net.Listener
+
+	serveCancel context.CancelFunc // cancels the accept loop (ADMIN_SHUTDOWN)
+	adminGrace  atomic.Int64       // seconds; overrides drain grace when > 0
 
 	connWg      sync.WaitGroup
 	activeConns atomic.Int64
@@ -72,7 +81,7 @@ func New(opts Options) *Server {
 	if version == "" {
 		version = "go-2.0"
 	}
-	return &Server{
+	s := &Server{
 		hub:           opts.Hub,
 		vfs:           opts.VFS,
 		users:         opts.Users,
@@ -82,8 +91,26 @@ func New(opts Options) *Server {
 		version:       version,
 		start:         time.Now(),
 		authFailDelay: opts.AuthFailDelay,
+		configPath:    opts.ConfigPath,
+		limiter:       ratelimit.New(),
 		reg:           NewRegistry(),
 	}
+	s.adminGrace.Store(-1) // -1 = no admin shutdown requested
+	// Persist accepted hot-config changes and notify subscribers.
+	opts.Hub.SetOnChange(s.onConfigChange)
+	return s
+}
+
+// onConfigChange persists the current snapshot (if a config path is set) and
+// broadcasts EVENT_CONFIG to admin subscribers (docs/tz/09-go-port.md §5.4).
+func (s *Server) onConfigChange(key, value string) {
+	if s.configPath != "" {
+		if err := s.hub.Current().Save(s.configPath); err != nil {
+			s.log.Error("failed to persist config change", "key", key, "err", err)
+		}
+	}
+	frame := proto.Encode(proto.EventConfig{Key: key, NewValue: value})
+	s.reg.broadcast(proto.SubConfig, frame)
 }
 
 // Registry exposes the session registry (used by the watcher/admin layers).
@@ -114,6 +141,10 @@ func (s *Server) Addr() net.Addr { return s.ln.Addr() }
 // Serve runs the accept loop until ctx is cancelled, then drains active
 // connections for up to grace before force-closing them.
 func (s *Server) Serve(ctx context.Context, grace time.Duration) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	s.serveCancel = cancel
+
 	s.startWatcher(ctx)
 	go func() {
 		<-ctx.Done()
@@ -145,7 +176,19 @@ func (s *Server) Serve(ctx context.Context, grace time.Duration) error {
 			s.handleConn(c)
 		}(conn)
 	}
+	if g := s.adminGrace.Load(); g >= 0 {
+		grace = time.Duration(g) * time.Second
+	}
 	return s.drain(grace)
+}
+
+// requestShutdown triggers a graceful shutdown with the given grace period
+// (ADMIN_SHUTDOWN). It is safe to call once.
+func (s *Server) requestShutdown(graceSeconds uint32) {
+	s.adminGrace.Store(int64(graceSeconds))
+	if s.serveCancel != nil {
+		s.serveCancel()
+	}
 }
 
 func (s *Server) rejectConn(conn net.Conn) {

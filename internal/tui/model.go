@@ -64,6 +64,18 @@ type Model struct {
 	busy     bool
 	link     linkState
 
+	// admin panel (F9)
+	admin        bool
+	adminTab     int
+	adminStats   proto.AdminStatsResponse
+	adminClients []proto.ClientInfo
+	adminConfig  []configKey
+	adminCursor  int
+	adminEditing bool
+	adminInput   textinput.Model
+	adminEditKey string
+	adminMsg     string
+
 	clientMu   sync.Mutex // serializes all client I/O across goroutines
 	client     *client.Client
 	profile    Profile
@@ -200,6 +212,43 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd = m.onReconnected(msg)
 	case reconnectFailedMsg:
 		cmd = m.onReconnectFailed(msg)
+	case adminStatsMsg:
+		if msg.err != nil {
+			cmd = m.adminErr(msg.err)
+		} else {
+			m.adminStats = msg.stats
+		}
+	case adminClientsMsg:
+		if msg.err != nil {
+			cmd = m.adminErr(msg.err)
+		} else {
+			m.adminClients = msg.clients
+			if m.adminCursor >= len(m.adminClients) {
+				m.adminCursor = 0
+			}
+		}
+	case adminConfigMsg:
+		if msg.err != nil {
+			cmd = m.adminErr(msg.err)
+		} else {
+			m.adminConfig = msg.rows
+		}
+	case adminSetResultMsg:
+		if msg.err != nil {
+			cmd = m.adminErr(msg.err)
+		} else if msg.ok {
+			m.adminMsg = "applied: " + msg.key
+			cmd = m.adminConfigCmd()
+		} else {
+			m.adminMsg = "rejected: " + msg.msg
+		}
+	case adminKickResultMsg:
+		if msg.err != nil {
+			cmd = m.adminErr(msg.err)
+		} else {
+			m.adminMsg = msg.msg
+			cmd = m.adminClientsCmd()
+		}
 	}
 
 	if fromChannel(msg) {
@@ -211,6 +260,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) handleKey(k tea.KeyMsg) tea.Cmd {
 	if m.screen == screenConnect {
 		return m.handleConnectKey(k)
+	}
+	if m.admin {
+		return m.handleAdminKey(k)
 	}
 	return m.handleCommanderKey(k)
 }
@@ -392,6 +444,8 @@ func (m *Model) handleCommanderKey(k tea.KeyMsg) tea.Cmd {
 	case "ctrl+n":
 		m.activePanel().MarkAllSeen(time.Now().Unix())
 		m.log(lineInfo, "marked all as seen")
+	case "f9":
+		return m.openAdmin()
 	case "f1":
 		m.log(lineInfo, helpText)
 	}

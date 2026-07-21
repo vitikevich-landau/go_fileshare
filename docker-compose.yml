@@ -1,0 +1,12 @@
+services:
+  fshare:
+    build: .
+    image: go_fileshare
+    ports:
+      - "5555:5555"
+    volumes:
+      # ./data must contain a share/ directory to serve; config.json and
+      # users.json are optional (defaults + no-auth bootstrap are used if absent).
+      - ./data:/data
+    restart: unless-stopped
+    stop_grace_period: 90s # >= the daemon's graceful drain window

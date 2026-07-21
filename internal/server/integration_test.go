@@ -49,6 +49,11 @@ func makeFile(t *testing.T, path string, size int) []byte {
 
 // newEnv builds a share tree and starts a server on an ephemeral port.
 func newEnv(t *testing.T, configure func(*config.Settings)) *env {
+	return newEnvWithConfig(t, "", configure)
+}
+
+// newEnvWithConfig is newEnv with a config path so ADMIN_SET changes persist.
+func newEnvWithConfig(t *testing.T, configPath string, configure func(*config.Settings)) *env {
 	t.Helper()
 	share := t.TempDir()
 	makeFile(t, filepath.Join(share, "a.txt"), 5)
@@ -81,6 +86,7 @@ func newEnv(t *testing.T, configure func(*config.Settings)) *env {
 	srv := server.New(server.Options{
 		Hub: hub, VFS: v, Users: users, Guard: guard,
 		Logger: quietLogger(), ServerName: "test", AuthFailDelay: 0,
+		ConfigPath: configPath,
 	})
 	if err := srv.Listen("127.0.0.1:0"); err != nil {
 		t.Fatal(err)

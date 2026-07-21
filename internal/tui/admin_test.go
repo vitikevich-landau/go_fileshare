@@ -1,0 +1,97 @@
+package tui
+
+import (
+	"strings"
+	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/vitikevich-landau/go_fileshare/internal/proto"
+)
+
+func TestOpenAdminRequiresAdminRole(t *testing.T) {
+	m := New(Profile{})
+	m.role = proto.RoleUser
+	if cmd := m.openAdmin(); cmd != nil || m.admin {
+		t.Fatal("non-admin should not open the admin panel")
+	}
+	if !strings.Contains(strings.Join(logTexts(m.opLog), " "), "insufficient permissions") {
+		t.Fatal("expected an insufficient-permissions log line")
+	}
+
+	m2 := New(Profile{})
+	m2.role = proto.RoleAdmin
+	if cmd := m2.openAdmin(); cmd == nil || !m2.admin {
+		t.Fatal("admin should open the panel and load data")
+	}
+}
+
+func TestAdminSettingsEditHotVsRestart(t *testing.T) {
+	m := New(Profile{})
+	m.role = proto.RoleAdmin
+	m.admin = true
+	m.adminTab = adminTabSettings
+	m.adminConfig = []configKey{
+		{Key: "server.port", Value: "5555", Hot: false},
+		{Key: "limits.global_bps", Value: "0", Hot: true},
+	}
+
+	// Restart-only row cannot be edited.
+	m.adminCursor = 0
+	if cmd := m.startEditSetting(); cmd != nil || m.adminEditing {
+		t.Fatal("restart-only key must not enter edit mode")
+	}
+	if !strings.Contains(m.adminMsg, "restart-only") {
+		t.Fatalf("expected restart-only message, got %q", m.adminMsg)
+	}
+
+	// Hot row enters edit mode prefilled with the current value.
+	m.adminCursor = 1
+	if cmd := m.startEditSetting(); cmd == nil || !m.adminEditing {
+		t.Fatal("hot key should enter edit mode")
+	}
+	if m.adminEditKey != "limits.global_bps" || m.adminInput.Value() != "0" {
+		t.Fatalf("edit state = key %q value %q", m.adminEditKey, m.adminInput.Value())
+	}
+}
+
+func TestAdminSetResultRefreshesAndReports(t *testing.T) {
+	m := New(Profile{})
+	m.role = proto.RoleAdmin
+	m.admin = true
+
+	// A rejected set reports the message and does not refresh.
+	m.Update(adminSetResultMsg{key: "server.port", ok: false, msg: "restart-only"})
+	if !strings.Contains(m.adminMsg, "rejected") {
+		t.Fatalf("expected rejected message, got %q", m.adminMsg)
+	}
+}
+
+func TestViewAdminRenders(t *testing.T) {
+	m := New(Profile{})
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.role = proto.RoleAdmin
+	m.admin = true
+	m.serverName = "vps"
+	m.adminStats = proto.AdminStatsResponse{UptimeS: 3600, Version: "go-2.0", ActiveConns: 3, PerClientBps: 5_000_000}
+	m.adminClients = []proto.ClientInfo{{SessionID: 1, Login: "vit", IP: "10.0.0.2", Role: proto.RoleAdmin, BytesSent: 1024}}
+	m.adminConfig = []configKey{{Key: "limits.global_bps", Value: "0", Hot: true}}
+
+	// Overview
+	out := m.viewAdmin()
+	for _, want := range []string{"ADMIN: vps", "Overview", "go-2.0", "unlimited"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("overview missing %q", want)
+		}
+	}
+	// Clients tab
+	m.adminTab = adminTabClients
+	if !strings.Contains(m.viewAdmin(), "vit") {
+		t.Error("clients tab missing session login")
+	}
+	// Settings tab
+	m.adminTab = adminTabSettings
+	if s := m.viewAdmin(); !strings.Contains(s, "limits.global_bps") || !strings.Contains(s, "[hot]") {
+		t.Error("settings tab missing config row")
+	}
+}

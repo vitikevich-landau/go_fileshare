@@ -397,6 +397,83 @@ func (c *Client) Cancel(transferID uint32) error {
 	return c.writeMsg(proto.DownloadCancel{TransferID: transferID})
 }
 
+// ---- admin channel (role=admin) ----
+
+// AdminGetConfig returns the effective config as JSON ([]config.KeyInfo).
+func (c *Client) AdminGetConfig() ([]byte, error) {
+	if err := c.writeMsg(proto.AdminGetConfig{}); err != nil {
+		return nil, err
+	}
+	m, err := c.recvExpect(proto.MsgAdminConfig)
+	if err != nil {
+		return nil, err
+	}
+	return m.(proto.AdminConfig).JSON, nil
+}
+
+// AdminSet changes one hot config key. It returns the server's ok flag and message.
+func (c *Client) AdminSet(key, value string) (bool, string, error) {
+	if err := c.writeMsg(proto.AdminSet{Key: key, Value: value}); err != nil {
+		return false, "", err
+	}
+	m, err := c.recvExpect(proto.MsgAdminSetResult)
+	if err != nil {
+		return false, "", err
+	}
+	r := m.(proto.AdminSetResult)
+	return r.OK, r.Message, nil
+}
+
+// AdminListClients returns the connected sessions.
+func (c *Client) AdminListClients() ([]proto.ClientInfo, error) {
+	if err := c.writeMsg(proto.AdminListClients{}); err != nil {
+		return nil, err
+	}
+	m, err := c.recvExpect(proto.MsgAdminClients)
+	if err != nil {
+		return nil, err
+	}
+	return m.(proto.AdminClients).Clients, nil
+}
+
+// AdminKick disconnects a session by id.
+func (c *Client) AdminKick(sessionID uint64) (bool, string, error) {
+	if err := c.writeMsg(proto.AdminKick{SessionID: sessionID}); err != nil {
+		return false, "", err
+	}
+	m, err := c.recvExpect(proto.MsgAdminKickResult)
+	if err != nil {
+		return false, "", err
+	}
+	r := m.(proto.AdminKickResult)
+	return r.OK, r.Message, nil
+}
+
+// AdminStats returns server statistics.
+func (c *Client) AdminStats() (proto.AdminStatsResponse, error) {
+	if err := c.writeMsg(proto.AdminStats{}); err != nil {
+		return proto.AdminStatsResponse{}, err
+	}
+	m, err := c.recvExpect(proto.MsgAdminStatsResp)
+	if err != nil {
+		return proto.AdminStatsResponse{}, err
+	}
+	return m.(proto.AdminStatsResponse), nil
+}
+
+// AdminShutdown requests a graceful shutdown with the given grace period.
+func (c *Client) AdminShutdown(graceSeconds uint32) (bool, string, error) {
+	if err := c.writeMsg(proto.AdminShutdown{GraceSeconds: graceSeconds}); err != nil {
+		return false, "", err
+	}
+	m, err := c.recvExpect(proto.MsgAdminShutdownResult)
+	if err != nil {
+		return false, "", err
+	}
+	r := m.(proto.AdminShutdownResult)
+	return r.OK, r.Message, nil
+}
+
 // Interrupt unblocks a read in progress from another goroutine (e.g. to quit
 // the TUI mid-download) by setting an immediate read deadline.
 func (c *Client) Interrupt() {

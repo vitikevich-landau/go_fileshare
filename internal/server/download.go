@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"io"
 	"os"
 
@@ -42,12 +43,25 @@ func (s *Server) startDownload(sess *Session, req proto.DownloadRequest) {
 		defer f.Close()
 		defer sess.downloading.Store(false)
 		defer sess.clearCurPath() // clear even if checksum/read errors (bug #2)
+
+		// A context that cancels when the transfer is cancelled or the session
+		// is torn down, so a rate-limit wait cannot block teardown.
+		ctx, ctxCancel := context.WithCancel(context.Background())
+		defer ctxCancel()
+		go func() {
+			select {
+			case <-cancel:
+			case <-sess.done:
+			}
+			ctxCancel()
+		}()
+
 		sess.setCurPath(req.Path) // set before ACCEPT so drain sees an active transfer (bug #5)
-		s.streamFile(sess, f, req, tid, total, cancel)
+		s.streamFile(ctx, sess, f, req, tid, total, cancel)
 	}()
 }
 
-func (s *Server) streamFile(sess *Session, f *os.File, req proto.DownloadRequest, tid uint32, total uint64, cancel chan struct{}) {
+func (s *Server) streamFile(ctx context.Context, sess *Session, f *os.File, req proto.DownloadRequest, tid uint32, total uint64, cancel chan struct{}) {
 	if req.Offset > 0 {
 		if _, err := f.Seek(int64(req.Offset), io.SeekStart); err != nil {
 			s.sendErr(sess, proto.ErrInternal)
@@ -58,6 +72,7 @@ func (s *Server) streamFile(sess *Session, f *os.File, req proto.DownloadRequest
 		return
 	}
 
+	clientKey := sess.Login()
 	buf := make([]byte, proto.ChunkSize)
 	sent := req.Offset
 	for sent < total {
@@ -70,6 +85,12 @@ func (s *Server) streamFile(sess *Session, f *os.File, req proto.DownloadRequest
 		}
 		n, err := f.Read(buf)
 		if n > 0 {
+			// Rate-limit against the CURRENT limits so a live config change
+			// throttles this active transfer (docs/tz/09-go-port.md §5.6).
+			lim := s.hub.Current().Limits
+			if werr := s.limiter.Wait(ctx, clientKey, lim.PerClientBps, lim.GlobalBps, n); werr != nil {
+				return // cancelled or torn down
+			}
 			// proto.Encode copies buf into a fresh frame, so reusing buf is safe.
 			if !sess.sendMsg(proto.ChunkData{TransferID: tid, Data: buf[:n]}) {
 				return

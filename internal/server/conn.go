@@ -189,9 +189,11 @@ func (s *Server) dispatch(sess *Session, m proto.Message) {
 		s.startDownload(sess, req)
 	case proto.DownloadCancel:
 		sess.cancelDownload()
+	case proto.AdminGetConfig, proto.AdminSet, proto.AdminListClients,
+		proto.AdminKick, proto.AdminStats, proto.AdminShutdown:
+		s.handleAdmin(sess, m)
 	default:
-		// Admin messages are handled in M11; anything else from a client is a
-		// protocol violation.
+		// Anything else from a client is a protocol violation.
 		sess.sendMsg(proto.Error{Code: proto.ErrBadRequest, Message: "unexpected message"})
 	}
 }

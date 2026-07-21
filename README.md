@@ -24,8 +24,49 @@ for them.
 
 ## Status
 
-🚧 Work in progress — implemented milestone by milestone. See the git log and
-[`docs/tz/08-roadmap.md`](docs/tz/08-roadmap.md).
+**v2.0 complete — milestones M7–M11 implemented** (see [`docs/tz/08-roadmap.md`](docs/tz/08-roadmap.md)):
+
+- **M7** — byte-exact wire protocol + `os.Root`-confined VFS
+- **M8** — SCRAM-like challenge/response auth, sessions, downloads with resume
+- **M9** — Bubble Tea Midnight-Commander-style TUI client
+- **M10** — live `EVENT_FS` (fsnotify), heartbeats, auto-reconnect
+- **M11** — live rate limiting + admin channel (config/kick/stats/shutdown) + admin panel (F9)
+
+M12–M14 (multi-user/quotas, upload, TLS) are future work. Every package ships
+tests run under `go test -race`.
+
+## Quickstart
+
+```bash
+# 1. Build
+go build -o bin/ ./cmd/fshare-daemon ./cmd/fshare-commander
+
+# 2. Run the daemon over a directory (no users.json => any login is admin)
+./bin/fshare-daemon --port 5555 --share-root ./some/dir
+
+# 3a. Interactive TUI client
+./bin/fshare-commander --host 127.0.0.1 --port 5555
+
+# 3b. Or scripted
+./bin/fshare-commander --batch --port 5555 --list /
+./bin/fshare-commander --batch --port 5555 --get /file.bin --out ./file.bin
+```
+
+Add users (challenge/response auth) with:
+
+```bash
+./bin/fshare-daemon --config config.json --add-user vit --role admin   # prompts for a password
+```
+
+## Docker
+
+```bash
+mkdir -p data/share && cp somefiles/* data/share/
+docker compose up --build           # serves ./data/share on :5555
+```
+
+The image is a static `scratch` build (`CGO_ENABLED=0`); `stop_grace_period`
+matches the daemon's graceful drain.
 
 ## Layout
 

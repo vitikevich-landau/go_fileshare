@@ -33,12 +33,17 @@ func (m *Model) eventForwarder() func(proto.Message) {
 	}
 }
 
-// subscribeFS subscribes to filesystem events on the current client.
+// subscribeFS subscribes to events on the current client: filesystem events for
+// everyone, plus config/notice streams for admins (for the admin log).
 func (m *Model) subscribeFS() {
+	mask := proto.SubFS
+	if m.role == proto.RoleAdmin {
+		mask |= proto.SubConfig | proto.SubNotice
+	}
 	m.clientMu.Lock()
 	c := m.client
 	if c != nil {
-		_ = c.Subscribe(proto.SubFS)
+		_ = c.Subscribe(mask)
 	}
 	m.clientMu.Unlock()
 }
@@ -115,6 +120,7 @@ func (m *Model) onEvent(pm proto.Message) tea.Cmd {
 		m.log(lineInfo, "notice: "+e.Text)
 	case proto.EventConfig:
 		m.log(lineInfo, fmt.Sprintf("config: %s = %s", e.Key, e.NewValue))
+		m.onAdminConfigEvent(e) // live-update the settings tab if open
 	}
 	return nil
 }

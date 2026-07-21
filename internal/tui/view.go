@@ -19,6 +19,9 @@ func (m *Model) View() string {
 	if m.screen == screenConnect {
 		return m.viewConnect()
 	}
+	if m.admin {
+		return m.viewAdmin()
+	}
 	return m.viewCommander()
 }
 
