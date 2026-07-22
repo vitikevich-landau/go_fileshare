@@ -50,11 +50,12 @@ func (s *Server) startDownload(sess *Session, req proto.DownloadRequest) {
 		ctx, ctxCancel := context.WithCancel(context.Background())
 		defer ctxCancel()
 		go func() {
-			// ctx.Done() is included so this watcher exits when the transfer
-			// finishes normally (outer defer ctxCancel), not just on cancel/
-			// teardown — otherwise it would leak one goroutine per download.
+			// The rate-limit ctx is cancelled only on teardown (not on a client
+			// cancel): a cancel is handled by the stream loop so it can send the
+			// terminal CANCELLED error and keep the connection in sync (RR-3).
+			// ctx.Done() also lets this watcher exit on normal completion, so it
+			// never leaks a goroutine.
 			select {
-			case <-cancel:
 			case <-sess.done:
 			case <-ctx.Done():
 			}
@@ -83,6 +84,9 @@ func (s *Server) streamFile(ctx context.Context, sess *Session, f *os.File, req 
 	for sent < total {
 		select {
 		case <-cancel:
+			// Client asked to cancel: send a defined terminal frame after the
+			// chunks already queued, so the client's loop ends in sync (RR-3).
+			s.sendErr(sess, proto.ErrCancelled)
 			return
 		case <-sess.done:
 			return

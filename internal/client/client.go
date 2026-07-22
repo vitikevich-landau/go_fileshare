@@ -5,6 +5,7 @@
 package client
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -313,11 +314,17 @@ type Progress struct {
 	Total    uint64
 }
 
-// Download fetches remotePath into localPath, resuming from localPath+".part"
+// Download is DownloadCtx with a background context (no cancellation).
+func (c *Client) Download(remotePath, localPath string, progress func(Progress)) error {
+	return c.DownloadCtx(context.Background(), remotePath, localPath, progress)
+}
+
+// DownloadCtx fetches remotePath into localPath, resuming from localPath+".part"
 // if present. On completion it verifies the reassembled file against the
 // server's whole-file checksum and atomically renames the .part into place.
-// progress may be nil.
-func (c *Client) Download(remotePath, localPath string, progress func(Progress)) error {
+// progress may be nil. Cancelling ctx sends DOWNLOAD_CANCEL and drains to the
+// server's terminal frame (so the connection stays usable), returning ctx.Err().
+func (c *Client) DownloadCtx(ctx context.Context, remotePath, localPath string, progress func(Progress)) error {
 	partPath := localPath + ".part"
 
 	var offset uint64
@@ -338,13 +345,25 @@ func (c *Client) Download(remotePath, localPath string, progress func(Progress))
 		var re *RemoteError
 		if offset > 0 && errors.As(err, &re) && re.Code == proto.ErrUnsupportedOffset {
 			os.Remove(partPath)
-			return c.Download(remotePath, localPath, progress)
+			return c.DownloadCtx(ctx, remotePath, localPath, progress)
 		}
 		return err
 	}
 	accept := m.(proto.DownloadAccept)
 	total := accept.TotalSize
 	tid := accept.TransferID
+
+	// Once ctx is cancelled, ask the server to abort. We keep reading until its
+	// terminal frame so the connection stays in sync (RR-3).
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = c.Cancel(tid)
+		case <-watchDone:
+		}
+	}()
 
 	flag := os.O_CREATE | os.O_WRONLY
 	if offset > 0 {
@@ -422,6 +441,12 @@ func (c *Client) Download(remotePath, localPath string, progress func(Progress))
 			return nil
 		case proto.Error:
 			pf.Close()
+			// If we asked to cancel, this ERROR is the server's terminal
+			// acknowledgement; the connection is now in sync. Report the
+			// cancellation, not a generic remote error.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return &RemoteError{Code: v.Code, Message: v.Message}
 		default:
 			if isAsync(msg) {

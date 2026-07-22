@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -60,6 +62,7 @@ type Model struct {
 	opLog    []logLine
 	prog     progress.Model
 	transfer *transferState
+	dlCancel context.CancelFunc // cancels the active download (Esc)
 	queue    []downloadJob
 	busy     bool
 	link     linkState
@@ -194,13 +197,19 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case downloadDoneMsg:
 		m.log(lineOK, fmt.Sprintf("downloaded %s (%s)", msg.name, formatSize(msg.bytes)))
 		m.transfer = nil
+		m.dlCancel = nil
 		m.refreshLocal(m.localIdx())
 		cmd = m.afterRemoteOp()
 	case downloadErrMsg:
 		m.transfer = nil
-		if isConnLost(msg.err) {
+		m.dlCancel = nil
+		switch {
+		case errors.Is(msg.err, context.Canceled):
+			m.log(lineInfo, "download cancelled: "+msg.name)
+			cmd = m.afterRemoteOp()
+		case isConnLost(msg.err):
 			cmd = m.beginReconnect(msg.err)
-		} else {
+		default:
 			m.log(lineErr, fmt.Sprintf("download %s failed: %v", msg.name, msg.err))
 			cmd = m.afterRemoteOp()
 		}
@@ -446,6 +455,11 @@ func (m *Model) handleCommanderKey(k tea.KeyMsg) tea.Cmd {
 		m.log(lineInfo, "marked all as seen")
 	case "f9":
 		return m.openAdmin()
+	case "esc":
+		if m.transfer != nil && m.dlCancel != nil {
+			m.dlCancel()
+			m.log(lineInfo, "cancelling "+m.transfer.name+"…")
+		}
 	case "f1":
 		m.log(lineInfo, helpText)
 	}
@@ -586,15 +600,19 @@ func (m *Model) startNext() {
 	if len(m.queue) == 0 {
 		m.busy = false
 		m.transfer = nil
+		m.dlCancel = nil
 		return
 	}
 	job := m.queue[0]
 	m.queue = m.queue[1:]
 	m.busy = true
 	m.transfer = &transferState{name: job.name}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.dlCancel = cancel
 	m.log(lineInfo, "downloading "+job.name+"…")
 	ev := m.events
 	go func() {
+		defer cancel() // release the context on any exit
 		m.clientMu.Lock()
 		c := m.client
 		if c == nil {
@@ -603,7 +621,7 @@ func (m *Model) startNext() {
 			return
 		}
 		var last uint64
-		err := c.Download(job.remote, job.local, func(p client.Progress) {
+		err := c.DownloadCtx(ctx, job.remote, job.local, func(p client.Progress) {
 			last = p.Total
 			// Non-blocking: never stall while holding clientMu even if the UI
 			// loop is momentarily not draining (a dropped progress tick is
