@@ -2,7 +2,8 @@
 
 Дата ревью: 2026-07-22  
 Ветка для последующей работы: `codex/code-review-findings`  
-Статус: замечания зафиксированы, исправления ещё не вносились.
+Статус: **все замечания CR-01…CR-10 исправлены** (по одному коммиту на пункт,
+с регрессионными тестами; полный прогон `go test -race ./...` зелёный).
 
 ## Область проверки
 
@@ -33,16 +34,16 @@ go build ./...
 
 | ID | Приоритет | Область | Краткое описание | Статус |
 |---|---|---|---|---|
-| CR-01 | P1 | Git/build | `cmd/` целиком игнорируется Git | Open |
-| CR-02 | P1 | Download | Клиент принимает неполный или непроверенный файл | Open |
-| CR-03 | P1 | Download/server | Idle timeout обрывает долгие активные загрузки | Open |
-| CR-04 | P1 | Client/auth | Сервер управляет PBKDF2 cost без лимита; handshake без deadline | Open |
-| CR-05 | P1 | Protocol/server | До аутентификации можно удерживать около 800 MiB payload-буферов | Open |
-| CR-06 | P2 | Auth/session | `MaxSessionsPerUser` обходится конкурентными handshake | Open |
-| CR-07 | P2 | Events/authz | Обычный пользователь может подписаться на admin config events | Open |
-| CR-08 | P2 | Config/logging | Hot change `log.level` не меняет реальный logger | Open |
-| CR-09 | P2 | VFS/checksum | Cache может вернуть устаревший SHA-256 | Open |
-| CR-10 | P2 | Protocol/listing | Большой каталог создаёт ответ больше `MaxControlPayload` | Open |
+| CR-01 | P1 | Git/build | `cmd/` целиком игнорируется Git | Fixed |
+| CR-02 | P1 | Download | Клиент принимает неполный или непроверенный файл | Fixed |
+| CR-03 | P1 | Download/server | Idle timeout обрывает долгие активные загрузки | Fixed |
+| CR-04 | P1 | Client/auth | Сервер управляет PBKDF2 cost без лимита; handshake без deadline | Fixed |
+| CR-05 | P1 | Protocol/server | До аутентификации можно удерживать около 800 MiB payload-буферов | Fixed |
+| CR-06 | P2 | Auth/session | `MaxSessionsPerUser` обходится конкурентными handshake | Fixed |
+| CR-07 | P2 | Events/authz | Обычный пользователь может подписаться на admin config events | Fixed |
+| CR-08 | P2 | Config/logging | Hot change `log.level` не меняет реальный logger | Fixed |
+| CR-09 | P2 | VFS/checksum | Cache может вернуть устаревший SHA-256 | Fixed |
+| CR-10 | P2 | Protocol/listing | Большой каталог создаёт ответ больше `MaxControlPayload` | Fixed |
 
 ## Подробные замечания
 
