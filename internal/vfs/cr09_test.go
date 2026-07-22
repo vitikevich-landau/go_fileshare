@@ -53,17 +53,17 @@ func TestChecksumInvalidatesOnSubSecondChange(t *testing.T) {
 	}
 }
 
-// TestChecksumInvalidatesOnPreservedMtimeChange covers RR-5: content replaced
-// with the mtime restored to its exact previous value still invalidates the
-// cache, via change-time. Skips where change-time is unavailable (e.g. Windows).
+// TestChecksumInvalidatesOnPreservedMtimeChange covers RR-5/R3-5: content
+// replaced with the mtime restored to its exact previous value must never return
+// a stale cached checksum, on every platform. Where a dependable change-time is
+// available (Linux/macOS) the differing ctime forces a cache miss; where it is
+// not (e.g. Windows) the cache refuses to serve a hit it cannot prove fresh and
+// recomputes. Either way the checksum is correct, so this no longer skips.
 func TestChecksumInvalidatesOnPreservedMtimeChange(t *testing.T) {
 	root := t.TempDir()
 	p := filepath.Join(root, "f.bin")
 	if err := os.WriteFile(p, []byte("AAAA"), 0o644); err != nil {
 		t.Fatal(err)
-	}
-	if info, _ := os.Stat(p); changeTimeNanos(info) == 0 {
-		t.Skip("change-time unavailable on this platform")
 	}
 
 	fixed := time.Unix(1_700_000_000, 424242)

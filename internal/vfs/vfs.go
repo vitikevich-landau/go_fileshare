@@ -291,10 +291,14 @@ func (v *VFS) Checksum(vpath string) (string, proto.Algo, [proto.ChecksumLen]byt
 	// (unix), catching a same-size same-mtime replacement. This is the cache key
 	// only; the wire DirEntry.mtime stays unix seconds.
 	mtime := uint64(info.ModTime().UnixNano())
-	ctime := changeTimeNanos(info)
+	ctime, ctimeOK := changeTimeNanos(info)
 
+	// Only trust a cache hit when the platform gives a dependable change-time.
+	// Where it does not (e.g. Windows), (size, mtime) alone cannot prove the
+	// content is unchanged — a same-size replacement with the exact mtime
+	// restored would return a stale checksum — so recompute instead (R3-5).
 	v.mu.Lock()
-	if e, ok := v.cache[clean]; ok && e.Size == size && e.Mtime == mtime && e.Ctime == ctime {
+	if e, ok := v.cache[clean]; ok && ctimeOK && e.Size == size && e.Mtime == mtime && e.Ctime == ctime {
 		v.mu.Unlock()
 		return clean, e.Algo, e.Sum, nil
 	}
