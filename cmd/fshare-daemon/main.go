@@ -80,7 +80,7 @@ func main() {
 }
 
 func run(cfg config.Settings, configPath string) error {
-	logger := newLogger(cfg.Log.Level)
+	logger, levelVar := newLogger(cfg.Log.Level)
 
 	v, err := vfs.New(cfg.Server.ShareRoot, cfg.Checksum.CacheFile)
 	if err != nil {
@@ -99,6 +99,7 @@ func run(cfg config.Settings, configPath string) error {
 		Hub: hub, VFS: v, Users: users, Guard: guard,
 		Logger: logger, ServerName: "fshared", Version: version,
 		ConfigPath:    configPath,
+		LogLevel:      levelVar,
 		AuthFailDelay: time.Second,
 	})
 	if err := srv.Listen(fmt.Sprintf(":%d", cfg.Server.Port)); err != nil {
@@ -220,19 +221,26 @@ func readPassword(prompt string) (string, error) {
 	return strings.TrimRight(line, "\r\n"), err
 }
 
-func newLogger(level string) *slog.Logger {
-	var lvl slog.Level
+// newLogger builds the stderr logger around a LevelVar so log.level can change
+// at runtime (CR-08). The LevelVar is handed to the server, which updates it.
+func newLogger(level string) (*slog.Logger, *slog.LevelVar) {
+	lv := new(slog.LevelVar)
+	lv.Set(levelFromString(level))
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lv}))
+	return logger, lv
+}
+
+func levelFromString(level string) slog.Level {
 	switch level {
 	case "debug":
-		lvl = slog.LevelDebug
+		return slog.LevelDebug
 	case "warn":
-		lvl = slog.LevelWarn
+		return slog.LevelWarn
 	case "error":
-		lvl = slog.LevelError
+		return slog.LevelError
 	default:
-		lvl = slog.LevelInfo
+		return slog.LevelInfo
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
 }
 
 func fatalf(format string, args ...any) {
