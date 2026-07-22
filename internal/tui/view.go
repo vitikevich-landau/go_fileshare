@@ -216,7 +216,11 @@ func (m *Model) renderPrompt() string {
 	if login == "" {
 		login = "anon"
 	}
-	return styPrompt.Render(fmt.Sprintf("%s@%s:%s$", login, m.serverName, path))
+	base := styPrompt.Render(fmt.Sprintf("%s@%s:%s$", login, m.serverName, path))
+	if m.cmdMode {
+		return base + " " + m.cmdInput.View()
+	}
+	return base
 }
 
 func (m *Model) renderFbar() string {

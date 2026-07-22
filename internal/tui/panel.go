@@ -38,6 +38,16 @@ func (p *Panel) SetEntries(entries []Entry, hasParent bool) {
 	p.Selected = map[string]bool{}
 }
 
+// findFile returns the named non-directory entry, if present.
+func (p *Panel) findFile(name string) (Entry, bool) {
+	for _, e := range p.Entries {
+		if e.Name == name && !e.IsDir {
+			return e, true
+		}
+	}
+	return Entry{}, false
+}
+
 // Current returns the entry under the cursor.
 func (p *Panel) Current() (Entry, bool) {
 	if p.Cursor < 0 || p.Cursor >= len(p.Entries) {

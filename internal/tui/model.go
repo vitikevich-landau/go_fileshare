@@ -27,7 +27,7 @@ const (
 	screenCommander
 )
 
-const helpText = "Tab switch · ↑↓/PgUp/PgDn/Home/End move · Enter cd · Space mark · F5 download · Ctrl+R refresh · Ctrl+N mark seen · F10 quit"
+const helpText = "Tab switch · ↑↓/PgUp/PgDn/Home/End move · Enter cd · Space mark · F5 download · Ctrl+R refresh · Ctrl+N mark seen · : command · F10 quit"
 
 type transferState struct {
 	name     string
@@ -102,6 +102,10 @@ type Model struct {
 	backoff          time.Duration
 	pumpStop         chan struct{}
 	remoteKeepCursor int // >=0 restores the cursor after a live remote refresh
+
+	// command line (":" opens it)
+	cmdMode  bool
+	cmdInput textinput.Model
 
 	events   chan tea.Msg
 	quitting bool
@@ -294,6 +298,9 @@ func (m *Model) handleKey(k tea.KeyMsg) tea.Cmd {
 	if m.admin {
 		return m.handleAdminKey(k)
 	}
+	if m.cmdMode {
+		return m.handleCmdKey(k)
+	}
 	return m.handleCommanderKey(k)
 }
 
@@ -481,6 +488,9 @@ func (m *Model) handleCommanderKey(k tea.KeyMsg) tea.Cmd {
 			m.dlCancel()
 			m.log(lineInfo, "cancelling "+m.transfer.name+"…")
 		}
+	case ":":
+		m.enterCmdMode()
+		return textinput.Blink
 	case "f1":
 		m.log(lineInfo, helpText)
 	}
