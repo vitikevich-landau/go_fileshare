@@ -231,15 +231,47 @@ func (m *Model) renderOpLog(n int) string {
 
 func (m *Model) renderTransfer() string {
 	if m.transfer == nil {
-		return strings.Repeat(" ", 0)
+		if n := len(m.queue); n > 0 {
+			return styDim.Render(fmt.Sprintf("%d queued", n))
+		}
+		return ""
 	}
+	t := m.transfer
 	pct := 0.0
-	if m.transfer.total > 0 {
-		pct = float64(m.transfer.received) / float64(m.transfer.total)
+	if t.total > 0 {
+		pct = float64(t.received) / float64(t.total)
 	}
 	bar := m.prog.ViewAs(pct)
-	return fmt.Sprintf("%s %s %s/%s", bar, m.transfer.name,
-		formatSize(m.transfer.received), formatSize(m.transfer.total))
+	speed, eta := transferRate(t)
+	line := fmt.Sprintf("%s %s %s/%s  %s  ETA %s", bar, t.name,
+		formatSize(t.received), formatSize(t.total), speed, eta)
+	if n := len(m.queue); n > 0 {
+		line += fmt.Sprintf("  (+%d queued)", n)
+	}
+	return line
+}
+
+// transferRate returns the average speed and estimated time remaining for an
+// in-flight transfer, as display strings.
+func transferRate(t *transferState) (speed, eta string) {
+	elapsed := time.Since(t.startedAt).Seconds()
+	if elapsed <= 0 || t.received == 0 {
+		return "--/s", "--"
+	}
+	bps := float64(t.received) / elapsed
+	speed = formatSize(uint64(bps)) + "/s"
+	if t.total > t.received && bps > 0 {
+		return speed, formatDuration(float64(t.total-t.received) / bps)
+	}
+	return speed, "0s"
+}
+
+// formatDuration renders a second count as a rounded Go duration ("1m23s").
+func formatDuration(seconds float64) string {
+	if seconds < 0 || seconds > 99*3600 {
+		return "--"
+	}
+	return time.Duration(seconds * float64(time.Second)).Round(time.Second).String()
 }
 
 func (m *Model) renderPrompt() string {

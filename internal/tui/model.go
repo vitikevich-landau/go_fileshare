@@ -30,9 +30,10 @@ const (
 const helpText = "Tab switch · ↑↓/PgUp/PgDn/Home/End move · Enter cd · Space mark · F5 download · Ctrl+R refresh · Ctrl+N mark seen · : command · F10 quit"
 
 type transferState struct {
-	name     string
-	received uint64
-	total    uint64
+	name      string
+	received  uint64
+	total     uint64
+	startedAt time.Time
 }
 
 type downloadJob struct {
@@ -670,7 +671,7 @@ func (m *Model) startNext() {
 	job := m.queue[0]
 	m.queue = m.queue[1:]
 	m.busy = true
-	m.transfer = &transferState{name: job.name}
+	m.transfer = &transferState{name: job.name, startedAt: time.Now()}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.dlCancel = cancel
 	m.log(lineInfo, "downloading "+job.name+"…")
