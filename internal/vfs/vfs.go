@@ -285,7 +285,10 @@ func (v *VFS) Checksum(vpath string) (string, proto.Algo, [proto.ChecksumLen]byt
 	defer f.Close()
 
 	size := uint64(info.Size())
-	mtime := uint64(info.ModTime().Unix())
+	// Nanosecond granularity so a same-size change within the same wall-clock
+	// second still invalidates the cache (CR-09). This is the cache key only;
+	// the wire DirEntry.mtime stays unix seconds.
+	mtime := uint64(info.ModTime().UnixNano())
 
 	v.mu.Lock()
 	if e, ok := v.cache[clean]; ok && e.Size == size && e.Mtime == mtime {
