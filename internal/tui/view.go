@@ -9,6 +9,9 @@ import (
 )
 
 // View implements tea.Model.
+// View реализует tea.Model: ЧИСТАЯ функция отрисовки — из текущего состояния
+// модели собирает строку-кадр экрана, ничего не меняя. Какой экран рисовать
+// (форма подключения или командер), решает m.screen.
 func (m *Model) View() string {
 	if m.quitting {
 		return ""

@@ -1,6 +1,11 @@
-// Command fshare-daemon is the non-interactive fileshare v2 server: it serves a
-// directory tree over the v2 protocol, applies config changes live, and shuts
-// down gracefully (docs/tz/09-go-port.md §5.10, docs/tz/03-server-daemon.md).
+// Команда fshare-daemon — неинтерактивный сервер fileshare v2: раздаёт дерево
+// каталогов по протоколу v2, применяет изменения конфига на лету и корректно
+// останавливается (docs/tz/09-go-port.md §5.10, docs/tz/03-server-daemon.md).
+//
+// Управление только по сети (админ-протокол) и сигналами: SIGINT/SIGTERM —
+// корректная остановка, SIGHUP — горячая перезагрузка конфига и users.json.
+// Демону недоступен интерактивный stdin (кроме разовых утилит --add-user и
+// --reset-password, которые спрашивают пароль и выходят).
 package main
 
 import (
@@ -41,6 +46,7 @@ func main() {
 	)
 	flag.Parse()
 
+	// Конфиг: значения по умолчанию, поверх — файл (если задан), поверх — флаги.
 	cfg := config.Default()
 	if *configPath != "" {
 		loaded, err := config.Load(*configPath)
@@ -62,6 +68,7 @@ func main() {
 		fatalf("config invalid: %s", msg)
 	}
 
+	// Разовые режимы: проверить конфиг или поправить пользователей — и выйти.
 	if *checkConfig {
 		fmt.Println("config OK")
 		return
@@ -79,6 +86,9 @@ func main() {
 	}
 }
 
+// run собирает и запускает демон: логгер → VFS → база пользователей → гард →
+// хаб конфига → сервер, вешает обработку сигналов (SIGINT/SIGTERM — остановка,
+// SIGHUP — горячая перезагрузка) и крутит Serve до остановки.
 func run(cfg config.Settings, configPath string) error {
 	logger, levelVar := newLogger(cfg.Log.Level)
 
@@ -124,13 +134,13 @@ func run(cfg config.Settings, configPath string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// SIGHUP re-reads the config file, preserving restart-only keys.
+	// SIGHUP перечитывает файл конфига, сохраняя restart-only ключи.
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
 		for range hup {
-			// Always hot-reload users.json (its path is independent of --config)
-			// and drop sessions of any now-disabled user (§3.3).
+			// Всегда горячо перечитываем users.json (его путь независим от --config)
+			// и сбрасываем сессии всех ставших отключёнными пользователей (§3.3).
 			if dropped, err := srv.ReloadUsers(); err != nil {
 				logger.Error("SIGHUP user reload failed", "err", err)
 			} else {
@@ -159,6 +169,8 @@ func run(cfg config.Settings, configPath string) error {
 	return nil
 }
 
+// runUserAdmin выполняет разовые сценарии --add-user / --reset-password и выходит
+// (спрашивает пароль в терминале, вычисляет StoredKey и пишет users.json).
 func runUserAdmin(cfg config.Settings, addLogin, roleStr, resetLogin string) error {
 	db, err := auth.Load(cfg.Auth.UsersFile)
 	if err != nil {
@@ -235,14 +247,15 @@ func newLogger(level string) (*slog.Logger, *slog.LevelVar) {
 	return logger, lv
 }
 
-// applyReload merges a freshly-loaded config into the running hub on SIGHUP. It
-// preserves restart-only keys (port, share_root, workers, checksum, auth, and
-// events — the watcher is built once) from the current snapshot, and applies the
-// hot log.level to the live LevelVar (which a plain Apply does not do) — RR-4.
+// applyReload вливает свежезагруженный конфиг в работающий хаб по SIGHUP.
+// Сохраняет restart-only ключи (port, share_root, workers, checksum, auth и
+// events — watcher строится один раз) из текущего снапшота и применяет горячий
+// log.level к живому LevelVar (чего обычный Apply не делает) — RR-4.
 //
-// The LevelVar update is applied through ApplyWith so it runs under the same hub
-// writer lock as the snapshot swap: a concurrent ADMIN_SET log.level cannot
-// interleave and leave the snapshot and the live logger diverged (R3-4).
+// Обновление LevelVar идёт через ApplyWith, чтобы выполниться под тем же
+// писательским локом хаба, что и подмена снапшота: параллельный ADMIN_SET
+// log.level не сможет вклиниться и оставить снапшот и живой логгер
+// рассогласованными (R3-4).
 func applyReload(hub *config.Hub, levelVar *slog.LevelVar, next config.Settings) error {
 	cur := hub.Current()
 	next.Server.Port = cur.Server.Port

@@ -9,8 +9,9 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/client"
 )
 
-// dialCmd connects and authenticates in the background. gen tags the result so
-// a stale attempt (e.g. one the user cancelled with Esc) can be ignored.
+// dialCmd подключается и аутентифицируется В ФОНЕ (как tea.Cmd, вне UI-потока).
+// gen помечает результат, чтобы устаревшую попытку (например, отменённую Esc)
+// можно было проигнорировать.
 func dialCmd(addr string, opts client.Options, prof Profile, gen int) tea.Cmd {
 	return func() tea.Msg {
 		c, err := client.Dial(addr, opts)
@@ -28,8 +29,9 @@ func dialCmd(addr string, opts client.Options, prof Profile, gen int) tea.Cmd {
 	}
 }
 
-// listRemote fetches a remote directory listing, holding the client mutex so it
-// cannot race with the event pump or a download.
+// listRemote запрашивает листинг удалённого каталога, удерживая мьютекс клиента,
+// чтобы не было гонки с насосом событий или закачкой (блокирующий транспорт —
+// однопользовательский).
 func (m *Model) listRemote(path string) tea.Cmd {
 	return func() tea.Msg {
 		m.clientMu.Lock()
@@ -47,7 +49,10 @@ func (m *Model) listRemote(path string) tea.Cmd {
 	}
 }
 
-// waitForActivity blocks until the next message arrives on the events channel.
+// waitForActivity — команда, блокирующая до прихода следующего сообщения в канал
+// events. Так асинхронные кадры из фоновых горутин (насос, закачка) попадают в
+// цикл Update. После каждого такого сообщения слушателя нужно перевзвести (см.
+// fromChannel), иначе следующее сообщение из канала не будет прочитано.
 func waitForActivity(events chan tea.Msg) tea.Cmd {
 	return func() tea.Msg { return <-events }
 }

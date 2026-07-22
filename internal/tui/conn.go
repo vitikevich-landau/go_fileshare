@@ -20,9 +20,10 @@ const (
 	maxBackoff    = 30 * time.Second
 )
 
-// eventForwarder returns a client event handler that forwards async frames to
-// the model's events channel without blocking (a dropped event just misses a
-// live refresh; Ctrl+R recovers).
+// eventForwarder возвращает обработчик событий клиента, который НЕблокирующе
+// переправляет асинхронные кадры в канал events модели (пропущенное событие лишь
+// пропустит живое обновление; Ctrl+R восстановит). Неблокирующе — потому что
+// нельзя тормозить сетевую горутину из-за занятого UI.
 func (m *Model) eventForwarder() func(proto.Message) {
 	ev := m.events
 	return func(msg proto.Message) {
@@ -33,8 +34,8 @@ func (m *Model) eventForwarder() func(proto.Message) {
 	}
 }
 
-// subscribeFS subscribes to events on the current client: filesystem events for
-// everyone, plus config/notice streams for admins (for the admin log).
+// subscribeFS подписывается на события текущего клиента: события файловой системы
+// — всем, плюс потоки config/notice для админов (для журнала админ-панели).
 func (m *Model) subscribeFS() {
 	mask := proto.SubFS
 	if m.role == proto.RoleAdmin {
@@ -48,8 +49,9 @@ func (m *Model) subscribeFS() {
 	m.clientMu.Unlock()
 }
 
-// startPump launches the background goroutine that receives events while idle
-// and sends heartbeats (docs/tz/04-tui-client.md §7).
+// startPump запускает фоновую горутину-«насос»: в простое принимает события и
+// шлёт heartbeat (docs/tz/04-tui-client.md §7). Это и есть работа сети ВНЕ
+// UI-потока. Прежний насос сначала останавливается.
 func (m *Model) startPump() {
 	m.stopPump()
 	stop := make(chan struct{})
@@ -97,8 +99,8 @@ func (m *Model) runPump(stop chan struct{}) {
 	}
 }
 
-// onEvent applies an async frame: it logs and, for a change in the currently
-// shown remote directory, refreshes that panel while keeping the cursor.
+// onEvent применяет асинхронный кадр: логирует и, если изменение произошло в
+// показываемом сейчас удалённом каталоге, обновляет ту панель, сохраняя курсор.
 func (m *Model) onEvent(pm proto.Message) tea.Cmd {
 	switch e := pm.(type) {
 	case proto.EventFs:
@@ -136,12 +138,12 @@ func (m *Model) remotePanel() *Panel {
 	return nil
 }
 
-// beginReconnect tears down the dropped connection and schedules a reconnect
-// attempt. It is idempotent while a reconnect is already in progress.
+// beginReconnect сворачивает оборвавшееся соединение и планирует попытку
+// реконнекта. Идемпотентна, пока реконнект уже идёт.
 func (m *Model) beginReconnect(cause error) tea.Cmd {
-	// Ignore a late conn-loss event from a session we already left (e.g. after an
-	// explicit `disconnect`): otherwise a stale connLostMsg/remoteErrMsg would
-	// silently turn a disconnect back into a background reconnect.
+	// Игнорируем запоздавшее событие потери связи от сессии, которую мы уже
+	// покинули (например, после явного `disconnect`): иначе устаревший
+	// connLostMsg/remoteErrMsg молча превратил бы disconnect обратно в фоновый реконнект.
 	if m.screen != screenCommander {
 		return nil
 	}
@@ -184,10 +186,12 @@ func (m *Model) reconnectCmd() tea.Cmd {
 	}
 }
 
+// onReconnected принимает успешно переподключённый клиент: заменяет им старый,
+// возобновляет подписки и насос и перечитывает показываемый удалённый каталог.
 func (m *Model) onReconnected(msg reconnectedMsg) tea.Cmd {
 	if !m.reconnecting || m.screen != screenCommander {
-		// We disconnected (or reset) while this reconnect was in flight: drop the
-		// late connection rather than adopting it invisibly.
+		// Мы отключились (или сбросились), пока этот реконнект был в полёте: роняем
+		// запоздавшее соединение, а не принимаем его незаметно.
 		if msg.client != nil {
 			msg.client.Close()
 		}
@@ -214,9 +218,11 @@ func (m *Model) onReconnected(msg reconnectedMsg) tea.Cmd {
 	return nil
 }
 
+// onReconnectFailed обрабатывает неудачную попытку: удваивает задержку отката (до
+// maxBackoff) и планирует следующую попытку — экспоненциальный backoff.
 func (m *Model) onReconnectFailed(msg reconnectFailedMsg) tea.Cmd {
 	if !m.reconnecting {
-		return nil // disconnected meanwhile: stop retrying
+		return nil // тем временем отключились: перестаём пытаться
 	}
 	m.backoff *= 2
 	if m.backoff > maxBackoff {

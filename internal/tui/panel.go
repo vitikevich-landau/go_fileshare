@@ -1,26 +1,28 @@
 package tui
 
-// Panel is one of the two file views. It holds a directory listing, a cursor,
-// a scroll offset, and a multi-selection set. All methods are pure state
-// transitions so they can be unit-tested without a terminal.
+// Panel — одна из двух файловых панелей. Хранит листинг каталога, курсор,
+// прокрутку и набор выделенных файлов. ВСЕ методы — чистые переходы состояния,
+// поэтому их можно юнит-тестировать без терминала (та самая тестируемость
+// UI-логики из docs/tz/01-architecture.md §4).
 type Panel struct {
-	Remote   bool
-	Label    string // display label (local dir, or profile name for remote)
-	Path     string
-	Entries  []Entry // Entries[0] is ".." when the panel has a parent
-	Cursor   int
-	Top      int // index of the first visible row
-	Selected map[string]bool
-	LastSeen int64
-	Sort     sortMode // F2 cycles this
+	Remote   bool            // удалённая панель (сервер) или локальная (диск клиента)
+	Label    string          // подпись (локальный каталог или имя профиля для удалённой)
+	Path     string          // текущий каталог
+	Entries  []Entry         // записи; Entries[0] — «..», если есть родитель
+	Cursor   int             // индекс записи под курсором
+	Top      int             // индекс первой видимой строки (прокрутка)
+	Selected map[string]bool // множественное выделение (по имени)
+	LastSeen int64           // метка «виделось до» — для подсветки новых файлов
+	Sort     sortMode        // текущий порядок сортировки (F2 переключает)
 }
 
 func newPanel(remote bool, label, path string) *Panel {
 	return &Panel{Remote: remote, Label: label, Path: path, Selected: map[string]bool{}}
 }
 
-// SetEntries replaces the listing. It sorts real entries, marks new ones
-// against LastSeen, prepends ".." when hasParent, and clamps the cursor.
+// SetEntries заменяет листинг: сортирует настоящие записи, помечает новые
+// (по LastSeen), добавляет «..» в начало при hasParent и зажимает курсор в
+// допустимых границах.
 func (p *Panel) SetEntries(entries []Entry, hasParent bool) {
 	sortEntriesBy(entries, p.Sort)
 	for i := range entries {

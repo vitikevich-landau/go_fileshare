@@ -7,18 +7,19 @@ import (
 	"runtime"
 )
 
-// Profile is a saved connection (docs/tz/04-tui-client.md §6, docs/tz/09-go-port.md §12.3).
+// Profile — сохранённое подключение (docs/tz/04-tui-client.md §6,
+// docs/tz/09-go-port.md §12.3): чтобы не вводить хост/порт/логин каждый раз.
 type Profile struct {
 	Name         string `json:"name"`
 	Host         string `json:"host"`
 	Port         int    `json:"port"`
 	Login        string `json:"login"`
-	Secret       string `json:"secret,omitempty"` // reserved for "remember password"
-	LastSeen     int64  `json:"last_seen"`
+	Secret       string `json:"secret,omitempty"` // зарезервировано под «запомнить пароль»
+	LastSeen     int64  `json:"last_seen"`        // для подсветки новых файлов между визитами
 	DownloadsDir string `json:"downloads_dir"`
 }
 
-// Profiles is the persisted set of connection profiles.
+// Profiles — сохранённый на диске НАБОР профилей подключения (в конфиг-каталоге).
 type Profiles struct {
 	Profiles []Profile `json:"profiles"`
 	path     string

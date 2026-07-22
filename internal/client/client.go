@@ -1,7 +1,9 @@
-// Package client is a blocking transport for the fileshare v2 protocol used by
-// the TUI and the --batch CLI. It handles the handshake, requests, downloads
-// with resume, and transparently routes asynchronous EVENT_*/PONG frames to an
-// event handler while awaiting a specific reply (docs/tz/09-go-port.md §5.8).
+// Package client — блокирующий транспорт протокола fileshare v2 для TUI и режима
+// --batch. Он проводит рукопожатие, шлёт запросы, качает файлы с докачкой и
+// прозрачно переправляет асинхронные кадры EVENT_*/PONG в обработчик событий,
+// пока ждёт конкретный ответ (docs/tz/09-go-port.md §5.8).
+//
+// Правила конкурентности и словарь типов описаны в types.go.
 package client
 
 import (
@@ -22,7 +24,8 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/proto"
 )
 
-// RemoteError is an ERROR frame returned by the server.
+// RemoteError — кадр ERROR, полученный от сервера (ошибка уровня приложения:
+// файл не найден, нет прав и т.п.). Отдельно от сетевых ошибок Go.
 type RemoteError struct {
 	Code    proto.ErrCode
 	Message string
@@ -35,7 +38,7 @@ func (e *RemoteError) Error() string {
 	return e.Code.String()
 }
 
-// AuthError is an AUTH_FAIL from the server.
+// AuthError — кадр AUTH_FAIL от сервера (вход отклонён).
 type AuthError struct {
 	Reason  proto.AuthFailReason
 	Message string
@@ -43,35 +46,35 @@ type AuthError struct {
 
 func (e *AuthError) Error() string { return fmt.Sprintf("authentication failed: %s", e.Message) }
 
-// Options configures a Dial.
+// Options — параметры для Dial.
 type Options struct {
-	ClientName   string
-	Login        string
-	Password     string
-	EventHandler func(proto.Message) // receives async EVENT_*/PONG frames
-	DialTimeout  time.Duration
+	ClientName   ClientName
+	Login        Login
+	Password     Password
+	EventHandler func(proto.Message) // принимает асинхронные кадры EVENT_*/PONG
+	DialTimeout  DialTimeout
 }
 
-// Client is a connected protocol client. Its request methods are not safe for
-// concurrent use with each other, but Ping/Interrupt/Close may be called from
-// another goroutine.
+// Client — подключённый клиент протокола. Его ЗАПРОСНЫЕ методы нельзя вызывать
+// конкурентно друг с другом (они по очереди пишут запрос и читают ответ из
+// одного сокета), но Ping/Interrupt/Close можно звать из другой горутины.
 type Client struct {
 	conn net.Conn
 
-	wmu          sync.Mutex // serializes writes
+	wmu          sync.Mutex // сериализует записи в сокет
 	eventHandler func(proto.Message)
 
 	role       proto.Role
-	sessionID  uint64
+	sessionID  SessionID
 	serverName string
 	motd       string
 	authMode   proto.AuthMode
-	iters      int
+	iters      Iterations
 }
 
-// Dial connects to addr, performs the handshake and authentication, and returns
-// a ready client.
-func Dial(addr string, opts Options) (*Client, error) {
+// Dial соединяется с addr, проводит рукопожатие и аутентификацию и возвращает
+// готовый клиент.
+func Dial(addr ServerAddr, opts Options) (*Client, error) {
 	timeout := opts.DialTimeout
 	if timeout == 0 {
 		timeout = 10 * time.Second
@@ -83,17 +86,18 @@ func Dial(addr string, opts Options) (*Client, error) {
 	return handshake(conn, opts)
 }
 
-// maxAuthIters bounds the PBKDF2 iteration count the client will run on a
-// server-announced value, so a hostile/MITM server cannot pin a CPU (CR-04).
+// maxAuthIters ограничивает число итераций PBKDF2, которое клиент выполнит по
+// объявленному сервером значению, чтобы враждебный/MITM-сервер не загрузил CPU
+// (CR-04).
 const maxAuthIters = 10_000_000
 
-// handshake performs HELLO/AUTH over an already-connected socket and returns a
-// ready client. On failure it closes conn.
+// handshake проводит HELLO/AUTH поверх уже установленного сокета и возвращает
+// готовый клиент. При сбое закрывает conn.
 func handshake(conn net.Conn, opts Options) (*Client, error) {
 	c := &Client{conn: conn, eventHandler: opts.EventHandler}
 
-	// Bound the whole handshake so a silent/MITM server cannot hang the client
-	// indefinitely (CR-04); cleared once authenticated.
+	// Ограничиваем всё рукопожатие по времени, чтобы молчащий/MITM-сервер не
+	// подвесил клиента навсегда (CR-04); снимается после аутентификации.
 	hsTimeout := opts.DialTimeout
 	if hsTimeout == 0 {
 		hsTimeout = 10 * time.Second
@@ -126,7 +130,7 @@ func handshake(conn net.Conn, opts Options) (*Client, error) {
 	c.authMode = helloOk.AuthMode
 	c.iters = int(helloOk.PBKDF2Iters)
 
-	// Validate the untrusted auth parameters before doing any expensive work.
+	// Проверяем недоверенные параметры аутентификации ДО любой дорогой работы.
 	switch helloOk.AuthMode {
 	case proto.AuthNone:
 		// no proof; iters irrelevant
@@ -194,8 +198,9 @@ func (c *Client) readMsg() (proto.Message, error) {
 	return proto.Decode(typ, payload)
 }
 
-// isAsync reports whether m is an out-of-band frame that may arrive at any time
-// and should be routed to the event handler rather than treated as a reply.
+// isAsync сообщает, является ли m «внеполосным» кадром, который может прийти в
+// любой момент (push-событие или PONG) и должен уйти в обработчик событий, а не
+// быть принят за ответ на запрос.
 func isAsync(m proto.Message) bool {
 	switch m.(type) {
 	case proto.EventFs, proto.EventNotice, proto.EventConfig, proto.Pong:
@@ -204,8 +209,10 @@ func isAsync(m proto.Message) bool {
 	return false
 }
 
-// recvExpect reads frames until one of type want arrives, dispatching async
-// frames to the event handler and turning ERROR into a RemoteError.
+// recvExpect читает кадры, пока не придёт кадр типа want, попутно отправляя
+// async-кадры в обработчик событий и превращая ERROR в RemoteError. Это и есть
+// «прозрачная маршрутизация»: события, пришедшие посреди ожидания ответа, не
+// теряются и не путаются с ответом.
 func (c *Client) recvExpect(want proto.Msg) (proto.Message, error) {
 	for {
 		m, err := c.readMsg()
@@ -228,8 +235,8 @@ func (c *Client) recvExpect(want proto.Msg) (proto.Message, error) {
 	}
 }
 
-// ListDir lists a remote directory, returning the normalized path and entries.
-func (c *Client) ListDir(path string) (string, []proto.DirEntry, error) {
+// ListDir перечисляет удалённый каталог, возвращая нормализованный путь и записи.
+func (c *Client) ListDir(path Path) (string, []proto.DirEntry, error) {
 	if err := c.writeMsg(proto.ListDirRequest{Path: path}); err != nil {
 		return "", nil, err
 	}
@@ -241,8 +248,8 @@ func (c *Client) ListDir(path string) (string, []proto.DirEntry, error) {
 	return r.Path, r.Entries, nil
 }
 
-// Stat returns metadata for a single remote path.
-func (c *Client) Stat(path string) (string, proto.DirEntry, error) {
+// Stat возвращает метаданные одного удалённого пути.
+func (c *Client) Stat(path Path) (string, proto.DirEntry, error) {
 	if err := c.writeMsg(proto.StatRequest{Path: path}); err != nil {
 		return "", proto.DirEntry{}, err
 	}
@@ -254,8 +261,9 @@ func (c *Client) Stat(path string) (string, proto.DirEntry, error) {
 	return r.Path, r.Entry, nil
 }
 
-// Checksum requests the checksum of a remote file.
-func (c *Client) Checksum(path string) (proto.Algo, [proto.ChecksumLen]byte, error) {
+// Checksum запрашивает контрольную сумму удалённого файла (сервер считает её
+// лениво с кэшем, поэтому первый запрос может быть дороже).
+func (c *Client) Checksum(path Path) (proto.Algo, [proto.ChecksumLen]byte, error) {
 	if err := c.writeMsg(proto.ChecksumRequest{Path: path}); err != nil {
 		return proto.AlgoPending, [proto.ChecksumLen]byte{}, err
 	}
@@ -267,13 +275,13 @@ func (c *Client) Checksum(path string) (proto.Algo, [proto.ChecksumLen]byte, err
 	return r.Algo, r.Checksum, nil
 }
 
-// Subscribe sets the event subscription mask.
+// Subscribe задаёт маску подписки на события (какие push-события слать).
 func (c *Client) Subscribe(mask uint32) error {
 	return c.writeMsg(proto.Subscribe{Mask: mask})
 }
 
-// Ping sends a keepalive. The PONG is absorbed as an async frame by the next
-// recvExpect or PollEvents.
+// Ping шлёт keepalive. Ответный PONG будет поглощён как async-кадр ближайшим
+// recvExpect или PollEvents.
 func (c *Client) Ping() error { return c.writeMsg(proto.Ping{}) }
 
 // frameReadTimeout bounds how long PollEvents will wait to finish a frame once
@@ -284,17 +292,17 @@ func (c *Client) Ping() error { return c.writeMsg(proto.Ping{}) }
 // shorten it.
 var frameReadTimeout = 30 * time.Second
 
-// PollEvents waits up to timeout for one asynchronous frame (EVENT_*/PONG),
-// routing it to the event handler. It returns whether a frame was received. A
-// timeout is reported as (false, nil). It must not run concurrently with a
-// request method — a single goroutine owns all reads (docs/tz/09-go-port.md §5.8).
+// PollEvents ждёт до timeout один асинхронный кадр (EVENT_*/PONG) и отправляет
+// его в обработчик событий. Возвращает, был ли получен кадр; тайм-аут — это
+// (false, nil). НЕ должен работать одновременно с запросным методом — все чтения
+// принадлежат одной горутине (docs/tz/09-go-port.md §5.8).
 //
-// The idle deadline applies only to the FIRST byte of the next frame, so a
-// timeout before any byte arrives is a clean "no event" that consumes nothing
-// and cannot desync the next poll (R3-7). Once a frame has started, the rest is
-// read under a bounded frameReadTimeout instead of forever; if that fires the
-// frame is partly consumed and the stream is desynced, so the connection is
-// dropped rather than reused (R4-1).
+// Тонкость десинхронизации: idle-дедлайн применяется только к ПЕРВОМУ байту
+// следующего кадра, поэтому тайм-аут до прихода любого байта — это чистое «нет
+// события», которое ничего не съедает и не рассинхронизирует следующий опрос
+// (R3-7). Как только кадр начался, остаток читается под ограниченным
+// frameReadTimeout, а не вечно; если он сработал — кадр прочитан частично, поток
+// рассинхронизирован, поэтому соединение сбрасывается, а не переиспользуется (R4-1).
 func (c *Client) PollEvents(timeout time.Duration) (bool, error) {
 	_ = c.conn.SetReadDeadline(time.Now().Add(timeout))
 	var first [1]byte
@@ -336,31 +344,33 @@ func isTimeout(err error) bool {
 	return errors.As(err, &ne) && ne.Timeout()
 }
 
-// Progress is reported during a download.
+// Progress — прогресс скачивания (сколько получено из скольки всего), которым
+// клиент кормит индикатор в UI.
 type Progress struct {
 	Received uint64
 	Total    uint64
 }
 
-// Download is DownloadCtx with a background context (no cancellation).
-func (c *Client) Download(remotePath, localPath string, progress func(Progress)) error {
+// Download — это DownloadCtx с фоновым контекстом (без отмены).
+func (c *Client) Download(remotePath Path, localPath LocalPath, progress func(Progress)) error {
 	return c.DownloadCtx(context.Background(), remotePath, localPath, progress)
 }
 
-// DownloadCtx fetches remotePath into localPath, resuming from localPath+".part"
-// if present. On completion it verifies the reassembled file against the
-// server's whole-file checksum and atomically renames the .part into place.
-// progress may be nil. Cancelling ctx aborts the transfer and returns ctx.Err():
-// once the transfer id is known it sends DOWNLOAD_CANCEL and drains to the
-// server's terminal frame so the connection stays usable (RR-3); before then it
-// drops the connection, which cannot be resynced without a transfer id (R4-2).
-func (c *Client) DownloadCtx(ctx context.Context, remotePath, localPath string, progress func(Progress)) error {
+// DownloadCtx качает remotePath в localPath, продолжая с localPath+".part", если
+// такой есть (докачка). По завершении сверяет пересобранный файл с контрольной
+// суммой всего файла от сервера и АТОМАРНО переименовывает «.part» на место.
+// progress может быть nil. Отмена ctx прерывает передачу и возвращает ctx.Err():
+// как только известен id передачи, шлётся DOWNLOAD_CANCEL с дочитыванием до
+// терминального кадра сервера, чтобы соединение осталось пригодным (RR-3); до
+// этого соединение сбрасывается — без id передачи его не ресинхронизировать (R4-2).
+func (c *Client) DownloadCtx(ctx context.Context, remotePath Path, localPath LocalPath, progress func(Progress)) error {
 	err := c.downloadOnce(ctx, remotePath, localPath, progress)
 
-	// A stale/oversized .part offset is rejected by the server: discard the .part
-	// and retry ONCE from scratch. Removing it makes the retry's offset 0, which
-	// the server can never reject as UNSUPPORTED_OFFSET, so this cannot loop; if
-	// the .part cannot be removed we stop rather than recurse forever (R4-4).
+	// Устаревший/слишком большой offset у «.part» сервер отвергает: выбрасываем
+	// «.part» и повторяем ОДИН раз с нуля. Удаление делает offset повтора равным 0,
+	// который сервер уже не отвергнет как UNSUPPORTED_OFFSET, поэтому зацикливания
+	// нет; если «.part» удалить не удалось — останавливаемся, а не рекурсируем вечно
+	// (R4-4).
 	var re *RemoteError
 	if errors.As(err, &re) && re.Code == proto.ErrUnsupportedOffset {
 		partPath := localPath + ".part"
@@ -372,12 +382,13 @@ func (c *Client) DownloadCtx(ctx context.Context, remotePath, localPath string, 
 	return err
 }
 
-// downloadOnce performs a single download attempt (no stale-offset retry). It
-// observes ctx for the whole attempt, including the wait for ACCEPT (R4-2), and
-// normalizes an error caused by cancellation to ctx.Err() via the named return.
-func (c *Client) downloadOnce(ctx context.Context, remotePath, localPath string, progress func(Progress)) (rerr error) {
+// downloadOnce выполняет ОДНУ попытку скачивания (без повтора по устаревшему
+// offset). Следит за ctx на протяжении всей попытки, включая ожидание ACCEPT
+// (R4-2), и через именованный возврат нормализует ошибку, вызванную отменой, к
+// ctx.Err().
+func (c *Client) downloadOnce(ctx context.Context, remotePath Path, localPath LocalPath, progress func(Progress)) (rerr error) {
 	if err := ctx.Err(); err != nil {
-		return err // already cancelled: send nothing
+		return err // уже отменено: ничего не шлём
 	}
 
 	partPath := localPath + ".part"
@@ -389,13 +400,13 @@ func (c *Client) downloadOnce(ctx context.Context, remotePath, localPath string,
 		return err
 	}
 
-	// Watch ctx for the whole attempt, including the wait for ACCEPT. Until the
-	// transfer id is known we cannot send a proper cancel or drain to a terminal
-	// frame, so a cancel then closes the connection to unblock the wait and abort
-	// (R4-2). Once ACCEPT arrives the watcher switches to the tid-aware
-	// DOWNLOAD_CANCEL that keeps the connection in sync (RR-3, R3-2). We await the
-	// watcher before returning so a cancel at the very end can never leak a
-	// DOWNLOAD_CANCEL into the next transfer (R3-2).
+	// Следим за ctx всю попытку, включая ожидание ACCEPT. Пока id передачи
+	// неизвестен, нельзя ни послать корректную отмену, ни дочитать до терминального
+	// кадра, поэтому отмена тогда закрывает соединение, чтобы разблокировать
+	// ожидание и прерваться (R4-2). Как только пришёл ACCEPT, наблюдатель
+	// переключается на DOWNLOAD_CANCEL с id, который держит соединение в согласии
+	// (RR-3, R3-2). Дожидаемся наблюдателя перед возвратом, чтобы отмена в самом
+	// конце не «утекла» DOWNLOAD_CANCEL-ом в следующую передачу (R3-2).
 	var tmu sync.Mutex
 	var cancelTID uint32
 	var haveTID bool
@@ -504,11 +515,11 @@ func (c *Client) downloadOnce(ctx context.Context, remotePath, localPath string,
 			if cerr := pf.Close(); cerr != nil {
 				return cerr
 			}
-			// Integrity gates before publishing (CR-02): the DONE must be for
-			// this transfer, all announced bytes must have arrived, and it must
-			// carry a supported checksum that matches the reassembled file. A
-			// short read keeps the .part so it can be resumed; a checksum
-			// mismatch discards it so we don't loop on a corrupt full-size .part.
+			// Проверки целостности ПЕРЕД публикацией (CR-02): DONE должен быть для
+			// этой передачи, все объявленные байты должны прийти, и он должен нести
+			// поддерживаемую сумму, совпадающую с пересобранным файлом. Недобор байт
+			// оставляет «.part» для докачки; несовпадение суммы удаляет его, чтобы не
+			// зациклиться на битом «.part» полного размера.
 			if v.TransferID != tid {
 				return fmt.Errorf("DOWNLOAD_DONE for unexpected transfer %d (want %d)", v.TransferID, tid)
 			}
@@ -562,24 +573,22 @@ func (c *Client) downloadOnce(ctx context.Context, remotePath, localPath string,
 	}
 }
 
-// abortConn closes the connection and returns err. It is used when a download
-// fails locally or the server violates the protocol mid-stream: the server may
-// still be sending CHUNK_DATA, so the only way to keep a later request from
-// reading leftover frames is to drop the connection (R3-3). Terminal
-// server frames (DOWNLOAD_DONE / ERROR) leave the connection in sync and do not
-// go through here.
+// abortConn закрывает соединение и возвращает err. Используется, когда скачивание
+// сбоит локально или сервер нарушает протокол посреди стрима: сервер может всё
+// ещё слать CHUNK_DATA, поэтому единственный способ не дать следующему запросу
+// прочитать чужие кадры — сбросить соединение (R3-3). Терминальные кадры сервера
+// (DOWNLOAD_DONE / ERROR) оставляют соединение в согласии и сюда НЕ идут.
 func (c *Client) abortConn(err error) error {
 	c.conn.Close()
 	return err
 }
 
-// Cancel asks the server to abort the active transfer without closing the
-// connection.
-func (c *Client) Cancel(transferID uint32) error {
+// Cancel просит сервер прервать активную передачу, НЕ закрывая соединение.
+func (c *Client) Cancel(transferID proto.TransferID) error {
 	return c.writeMsg(proto.DownloadCancel{TransferID: transferID})
 }
 
-// ---- admin channel (role=admin) ----
+// ---- админ-канал (role=admin) ----
 
 // AdminGetConfig returns the effective config as JSON ([]config.KeyInfo).
 func (c *Client) AdminGetConfig() ([]byte, error) {
@@ -670,19 +679,21 @@ func (c *Client) AdminReloadUsers() (bool, string, error) {
 	return r.OK, r.Message, nil
 }
 
-// Interrupt unblocks a read in progress from another goroutine (e.g. to quit
-// the TUI mid-download) by setting an immediate read deadline.
+// Interrupt из другой горутины разблокирует идущее чтение (например, чтобы выйти
+// из TUI посреди скачивания), выставляя немедленный дедлайн чтения.
 func (c *Client) Interrupt() {
 	_ = c.conn.SetReadDeadline(time.Now())
 }
 
-// Close closes the connection.
+// Close закрывает соединение.
 func (c *Client) Close() error { return c.conn.Close() }
 
-// checksumMismatch reports whether the file's checksum differs from want, using
-// the algorithm the server declared. An unsupported/absent algorithm is an
-// error. It is ctx-aware: verifying a large .part re-reads the whole file, so a
-// cancel during it aborts promptly and returns ctx.Err() (R5-1).
+// checksumMismatch сообщает, отличается ли сумма файла от want, используя
+// объявленный сервером алгоритм. Неподдерживаемый/отсутствующий алгоритм — ошибка.
+// Учитывает ctx: сверка большого «.part» перечитывает весь файл, поэтому отмена во
+// время неё прерывается сразу и возвращает ctx.Err() (R5-1). CRC-32 занимает
+// первые 4 байта поля (big-endian), SHA-256 — все 32 — так держится совместимость
+// с C++-сервером, настроенным на CRC32 (RR-2).
 func checksumMismatch(ctx context.Context, path string, algo proto.Algo, want [proto.ChecksumLen]byte) (bool, error) {
 	switch algo {
 	case proto.AlgoSHA256:

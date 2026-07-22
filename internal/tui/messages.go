@@ -7,30 +7,36 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/proto"
 )
 
-// linkState is the connection indicator.
+// linkState — индикатор состояния связи (цветной значок в статусе).
 type linkState int
 
 const (
-	linkDown linkState = iota
-	linkReconnect
-	linkUp
+	linkDown      linkState = iota // нет связи
+	linkReconnect                  // идёт переподключение
+	linkUp                         // связь есть
 )
 
+// lineKind — вид строки лога операций (задаёт цвет).
 type lineKind int
 
 const (
-	lineInfo lineKind = iota
-	lineOK
-	lineErr
-	lineEvent
+	lineInfo  lineKind = iota // обычная информация
+	lineOK                    // успех (зелёная)
+	lineErr                   // ошибка (красная)
+	lineEvent                 // push-событие от сервера
 )
 
+// logLine — одна строка лога операций: текст плюс его вид.
 type logLine struct {
 	text string
 	kind lineKind
 }
 
-// ---- async messages ----
+// ---- асинхронные сообщения (tea.Msg) ----
+//
+// Это результаты побочных эффектов (сетевых запросов, скачивания, событий),
+// которые приходят обратно в Update как сообщения. Часть приходит из tea.Cmd,
+// часть — из канала events (см. fromChannel ниже).
 
 type connectedMsg struct {
 	client     *client.Client
@@ -53,8 +59,8 @@ type remoteListingMsg struct {
 
 type remoteErrMsg struct{ err error }
 
-// The following flow through the model's events channel from the download
-// goroutine (docs/tz/09-go-port.md §5.9).
+// Следующие сообщения текут через канал events модели из горутины скачивания
+// (docs/tz/09-go-port.md §5.9) — так прогресс попадает в UI, не блокируя сеть.
 type progressMsg struct {
 	name     string
 	received uint64
@@ -90,8 +96,8 @@ type connLostMsg struct{ err error }
 type reconnectedMsg struct{ client *client.Client }
 type reconnectFailedMsg struct{ err error }
 
-// fromChannel reports whether a message arrives via the events channel and thus
-// requires re-arming the listener.
+// fromChannel сообщает, пришло ли сообщение через канал events и, значит, требует
+// перевзвода слушателя (иначе следующее сообщение из канала не будет прочитано).
 func fromChannel(msg tea.Msg) bool {
 	switch msg.(type) {
 	case progressMsg, downloadDoneMsg, downloadErrMsg, eventMsg, connLostMsg, checksumMsg:

@@ -1,7 +1,10 @@
-// Package tui implements the fileshare-commander interactive client as a Bubble
-// Tea program. The state and navigation logic (Model/Panel) are kept free of
-// terminal types so they can be unit-tested directly (docs/tz/09-go-port.md
-// §5.9, docs/tz/04-tui-client.md §7).
+// Package tui реализует интерактивный клиент fileshare-commander как программу
+// Bubble Tea. Логика состояния и навигации (Model/Panel) свободна от терминальных
+// типов, поэтому её можно юнит-тестировать напрямую (docs/tz/09-go-port.md §5.9,
+// docs/tz/04-tui-client.md §7).
+//
+// Архитектура (Model–Update–View, сеть вне UI-потока) и словарь типов описаны в
+// types.go — прочитайте его первым.
 package tui
 
 import (
@@ -9,18 +12,18 @@ import (
 	"sort"
 )
 
-// Entry is one row in a panel: a local or remote filesystem object.
+// Entry — одна строка в панели: объект локальной или удалённой файловой системы.
 type Entry struct {
-	Name    string
+	Name    FileName
 	IsDir   bool
-	Size    uint64
+	Size    ByteSize
 	Mtime   int64
-	IsNew   bool // mtime later than the panel's last-seen snapshot
-	HasPart bool // a matching .part exists (partial download)
-	IsUp    bool // the synthetic ".." parent entry
+	IsNew   bool // mtime новее снимка «виделось до» у панели → подсветка нового
+	HasPart bool // рядом есть «.part» (недокачанный файл) → можно докачать
+	IsUp    bool // синтетическая запись «..» (родитель)
 }
 
-// sortMode selects the panel ordering (F2 cycles through these).
+// sortMode выбирает порядок сортировки панели (F2 переключает по кругу).
 type sortMode int
 
 const (
@@ -65,7 +68,7 @@ func sortEntriesBy(es []Entry, mode sortMode) {
 	})
 }
 
-// formatSize renders a byte count in a compact human-readable form.
+// formatSize выводит число байт в компактной человекочитаемой форме (B/K/M/G…).
 func formatSize(n uint64) string {
 	const unit = 1024
 	if n < unit {

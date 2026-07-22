@@ -21,29 +21,39 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/proto"
 )
 
+// screen — какой из двух экранов сейчас показан: форма подключения или
+// двухпанельный командер.
 type screen int
 
 const (
-	screenConnect screen = iota
-	screenCommander
+	screenConnect   screen = iota // экран логина (хост/порт/логин/пароль)
+	screenCommander               // основной двухпанельный экран
 )
 
 const helpText = "Tab switch · ↑↓/PgUp/PgDn/Home/End move · Enter cd · Space mark · F5 download · Ctrl+R refresh · Ctrl+N mark seen · : command · F10 quit"
 
+// transferState — состояние ТЕКУЩЕЙ (одной) идущей передачи: имя файла, сколько
+// байт получено из скольки всего и когда началась (для расчёта скорости и ETA).
 type transferState struct {
-	name      string
-	received  uint64
-	total     uint64
+	name      FileName
+	received  ByteSize
+	total     ByteSize
 	startedAt time.Time
 }
 
+// downloadJob — одна задача в очереди скачивания: откуда (сервер), куда (локально)
+// и под каким именем. Очередь выполняется последовательно, по одной передаче.
 type downloadJob struct {
-	remote string
-	local  string
-	name   string
+	remote RemotePath
+	local  LocalPath
+	name   FileName
 }
 
-// Model is the Bubble Tea model for fshare-commander.
+// Model — модель Bubble Tea для fshare-commander: ЕДИНОЕ состояние всего UI.
+// Меняется только в Update (см. update.go/model.go), рисуется только во View.
+// Поля сгруппированы по назначению (экран подключения, командер, админ-панель,
+// реконнект, командная строка). Сетевой клиент прячется за clientMu, потому что
+// к нему обращаются и Update, и фоновый насос.
 type Model struct {
 	screen        screen
 	width, height int
@@ -86,7 +96,7 @@ type Model struct {
 
 	// admin confirmation modal (F2 shutdown / kick)
 	adminConfirm      confirmKind
-	adminConfirmArg   uint64          // e.g. session id for a kick confirm
+	adminConfirmArg   uint64            // e.g. session id for a kick confirm
 	adminConfirmInput textinput.Model   // typed-word confirm (shutdown)
 	adminDetail       *proto.ClientInfo // Enter on Clients tab: session detail box
 	adminMenu         bool              // F2 lifecycle menu is open
@@ -98,14 +108,14 @@ type Model struct {
 	serverName string
 	role       proto.Role
 
-	// reconnect state
-	host             string
-	port             int
+	// состояние реконнекта
+	host             Host
+	port             Port
 	password         string
 	reconnecting     bool
-	backoff          time.Duration
-	pumpStop         chan struct{}
-	remoteKeepCursor int // >=0 restores the cursor after a live remote refresh
+	backoff          time.Duration // текущая задержка экспоненциального отката
+	pumpStop         chan struct{} // закрытие останавливает фоновый насос
+	remoteKeepCursor int           // >=0 восстанавливает курсор после живого обновления панели
 
 	// command line (":" opens it)
 	cmdMode  bool
@@ -120,8 +130,10 @@ type Model struct {
 	quitting bool
 }
 
-// New builds the initial model. Fields of prefill seed the connect form: a
-// non-empty Name loads that saved profile; Host/Port/Login override the form.
+// New создаёт стартовую модель на экране подключения, заранее заполняя поля из
+// профиля prefill: непустое Name загружает сохранённый профиль; Host/Port/Login
+// переопределяют форму. Здесь же готовятся текстовые поля, спиннер и канал events,
+// через который в UI будут приходить асинхронные сообщения.
 func New(prefill Profile) *Model {
 	host := textinput.New()
 	host.Placeholder = "host"
@@ -180,12 +192,17 @@ func New(prefill Profile) *Model {
 	return m
 }
 
-// Init implements tea.Model.
+// Init реализует tea.Model: стартовые команды. Помимо мигания курсора запускает
+// waitForActivity — «слушателя» канала events, который превращает приходящие
+// туда кадры в сообщения tea.Msg (без него сообщения из канала не дойдут).
 func (m *Model) Init() tea.Cmd {
 	return tea.Batch(textinput.Blink, waitForActivity(m.events))
 }
 
-// Update implements tea.Model.
+// Update реализует tea.Model: ЕДИНСТВЕННОЕ место, где меняется состояние модели.
+// Разбирает очередное сообщение (клавиша, изменение размера, ответ сети, событие)
+// и возвращает обновлённую модель и, возможно, команду на следующий побочный
+// эффект. Сообщения из канала events требуют перевзвода слушателя (см. fromChannel).
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	switch msg := msg.(type) {

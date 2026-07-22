@@ -155,14 +155,14 @@ func (m *Model) cmdInfo(names []string) tea.Cmd {
 	return nil
 }
 
-// doDisconnect closes the connection and returns to the connect screen. It must
-// not wait on clientMu while HOLDING it (an active download holds it for the
-// whole transfer), so it cancels the transfer and any pending reconnect first,
-// then closes the socket OUTSIDE the lock — which unblocks the download's read.
-// The m.client pointer is cleared UNDER clientMu, because background readers
-// (pump/commands) read it under that lock; a single writer does not remove the
-// read/write data race. Reading the pointer once on this (Update) goroutine to
-// close it is safe: all writes to m.client happen on this goroutine.
+// doDisconnect закрывает соединение и возвращает на экран подключения. Нельзя
+// ждать clientMu, УДЕРЖИВАЯ его (активная закачка держит его всю передачу),
+// поэтому сначала отменяем передачу и любой ожидающий реконнект, затем закрываем
+// сокет ВНЕ лока — это разблокирует чтение закачки. Указатель m.client обнуляется
+// ПОД clientMu, потому что фоновые читатели (насос/команды) читают его под этим
+// локом; один писатель не убирает гонку чтение/запись. Прочитать указатель один
+// раз в этой (Update) горутине, чтобы его закрыть, безопасно: все записи в
+// m.client происходят в этой же горутине.
 func (m *Model) doDisconnect() tea.Cmd {
 	m.stopPump()
 	if m.dlCancel != nil {

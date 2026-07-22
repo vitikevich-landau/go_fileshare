@@ -1,7 +1,10 @@
-// Command fshare-commander is the fileshare v2 client. The full-screen TUI
-// (Bubble Tea) lands in M9; for now it provides a scriptable --batch mode:
-// list a directory, stat/checksum a path, or download a file
-// (docs/tz/09-go-port.md §5.11).
+// Команда fshare-commander — клиент fileshare v2. По умолчанию запускает
+// полноэкранный TUI в стиле Midnight Commander (Bubble Tea). Флаг --batch даёт
+// скриптовый режим: перечислить каталог, узнать метаданные/сумму пути или
+// скачать файл — и выйти (docs/tz/09-go-port.md §5.11).
+//
+// Один бинарь и для пользователя, и для админа: админ-функции открываются по
+// роли, полученной при входе.
 package main
 
 import (
@@ -38,10 +41,11 @@ func main() {
 	)
 	flag.Parse()
 
+	// Без --batch запускаем интерактивный TUI, предзаполнив форму подключения.
 	if !*batch {
 		pre := tui.Profile{}
 		if *profile != "" {
-			pre.Name = *profile // load a saved profile; ignore host/port defaults
+			pre.Name = *profile // грузим сохранённый профиль; host/port по умолчанию игнорируем
 		} else {
 			pre.Host, pre.Port, pre.Login = *host, *port, *login
 		}
@@ -49,6 +53,7 @@ func main() {
 		return
 	}
 
+	// Режим --batch: одно скриптовое действие и выход.
 	pw := resolvePassword(*password, *login)
 	addr := fmt.Sprintf("%s:%d", *host, *port)
 	c, err := client.Dial(addr, client.Options{Login: *login, Password: pw, ClientName: "fshare-commander/batch"})
@@ -138,6 +143,9 @@ func doGet(c *client.Client, remote, out string) {
 	fmt.Printf("downloaded %s -> %s in %s\n", remote, out, time.Since(start).Round(time.Millisecond))
 }
 
+// resolvePassword достаёт пароль по приоритету: флаг → переменная окружения
+// FILESHARE_PASSWORD → запрос в терминале. Пустой логин = сервер без входа,
+// пароль не нужен.
 func resolvePassword(flagPw, login string) string {
 	if flagPw != "" {
 		return flagPw
@@ -146,7 +154,7 @@ func resolvePassword(flagPw, login string) string {
 		return env
 	}
 	if login == "" {
-		return "" // no-auth server needs no password
+		return "" // серверу без аутентификации пароль не нужен
 	}
 	fmt.Fprint(os.Stderr, "Password: ")
 	fd := int(os.Stdin.Fd())
