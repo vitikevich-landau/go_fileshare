@@ -201,7 +201,11 @@ func (s *Server) dispatch(sess *Session, m proto.Message) {
 	case proto.Ping:
 		sess.sendMsg(proto.Pong{})
 	case proto.Subscribe:
-		sess.subMask.Store(req.Mask)
+		mask := req.Mask
+		if sess.Role() != proto.RoleAdmin {
+			mask &^= proto.SubConfig // EVENT_CONFIG is admin-only (CR-07)
+		}
+		sess.subMask.Store(mask)
 	case proto.ListDirRequest:
 		s.handleList(sess, req)
 	case proto.StatRequest:
