@@ -12,6 +12,7 @@ type Panel struct {
 	Top      int // index of the first visible row
 	Selected map[string]bool
 	LastSeen int64
+	Sort     sortMode // F2 cycles this
 }
 
 func newPanel(remote bool, label, path string) *Panel {
@@ -21,7 +22,7 @@ func newPanel(remote bool, label, path string) *Panel {
 // SetEntries replaces the listing. It sorts real entries, marks new ones
 // against LastSeen, prepends ".." when hasParent, and clamps the cursor.
 func (p *Panel) SetEntries(entries []Entry, hasParent bool) {
-	sortEntries(entries)
+	sortEntriesBy(entries, p.Sort)
 	for i := range entries {
 		entries[i].IsNew = p.LastSeen > 0 && entries[i].Mtime > p.LastSeen
 	}
@@ -105,6 +106,36 @@ func (p *Panel) ToggleSelect() {
 	} else {
 		p.Selected[e.Name] = true
 	}
+}
+
+// InvertSelect flips the selection of every file entry (dirs and ".." are left
+// untouched).
+func (p *Panel) InvertSelect() {
+	for _, e := range p.Entries {
+		if e.IsDir || e.IsUp {
+			continue
+		}
+		if p.Selected[e.Name] {
+			delete(p.Selected, e.Name)
+		} else {
+			p.Selected[e.Name] = true
+		}
+	}
+}
+
+// Resort reorders the current entries by the panel's sort mode, keeping ".." at
+// the top, and resets the cursor.
+func (p *Panel) Resort() {
+	rest := p.Entries
+	hasUp := len(rest) > 0 && rest[0].IsUp
+	if hasUp {
+		rest = rest[1:]
+	}
+	sortEntriesBy(rest, p.Sort)
+	if hasUp {
+		p.Entries = append(p.Entries[:1], rest...)
+	}
+	p.Cursor, p.Top = 0, 0
 }
 
 // Targets returns the names to act on: the selection if any, else the current

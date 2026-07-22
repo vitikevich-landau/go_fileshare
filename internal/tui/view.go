@@ -56,6 +56,9 @@ func (m *Model) viewConnect() string {
 }
 
 func (m *Model) viewCommander() string {
+	if m.fullLog {
+		return m.viewFullLog()
+	}
 	colW := (m.width - 3) / 2
 	if colW < 12 {
 		colW = 12
@@ -72,10 +75,39 @@ func (m *Model) viewCommander() string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString(m.renderOpLog(4))
+	if m.infoBox != nil {
+		b.WriteString(m.renderInfoBox())
+	} else {
+		b.WriteString(m.renderOpLog(4))
+	}
 	b.WriteString(m.renderTransfer() + "\n")
 	b.WriteString(m.renderPrompt() + "\n")
 	b.WriteString(m.renderFbar())
+	return b.String()
+}
+
+// viewFullLog renders the fullscreen operation log (Ctrl+O).
+func (m *Model) viewFullLog() string {
+	var b strings.Builder
+	b.WriteString(styActiveTitle.Render(fit(" Operation log · Ctrl+O to close", m.width)) + "\n")
+	rows := m.panelRows + 2
+	if rows < 4 {
+		rows = 4
+	}
+	b.WriteString(m.renderOpLog(rows))
+	b.WriteString(m.renderTransfer() + "\n")
+	b.WriteString(m.renderPrompt() + "\n")
+	b.WriteString(m.renderFbar())
+	return b.String()
+}
+
+// renderInfoBox renders the F3/F4 info/checksum box in the op-log slot.
+func (m *Model) renderInfoBox() string {
+	var b strings.Builder
+	b.WriteString(styActiveTitle.Render(fit(" info · any key to close", m.width)) + "\n")
+	for _, line := range m.infoBox {
+		b.WriteString(fit("  "+line, m.width) + "\n")
+	}
 	return b.String()
 }
 

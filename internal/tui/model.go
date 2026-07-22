@@ -107,6 +107,10 @@ type Model struct {
 	cmdMode  bool
 	cmdInput textinput.Model
 
+	// hotkey overlays
+	fullLog bool     // Ctrl+O: fullscreen op-log
+	infoBox []string // F3/F4: entry info/checksum box (nil = closed)
+
 	events   chan tea.Msg
 	quitting bool
 }
@@ -225,6 +229,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			m.log(lineErr, fmt.Sprintf("download %s failed: %v", msg.name, msg.err))
 			cmd = m.afterRemoteOp()
+		}
+	case checksumMsg:
+		var line string
+		if msg.err != nil {
+			line = "checksum error: " + msg.err.Error()
+		} else {
+			line = fmt.Sprintf("%s: %x", algoName(msg.algo), msg.sum[:])
+		}
+		m.log(lineInfo, msg.name+" "+line)
+		if m.infoBox != nil {
+			m.infoBox = append(m.infoBox, line)
 		}
 	case eventMsg:
 		cmd = m.onEvent(msg.m)
@@ -446,6 +461,14 @@ func (m *Model) onConnected(msg connectedMsg) tea.Cmd {
 }
 
 func (m *Model) handleCommanderKey(k tea.KeyMsg) tea.Cmd {
+	// An open info box (F3/F4) is dismissed by any key except Ctrl+C.
+	if m.infoBox != nil {
+		if k.String() == "ctrl+c" {
+			return m.quit()
+		}
+		m.infoBox = nil
+		return nil
+	}
 	switch k.String() {
 	case "ctrl+c":
 		return m.quit()
@@ -474,6 +497,16 @@ func (m *Model) handleCommanderKey(k tea.KeyMsg) tea.Cmd {
 	case " ", "insert":
 		m.activePanel().ToggleSelect()
 		m.activePanel().Move(1, m.panelRows)
+	case "*":
+		m.activePanel().InvertSelect()
+	case "f2":
+		m.cyclePanelSort()
+	case "f3":
+		m.showEntryInfo()
+	case "f4":
+		return m.checksumEntry()
+	case "ctrl+o":
+		m.fullLog = !m.fullLog
 	case "f5":
 		return m.download()
 	case "ctrl+r":
