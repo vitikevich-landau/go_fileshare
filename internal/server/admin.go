@@ -8,9 +8,9 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/proto"
 )
 
-// handleAdmin dispatches an admin message. The request loop only reaches this
-// for role=admin sessions (dispatch.MinRole), so authorization is enforced on
-// the server regardless of the client UI (docs/tz/05-admin.md §1).
+// handleAdmin разбирает админ-сообщение. Цикл запросов доходит сюда только для
+// сессий с ролью admin (см. MinRole), поэтому авторизация обеспечена на сервере
+// независимо от клиентского UI (docs/tz/05-admin.md §1).
 func (s *Server) handleAdmin(sess *Session, m proto.Message) {
 	switch req := m.(type) {
 	case proto.AdminGetConfig:
@@ -57,12 +57,14 @@ func (s *Server) adminSet(sess *Session, req proto.AdminSet) {
 		sess.sendMsg(proto.AdminSetResult{OK: false, Message: err.Error()})
 		return
 	}
-	// hub.Set already persisted + broadcast EVENT_CONFIG via onConfigChange.
+	// hub.Set уже сохранил конфиг и разослал EVENT_CONFIG через onConfigChange.
 	s.log.Info("admin config change", "admin", sess.Login(), "ip", sess.IP, "key", req.Key, "value", req.Value)
 	s.BroadcastNotice(proto.SevInfo, fmt.Sprintf("%s set %s = %s", sess.Login(), req.Key, req.Value))
 	sess.sendMsg(proto.AdminSetResult{OK: true, Message: "applied"})
 }
 
+// adminListClients собирает сводку по всем живым сессиям для админ-панели: логин,
+// IP, роль, где «находится» клиент, отдано байт и средняя скорость за сессию.
 func (s *Server) adminListClients(sess *Session) {
 	now := time.Now()
 	sessions := s.reg.list()
@@ -72,7 +74,7 @@ func (s *Server) adminListClients(sess *Session) {
 		bytes := sn.bytes.Load()
 		var speed uint64
 		if up > 0 {
-			speed = uint64(float64(bytes) / up) // average over the session
+			speed = uint64(float64(bytes) / up) // среднее за сессию
 		}
 		clients = append(clients, proto.ClientInfo{
 			SessionID:   sn.ID,
@@ -87,6 +89,8 @@ func (s *Server) adminListClients(sess *Session) {
 	sess.sendMsg(proto.AdminClients{Clients: clients})
 }
 
+// adminKick принудительно отключает чужую сессию по номеру (свою — нельзя).
+// Закрытие сокета разблокирует её читателя/писателя, а её handleConn свернёт всё.
 func (s *Server) adminKick(sess *Session, req proto.AdminKick) {
 	if req.SessionID == sess.ID {
 		sess.sendMsg(proto.AdminKickResult{OK: false, Message: "cannot kick your own session"})
@@ -99,13 +103,15 @@ func (s *Server) adminKick(sess *Session, req proto.AdminKick) {
 	}
 	s.log.Info("admin kick", "admin", sess.Login(), "target_session", req.SessionID, "target_login", target.Login())
 	s.BroadcastNotice(proto.SevWarn, fmt.Sprintf("%s kicked session %d (%s)", sess.Login(), req.SessionID, target.Login()))
-	target.conn.Close() // unblocks its reader/writer; the handler tears down
+	target.conn.Close() // разблокирует его читателя/писателя; handler свернёт всё
 	sess.sendMsg(proto.AdminKickResult{OK: true, Message: fmt.Sprintf("kicked session %d", req.SessionID)})
 }
 
+// adminStats отдаёт сводную статистику сервера. Число файлов берётся из кэша VFS
+// (дерево обходится в фоне не чаще раза в 30с), чтобы ответ был мгновенным.
 func (s *Server) adminStats(sess *Session) {
 	lim := s.hub.Current().Limits
-	files, _ := s.vfs.ShareStats() // cached; walks in the background at most every 30s
+	files, _ := s.vfs.ShareStats() // кэш; обход в фоне не чаще раза в 30с
 	sess.sendMsg(proto.AdminStatsResponse{
 		UptimeS:         uint64(time.Since(s.start).Seconds()),
 		BytesSent:       s.bytesSent.Load(),
@@ -123,6 +129,6 @@ func (s *Server) adminShutdown(sess *Session, req proto.AdminShutdown) {
 	s.BroadcastNotice(proto.SevWarn, fmt.Sprintf("server shutting down in %d seconds", req.GraceSeconds))
 	s.log.Info("admin shutdown requested", "admin", sess.Login(), "grace_s", req.GraceSeconds)
 	sess.sendMsg(proto.AdminShutdownResult{OK: true, Message: "shutting down"})
-	// Cancel the accept loop after replying, so drain runs with the grace.
+	// Отменяем цикл приёма ПОСЛЕ ответа, чтобы drain отработал с grace-периодом.
 	go s.requestShutdown(req.GraceSeconds)
 }

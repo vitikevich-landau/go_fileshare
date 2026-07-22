@@ -9,55 +9,59 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/proto"
 )
 
-// writeDeadline bounds a single socket write so a stuck client cannot wedge the
-// writer goroutine forever.
+// writeDeadline ограничивает одну запись в сокет, чтобы застрявший клиент не
+// заклинил горутину-писателя навсегда.
 const writeDeadline = 30 * time.Second
 
-// flushTimeout bounds how long teardown waits for the writer to flush queued
-// frames before force-closing the socket.
+// flushTimeout ограничивает, сколько teardown ждёт, пока писатель дошлёт
+// накопленные кадры, перед принудительным закрытием сокета.
 const flushTimeout = 2 * time.Second
 
-// idleCheckInterval is how often the idle watchdog re-evaluates a connection.
+// idleCheckInterval — как часто «сторож простоя» переоценивает соединение.
 const idleCheckInterval = time.Second
 
-// outBuffer is the per-session outgoing queue depth.
+// outBuffer — глубина исходящей очереди на сессию.
 const outBuffer = 64
 
 var emptyPath = ""
 
-// Session is one connected client. Outgoing frames go through the out channel,
-// drained by a single writer goroutine, so writes are serialized (frames are
-// atomic on the wire) and a slow client backpressures only its own transfers —
-// broadcasts use a non-blocking send and are dropped rather than blocking others
-// (docs/tz/09-go-port.md §5.5).
+// Session — один подключённый клиент. Исходящие кадры идут через канал out,
+// который вычитывает ЕДИНСТВЕННАЯ горутина-писатель: поэтому записи
+// сериализованы (кадры атомарны на проводе), а медленный клиент создаёт
+// backpressure только собственным передачам — рассылки шлются НЕблокирующе и
+// отбрасываются, а не тормозят остальных (docs/tz/09-go-port.md §5.5).
+//
+// Часть полей защищена мьютексом mu (login/role/authed/cancel*), часть —
+// атомарные (subMask/bytes/curPath/downloading/inFlight/lastActivity), чтобы
+// читаться на горячем пути без блокировок.
 type Session struct {
-	ID   uint64
-	IP   string
+	ID   SessionID
+	IP   ClientIP
 	conn net.Conn
 
-	out  chan []byte
-	done chan struct{}
-	wg   *sync.WaitGroup // background goroutines (writer + active download)
+	out  chan []byte     // очередь исходящих кадров (читает writeLoop)
+	done chan struct{}   // закрывается при teardown — сигнал всем горутинам сессии
+	wg   *sync.WaitGroup // фоновые горутины (писатель + активная закачка)
 
-	challenge []byte // set during handshake
+	challenge []byte // выдан во время рукопожатия
 
 	mu        sync.Mutex
 	login     string
 	role      proto.Role
 	authed    bool
-	cancelDL  chan struct{} // closes to cancel the active download
-	cancelTID uint32        // transfer id the cancel channel belongs to (R3-2)
+	cancelDL  chan struct{} // закрытие отменяет активную закачку
+	cancelTID TransferID    // id передачи, которой принадлежит канал отмены (R3-2)
 
-	subMask      atomic.Uint32
-	bytes        atomic.Uint64
-	curPath      atomic.Pointer[string]
-	downloading  atomic.Bool
-	inFlight     atomic.Bool  // a request handler is running in dispatch (R3-6)
-	lastActivity atomic.Int64 // unix-nanos of the last completed frame / activity
+	subMask      atomic.Uint32          // маска подписки на события
+	bytes        atomic.Uint64          // отдано байт этому клиенту
+	curPath      atomic.Pointer[string] // где клиент «находится» (последний LIST_DIR)
+	downloading  atomic.Bool            // идёт ли сейчас закачка
+	inFlight     atomic.Bool            // выполняется ли обработчик запроса (R3-6)
+	lastActivity atomic.Int64           // unix-нс последней активности (для сторожа простоя)
 	startedAt    time.Time
 }
 
-func newSession(id uint64, conn net.Conn, ip string, wg *sync.WaitGroup) *Session {
+func newSession(id SessionID, conn net.Conn, ip ClientIP, wg *sync.WaitGroup) *Session {
 	s := &Session{
 		ID:        id,
 		IP:        ip,
@@ -72,16 +76,17 @@ func newSession(id uint64, conn net.Conn, ip string, wg *sync.WaitGroup) *Sessio
 	return s
 }
 
-// touch records activity for the idle watchdog.
+// touch отмечает активность для сторожа простоя.
 func (s *Session) touch() { s.lastActivity.Store(time.Now().UnixNano()) }
 
-// idleFor reports how long the session has been without activity.
+// idleFor сообщает, как долго сессия была без активности.
 func (s *Session) idleFor() time.Duration {
 	return time.Since(time.Unix(0, s.lastActivity.Load()))
 }
 
-// send queues a frame, blocking for backpressure until it is accepted or the
-// session is being torn down.
+// send кладёт кадр в очередь, БЛОКИРУЯСЬ для backpressure, пока кадр не примут
+// или пока сессию не начнут закрывать (тогда возвращает false). Так медленный
+// клиент притормаживает свои же передачи, а не теряет кадры.
 func (s *Session) send(frame []byte) bool {
 	select {
 	case s.out <- frame:
@@ -91,8 +96,9 @@ func (s *Session) send(frame []byte) bool {
 	}
 }
 
-// trySend queues a frame without blocking, dropping it if the queue is full.
-// Used for broadcasts so one slow client cannot stall delivery to others.
+// trySend кладёт кадр в очередь БЕЗ блокировки, отбрасывая его, если очередь
+// полна. Используется для рассылок, чтобы один медленный клиент не задержал
+// доставку остальным.
 func (s *Session) trySend(frame []byte) bool {
 	select {
 	case s.out <- frame:
@@ -105,8 +111,9 @@ func (s *Session) trySend(frame []byte) bool {
 func (s *Session) sendMsg(m proto.Message) bool    { return s.send(proto.Encode(m)) }
 func (s *Session) trySendMsg(m proto.Message) bool { return s.trySend(proto.Encode(m)) }
 
-// writeLoop drains out to the socket until the session is torn down, then makes
-// a best-effort flush of anything still queued.
+// writeLoop сливает очередь out в сокет, пока сессию не начнут закрывать, затем
+// по мере сил дошлёт всё, что ещё осталось в очереди (например, финальный
+// AUTH_FAIL/ERROR). Это единственное место, которое пишет в сокет.
 func (s *Session) writeLoop() {
 	for {
 		select {
@@ -132,7 +139,7 @@ func (s *Session) writeLoop() {
 func (s *Session) writeFrame(frame []byte) bool {
 	_ = s.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
 	if _, err := s.conn.Write(frame); err != nil {
-		s.conn.Close() // unblock the reader on a dead socket
+		s.conn.Close() // на мёртвом сокете закрываем, чтобы разблокировать читателя
 		return false
 	}
 	return true
@@ -164,17 +171,18 @@ func (s *Session) Authed() bool {
 	return s.authed
 }
 
-// setCancel installs the cancel channel for the active download and records the
-// transfer id it belongs to, so a cancel request can be matched to it (R3-2).
-func (s *Session) setCancel(tid uint32, c chan struct{}) {
+// setCancel устанавливает канал отмены для активной закачки и запоминает id
+// передачи, которому он принадлежит, чтобы запрос отмены можно было сопоставить
+// именно с ней (R3-2).
+func (s *Session) setCancel(tid TransferID, c chan struct{}) {
 	s.mu.Lock()
 	s.cancelDL = c
 	s.cancelTID = tid
 	s.mu.Unlock()
 }
 
-// clearCancel drops the active download's cancel channel once the transfer has
-// finished, so a stale DOWNLOAD_CANCEL cannot touch a later transfer (R3-2).
+// clearCancel сбрасывает канал отмены после завершения передачи, чтобы
+// «запоздавший» DOWNLOAD_CANCEL не задел следующую передачу (R3-2).
 func (s *Session) clearCancel() {
 	s.mu.Lock()
 	s.cancelDL = nil
@@ -182,11 +190,11 @@ func (s *Session) clearCancel() {
 	s.mu.Unlock()
 }
 
-// cancelDownload closes the active download's cancel channel, but only if tid
-// matches the active transfer. A stray or late cancel for a different (e.g.
-// already-finished) transfer is ignored so it cannot abort the wrong one
-// (R3-2). It reports whether a cancel was actually delivered.
-func (s *Session) cancelDownload(tid uint32) bool {
+// cancelDownload закрывает канал отмены активной закачки, но ТОЛЬКО если tid
+// совпадает с активной передачей. Случайная или запоздавшая отмена для другой
+// (например, уже завершённой) передачи игнорируется, чтобы не оборвать не ту
+// (R3-2). Возвращает, была ли отмена действительно доставлена.
+func (s *Session) cancelDownload(tid TransferID) bool {
 	s.mu.Lock()
 	c := s.cancelDL
 	if c == nil || s.cancelTID != tid {
@@ -208,7 +216,9 @@ func (s *Session) CurPath() string {
 	return ""
 }
 
-// Registry tracks live sessions.
+// Registry отслеживает живые сессии (по SessionID). Безопасен для конкурентного
+// доступа: диспетчер, рассылки, админ-kick и сторож простоя обращаются к нему из
+// разных горутин.
 type Registry struct {
 	mu       sync.Mutex
 	sessions map[uint64]*Session
@@ -252,10 +262,10 @@ func (r *Registry) count() int {
 	return n
 }
 
-// reserveUserSlot atomically enforces the per-user session cap and, if there is
-// room, marks sess authenticated — so concurrent handshakes for one user cannot
-// all slip past the check before any of them commits (CR-06). max <= 0 means no
-// limit. It returns whether the slot was granted.
+// reserveUserSlot АТОМАРНО проверяет лимит сессий на пользователя и, если место
+// есть, помечает sess аутентифицированной — так параллельные рукопожатия одного
+// пользователя не смогут все проскочить проверку до того, как хоть одно
+// зафиксируется (CR-06). max <= 0 означает «без лимита». Возвращает, выдан ли слот.
 func (r *Registry) reserveUserSlot(sess *Session, login string, role proto.Role, max int) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -274,15 +284,17 @@ func (r *Registry) reserveUserSlot(sess *Session, login string, role proto.Role,
 	return true
 }
 
-// closeAll force-closes every session's socket (used on shutdown after grace).
+// closeAll принудительно закрывает сокеты всех сессий (используется при остановке
+// после истечения grace-периода).
 func (r *Registry) closeAll() {
 	for _, s := range r.list() {
 		s.conn.Close()
 	}
 }
 
-// broadcast queues frame to every session subscribed to any bit in mask, using
-// a non-blocking send (docs/tz/09-go-port.md §5.5).
+// broadcast кладёт frame в очередь каждой сессии, подписанной на любой бит в mask,
+// НЕблокирующей отправкой — так тормозящий клиент не задержит доставку остальным
+// (docs/tz/09-go-port.md §5.5).
 func (r *Registry) broadcast(mask uint32, frame []byte) {
 	for _, s := range r.list() {
 		if s.subMask.Load()&mask != 0 {

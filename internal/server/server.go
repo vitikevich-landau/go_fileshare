@@ -1,6 +1,9 @@
-// Package server implements the fileshare v2 daemon: accept loop, per-connection
-// handshake and request loop, session registry, filesystem/transfer handlers,
-// and graceful shutdown (docs/tz/09-go-port.md §5.5).
+// Package server реализует демон fileshare v2: цикл приёма соединений,
+// рукопожатие и цикл запросов на каждое соединение, реестр сессий, обработчики
+// файловой системы и передач, корректную остановку (docs/tz/09-go-port.md §5.5).
+//
+// Модель конкурентности (горутина-писатель / читатель / сторож простоя /
+// горутина закачки) и словарь типов описаны в types.go.
 package server
 
 import (
@@ -19,28 +22,30 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/vfs"
 )
 
-// Options configures a Server.
+// Options — параметры конструктора Server (зависимости и настройки, которые
+// сервер не создаёт сам, а получает снаружи).
 type Options struct {
-	Hub        *config.Hub
-	VFS        *vfs.VFS
-	Users      *auth.DB
-	Guard      *auth.Guard
-	Logger     *slog.Logger
-	ServerName string
-	Version    string
-	// ConfigPath, when set, is where accepted ADMIN_SET/reload changes are
-	// persisted atomically so they survive a restart.
+	Hub        *config.Hub  // хаб горячих настроек (снапшоты)
+	VFS        *vfs.VFS     // дерево раздачи + checksum-кэш
+	Users      *auth.DB     // база пользователей (nil/пусто = bootstrap без входа)
+	Guard      *auth.Guard  // анти-brute-force бан по IP
+	Logger     *slog.Logger // структурный логгер
+	ServerName string       // самоназвание в HELLO_OK
+	Version    string       // версия для ADMIN_STATS
+	// ConfigPath, если задан, — куда АТОМАРНО сохранять принятые изменения
+	// ADMIN_SET/reload, чтобы они пережили перезапуск.
 	ConfigPath string
-	// LogLevel, when set, is updated live when log.level changes so the hot
-	// setting actually takes effect (CR-08). Build the logger's handler with
-	// this same LevelVar.
+	// LogLevel, если задан, обновляется на лету при смене log.level, чтобы горячая
+	// настройка реально применилась (CR-08). Обработчик логгера нужно строить с
+	// этим же LevelVar.
 	LogLevel *slog.LevelVar
-	// AuthFailDelay is slept after each failed authentication to slow brute
-	// force (docs/tz/06-security.md §3). Tests set 0.
+	// AuthFailDelay — пауза после каждой неудачной аутентификации для замедления
+	// перебора (docs/tz/06-security.md §3). Тесты ставят 0.
 	AuthFailDelay time.Duration
 }
 
-// Server is a running (or runnable) fileshare daemon.
+// Server — работающий (или готовый к запуску) демон fileshare. Держит все общие
+// службы и счётчики; на каждое соединение заводится своя Session.
 type Server struct {
 	hub           *config.Hub
 	vfs           *vfs.VFS
@@ -55,21 +60,21 @@ type Server struct {
 	logLevelVar   *slog.LevelVar
 	limiter       *ratelimit.Limiter
 
-	reg *Registry
-	ln  net.Listener
+	reg *Registry    // реестр живых сессий
+	ln  net.Listener // TCP-слушатель
 
-	serveCancel context.CancelFunc // cancels the accept loop (ADMIN_SHUTDOWN)
-	adminGrace  atomic.Int64       // seconds; overrides drain grace when > 0
+	serveCancel context.CancelFunc // отменяет цикл приёма (ADMIN_SHUTDOWN)
+	adminGrace  atomic.Int64       // секунды; переопределяет grace при значении > 0
 
-	connWg      sync.WaitGroup
-	activeConns atomic.Int64
+	connWg      sync.WaitGroup // ждёт завершения всех горутин соединений при остановке
+	activeConns atomic.Int64   // сейчас открытых соединений (для лимита и статистики)
 
-	// stats
-	bytesSent       atomic.Uint64
-	completed       atomic.Uint64
-	activeDownloads atomic.Int64
-	nextTransfer    atomic.Uint32
-	nextSession     atomic.Uint64
+	// счётчики статистики (все атомарные — читаются админом на лету)
+	bytesSent       atomic.Uint64 // всего отдано байт
+	completed       atomic.Uint64 // успешно завершённых передач
+	activeDownloads atomic.Int64  // идущих закачек
+	nextTransfer    atomic.Uint32 // генератор TransferID
+	nextSession     atomic.Uint64 // генератор SessionID
 }
 
 // New builds a Server from opts.
@@ -107,10 +112,11 @@ func New(opts Options) *Server {
 	return s
 }
 
-// onConfigChange persists the current snapshot (if a config path is set) and
-// broadcasts EVENT_CONFIG to admin subscribers (docs/tz/09-go-port.md §5.4).
+// onConfigChange сохраняет текущий снапшот (если задан путь конфига) и рассылает
+// EVENT_CONFIG подписанным админам (docs/tz/09-go-port.md §5.4). Вызывается хабом
+// после успешного ADMIN_SET.
 func (s *Server) onConfigChange(key, value string) {
-	// Apply the hot log level to the live logger (CR-08).
+	// Применяем горячий уровень логирования к живому логгеру (CR-08).
 	if key == "log.level" && s.logLevelVar != nil {
 		s.logLevelVar.Set(parseLogLevel(value))
 	}
@@ -140,7 +146,8 @@ func parseLogLevel(level string) slog.Level {
 // Registry exposes the session registry (used by the watcher/admin layers).
 func (s *Server) Registry() *Registry { return s.reg }
 
-// authMode is NONE when there are no users (bootstrap), else CHALLENGE.
+// authMode — NONE, когда пользователей нет (bootstrap: любой логин = admin),
+// иначе CHALLENGE.
 func (s *Server) authMode() proto.AuthMode {
 	if s.users == nil || s.users.Empty() {
 		return proto.AuthNone
@@ -162,8 +169,10 @@ func (s *Server) Listen(addr string) error {
 // Addr returns the bound listen address.
 func (s *Server) Addr() net.Addr { return s.ln.Addr() }
 
-// Serve runs the accept loop until ctx is cancelled, then drains active
-// connections for up to grace before force-closing them.
+// Serve крутит цикл приёма соединений до отмены ctx, затем «сливает» активные
+// соединения в течение не более grace, прежде чем принудительно их закрыть.
+// Каждое принятое соединение обрабатывается в своей горутине (handleConn), а
+// лимит MaxConnections проверяется на входе.
 func (s *Server) Serve(ctx context.Context, grace time.Duration) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -180,7 +189,7 @@ func (s *Server) Serve(ctx context.Context, grace time.Duration) error {
 		conn, err := s.ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
-				break // shutting down
+				break // идёт остановка
 			}
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
@@ -207,9 +216,9 @@ func (s *Server) Serve(ctx context.Context, grace time.Duration) error {
 	return s.drain(grace)
 }
 
-// Rate-limit bucket reaper: drop per-client buckets idle longer than
-// rateReapTTL, checked every rateReapInterval, so the limiter's map stays
-// bounded for a churning user set (§8 bug 11 follow-up).
+// Сборщик вёдер rate-limit: удаляет персональные вёдра, простаивавшие дольше
+// rateReapTTL, с проверкой каждые rateReapInterval, чтобы карта лимитера
+// оставалась ограниченной при меняющемся наборе пользователей (§8 bug 11).
 const (
 	rateReapInterval = time.Minute
 	rateReapTTL      = 10 * time.Minute
@@ -233,9 +242,10 @@ func (s *Server) reapRateBuckets(ctx context.Context, interval, ttl time.Duratio
 	}
 }
 
-// requestShutdown triggers a graceful shutdown with the given grace period
-// (ADMIN_SHUTDOWN). It is safe to call once.
-func (s *Server) requestShutdown(graceSeconds uint32) {
+// requestShutdown запускает корректную остановку с заданным grace-периодом
+// (ADMIN_SHUTDOWN): запоминает grace и отменяет цикл приёма, после чего Serve
+// переходит к drain. Рассчитан на однократный вызов.
+func (s *Server) requestShutdown(graceSeconds GraceSeconds) {
 	s.adminGrace.Store(int64(graceSeconds))
 	if s.serveCancel != nil {
 		s.serveCancel()
@@ -248,8 +258,9 @@ func (s *Server) rejectConn(conn net.Conn) {
 	conn.Close()
 }
 
-// drain waits for active connections to finish, up to grace, then force-closes
-// any that remain and waits for their goroutines to exit.
+// drain ждёт завершения активных соединений не дольше grace, затем принудительно
+// закрывает оставшиеся и дожидается выхода их горутин. Так корректная передача
+// успевает доиграть, а «зависшие» клиенты не задерживают остановку навсегда.
 func (s *Server) drain(grace time.Duration) error {
 	done := make(chan struct{})
 	go func() {
@@ -271,8 +282,9 @@ func (s *Server) drain(grace time.Duration) error {
 	return nil
 }
 
-// handleConn owns one connection: it starts the writer goroutine, runs the
-// handshake and request loop, and tears everything down on exit (docs/tz/09-go-port.md §5.5).
+// handleConn владеет одним соединением: запускает горутину-писателя, проводит
+// рукопожатие и цикл запросов и корректно всё сворачивает на выходе
+// (docs/tz/09-go-port.md §5.5).
 func (s *Server) handleConn(conn net.Conn) {
 	ip := hostOf(conn.RemoteAddr())
 	id := s.nextSession.Add(1)
@@ -288,11 +300,11 @@ func (s *Server) handleConn(conn net.Conn) {
 	}()
 
 	defer func() {
-		close(sess.done) // stop producers/senders; writer flushes queued frames
+		close(sess.done) // остановить производителей/отправителей; писатель дошлёт очередь
 
-		// Give the writer a bounded window to flush remaining frames (e.g. a
-		// final AUTH_FAIL/ERROR) before force-closing, so a well-behaved client
-		// receives them; a client that stops reading cannot stall teardown.
+		// Даём писателю ограниченное окно, чтобы дослать оставшиеся кадры
+		// (например, финальный AUTH_FAIL/ERROR), прежде чем закрыть силой: вежливый
+		// клиент их получит, а переставший читать клиент не сможет затормозить teardown.
 		flushed := make(chan struct{})
 		go func() { cwg.Wait(); close(flushed) }()
 		select {
@@ -312,7 +324,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	s.serveRequests(sess)
 }
 
-func hostOf(addr net.Addr) string {
+// hostOf извлекает host (без порта) из сетевого адреса — это и есть ClientIP,
+// который сервер пишет в логи и передаёт гарду.
+func hostOf(addr net.Addr) ClientIP {
 	host, _, err := net.SplitHostPort(addr.String())
 	if err != nil {
 		return addr.String()
