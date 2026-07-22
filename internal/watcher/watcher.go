@@ -113,6 +113,14 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 		}
 	}
 
+	// A removed or renamed-away path may have been a watched directory; drop its
+	// watch explicitly so the fsnotify watch set stays bounded rather than
+	// relying on backend auto-removal (§8 bug 15, remove-half). Remove on a path
+	// that was not a watch is a harmless no-op.
+	if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+		_ = w.fsw.Remove(ev.Name)
+	}
+
 	created := ev.Op&(fsnotify.Create|fsnotify.Rename) != 0
 
 	w.mu.Lock()

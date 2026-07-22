@@ -74,6 +74,50 @@ func TestWatcherRecursiveNewSubdir(t *testing.T) {
 	}
 }
 
+func watchListContains(w *Watcher, path string) bool {
+	for _, p := range w.fsw.WatchList() {
+		if p == path {
+			return true
+		}
+	}
+	return false
+}
+
+// A removed directory's watch must be dropped so the fsnotify watch set stays
+// bounded rather than leaking a watch per removed subtree (§8 bug 15).
+func TestWatcherDropsWatchOnDirRemove(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ch := make(chan Event, 16)
+	w, err := New(root, 30*time.Millisecond, func(e Event) { ch <- e })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+
+	if !watchListContains(w, sub) {
+		t.Fatalf("subdir %q is not watched initially; WatchList=%v", sub, w.fsw.WatchList())
+	}
+
+	if err := os.RemoveAll(sub); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.After(3 * time.Second)
+	for watchListContains(w, sub) {
+		select {
+		case <-deadline:
+			t.Fatalf("watch on removed dir %q was not dropped; WatchList=%v", sub, w.fsw.WatchList())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 func TestWatcherReportsRemove(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "gone.txt")
