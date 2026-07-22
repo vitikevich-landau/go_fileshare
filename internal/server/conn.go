@@ -231,7 +231,26 @@ func (s *Server) handleList(sess *Session, req proto.ListDirRequest) {
 		s.sendErr(sess, vfs.CodeOf(err))
 		return
 	}
-	sess.sendMsg(proto.ListDirResponse{Path: clean, Entries: entries})
+	frame, ok := listDirFrame(clean, entries)
+	if !ok {
+		// A listing that would exceed the frame limit is refused with a
+		// controlled error rather than an oversize frame that would break the
+		// connection (CR-10). Pagination is a future protocol extension.
+		s.log.Warn("directory listing exceeds frame limit", "path", clean, "entries", len(entries))
+		s.sendErr(sess, proto.ErrInternal)
+		return
+	}
+	sess.send(frame)
+}
+
+// listDirFrame encodes a LIST_DIR_RESPONSE, returning ok=false if its payload
+// would exceed the protocol frame limit.
+func listDirFrame(clean string, entries []proto.DirEntry) ([]byte, bool) {
+	frame := proto.Encode(proto.ListDirResponse{Path: clean, Entries: entries})
+	if len(frame)-proto.HeaderSize > proto.MaxControlPayload {
+		return nil, false
+	}
+	return frame, true
 }
 
 func (s *Server) handleStat(sess *Session, req proto.StatRequest) {
