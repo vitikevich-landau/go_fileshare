@@ -276,15 +276,25 @@ func (c *Client) Subscribe(mask uint32) error {
 // recvExpect or PollEvents.
 func (c *Client) Ping() error { return c.writeMsg(proto.Ping{}) }
 
+// frameReadTimeout bounds how long PollEvents will wait to finish a frame once
+// its first byte has arrived. A well-behaved peer sends the small remainder of
+// an event/pong frame in milliseconds; this only fires if a peer sends one byte
+// then stalls without closing the socket, in which case PollEvents must not
+// wedge the idle pump (and clientMu) forever (R4-1). It is a var so tests can
+// shorten it.
+var frameReadTimeout = 30 * time.Second
+
 // PollEvents waits up to timeout for one asynchronous frame (EVENT_*/PONG),
 // routing it to the event handler. It returns whether a frame was received. A
 // timeout is reported as (false, nil). It must not run concurrently with a
 // request method — a single goroutine owns all reads (docs/tz/09-go-port.md §5.8).
 //
-// The deadline applies only to the FIRST byte of the next frame. Once a frame
-// has started arriving, the rest is read with no deadline, so a slow or
-// fragmented frame is never left half-consumed and cannot desync the stream on
-// the next poll (R3-7). A timeout before any byte means "no event".
+// The idle deadline applies only to the FIRST byte of the next frame, so a
+// timeout before any byte arrives is a clean "no event" that consumes nothing
+// and cannot desync the next poll (R3-7). Once a frame has started, the rest is
+// read under a bounded frameReadTimeout instead of forever; if that fires the
+// frame is partly consumed and the stream is desynced, so the connection is
+// dropped rather than reused (R4-1).
 func (c *Client) PollEvents(timeout time.Duration) (bool, error) {
 	_ = c.conn.SetReadDeadline(time.Now().Add(timeout))
 	var first [1]byte
@@ -296,11 +306,14 @@ func (c *Client) PollEvents(timeout time.Duration) (bool, error) {
 		}
 		return false, err
 	}
-	// A frame has begun; finish reading it without a deadline.
-	_ = c.conn.SetReadDeadline(time.Time{})
+	// A frame has begun; finish reading it under a bounded deadline.
+	_ = c.conn.SetReadDeadline(time.Now().Add(frameReadTimeout))
 	typ, payload, rerr := proto.ReadFrameContinue(first[0], c.conn, proto.MaxControlPayload)
+	_ = c.conn.SetReadDeadline(time.Time{})
 	if rerr != nil {
-		return false, rerr
+		// A stalled or broken mid-frame read leaves the stream desynced; drop the
+		// connection so a later poll/request cannot read leftover bytes (R4-1).
+		return false, c.abortConn(rerr)
 	}
 	m, derr := proto.Decode(typ, payload)
 	if derr != nil {
@@ -337,11 +350,37 @@ func (c *Client) Download(remotePath, localPath string, progress func(Progress))
 // DownloadCtx fetches remotePath into localPath, resuming from localPath+".part"
 // if present. On completion it verifies the reassembled file against the
 // server's whole-file checksum and atomically renames the .part into place.
-// progress may be nil. Cancelling ctx sends DOWNLOAD_CANCEL and drains to the
-// server's terminal frame (so the connection stays usable), returning ctx.Err().
+// progress may be nil. Cancelling ctx aborts the transfer and returns ctx.Err():
+// once the transfer id is known it sends DOWNLOAD_CANCEL and drains to the
+// server's terminal frame so the connection stays usable (RR-3); before then it
+// drops the connection, which cannot be resynced without a transfer id (R4-2).
 func (c *Client) DownloadCtx(ctx context.Context, remotePath, localPath string, progress func(Progress)) error {
-	partPath := localPath + ".part"
+	err := c.downloadOnce(ctx, remotePath, localPath, progress)
 
+	// A stale/oversized .part offset is rejected by the server: discard the .part
+	// and retry ONCE from scratch. Removing it makes the retry's offset 0, which
+	// the server can never reject as UNSUPPORTED_OFFSET, so this cannot loop; if
+	// the .part cannot be removed we stop rather than recurse forever (R4-4).
+	var re *RemoteError
+	if errors.As(err, &re) && re.Code == proto.ErrUnsupportedOffset {
+		partPath := localPath + ".part"
+		if rmErr := os.Remove(partPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			return fmt.Errorf("cannot discard stale partial download %q: %w", partPath, rmErr)
+		}
+		return c.downloadOnce(ctx, remotePath, localPath, progress)
+	}
+	return err
+}
+
+// downloadOnce performs a single download attempt (no stale-offset retry). It
+// observes ctx for the whole attempt, including the wait for ACCEPT (R4-2), and
+// normalizes an error caused by cancellation to ctx.Err() via the named return.
+func (c *Client) downloadOnce(ctx context.Context, remotePath, localPath string, progress func(Progress)) (rerr error) {
+	if err := ctx.Err(); err != nil {
+		return err // already cancelled: send nothing
+	}
+
+	partPath := localPath + ".part"
 	var offset uint64
 	if fi, err := os.Stat(partPath); err == nil && !fi.IsDir() {
 		offset = uint64(fi.Size())
@@ -350,28 +389,16 @@ func (c *Client) DownloadCtx(ctx context.Context, remotePath, localPath string, 
 		return err
 	}
 
-	if err := c.writeMsg(proto.DownloadRequest{Path: remotePath, Offset: offset}); err != nil {
-		return err
-	}
-	m, err := c.recvExpect(proto.MsgDownloadAccept)
-	if err != nil {
-		// A stale/oversized .part offset is rejected: discard it and restart
-		// from scratch rather than looping forever (bug #6).
-		var re *RemoteError
-		if offset > 0 && errors.As(err, &re) && re.Code == proto.ErrUnsupportedOffset {
-			os.Remove(partPath)
-			return c.DownloadCtx(ctx, remotePath, localPath, progress)
-		}
-		return err
-	}
-	accept := m.(proto.DownloadAccept)
-	total := accept.TotalSize
-	tid := accept.TransferID
-
-	// Once ctx is cancelled, ask the server to abort. We keep reading until its
-	// terminal frame so the connection stays in sync (RR-3). We await the watcher
-	// before returning so a cancel triggered exactly as the transfer ends can
-	// never leak a DOWNLOAD_CANCEL into the next transfer (R3-2).
+	// Watch ctx for the whole attempt, including the wait for ACCEPT. Until the
+	// transfer id is known we cannot send a proper cancel or drain to a terminal
+	// frame, so a cancel then closes the connection to unblock the wait and abort
+	// (R4-2). Once ACCEPT arrives the watcher switches to the tid-aware
+	// DOWNLOAD_CANCEL that keeps the connection in sync (RR-3, R3-2). We await the
+	// watcher before returning so a cancel at the very end can never leak a
+	// DOWNLOAD_CANCEL into the next transfer (R3-2).
+	var tmu sync.Mutex
+	var cancelTID uint32
+	var haveTID bool
 	watchDone := make(chan struct{})
 	var watchWG sync.WaitGroup
 	watchWG.Add(1)
@@ -379,14 +406,42 @@ func (c *Client) DownloadCtx(ctx context.Context, remotePath, localPath string, 
 		defer watchWG.Done()
 		select {
 		case <-ctx.Done():
-			_ = c.Cancel(tid)
+			tmu.Lock()
+			tid, have := cancelTID, haveTID
+			tmu.Unlock()
+			if have {
+				_ = c.Cancel(tid)
+			} else {
+				c.conn.Close() // no transfer id yet: cannot resync, so drop it
+			}
 		case <-watchDone:
 		}
 	}()
 	defer func() {
 		close(watchDone)
 		watchWG.Wait()
+		// An error caused by the cancel (a closed conn, a CANCELLED terminal) is
+		// reported as ctx.Err(); a completed download keeps its nil success even
+		// if ctx was cancelled at the tail.
+		if rerr != nil && ctx.Err() != nil {
+			rerr = ctx.Err()
+		}
 	}()
+
+	if err := c.writeMsg(proto.DownloadRequest{Path: remotePath, Offset: offset}); err != nil {
+		return err
+	}
+	m, err := c.recvExpect(proto.MsgDownloadAccept)
+	if err != nil {
+		return err
+	}
+	accept := m.(proto.DownloadAccept)
+	total := accept.TotalSize
+	tid := accept.TransferID
+	tmu.Lock()
+	cancelTID = tid
+	haveTID = true
+	tmu.Unlock()
 
 	flag := os.O_CREATE | os.O_WRONLY
 	if offset > 0 {
