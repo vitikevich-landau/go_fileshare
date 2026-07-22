@@ -368,9 +368,9 @@ func (m *Model) handleAdminConfirmKey(k tea.KeyMsg) tea.Cmd {
 			m.adminMsg = "shutdown cancelled"
 			return nil
 		case "enter":
-			word, grace, ok := parseShutdownConfirm(m.adminConfirmInput.Value())
-			if !ok || word != "shutdown" {
-				m.adminMsg = "type the word 'shutdown' to confirm"
+			grace, ok := parseShutdownConfirm(m.adminConfirmInput.Value())
+			if !ok {
+				m.adminMsg = "type exactly 'shutdown' or 'shutdown <seconds>' to confirm"
 				return nil
 			}
 			m.adminConfirm = confirmNone
@@ -396,20 +396,24 @@ func (m *Model) handleAdminConfirmKey(k tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-// parseShutdownConfirm parses "shutdown" or "shutdown <seconds>" into the
-// confirmation word and grace period (defaulting to defaultShutdownGrace).
-func parseShutdownConfirm(s string) (word string, grace uint32, ok bool) {
+// parseShutdownConfirm accepts ONLY exactly "shutdown" or "shutdown <seconds>"
+// where <seconds> is a valid uint32. Any other form (wrong word, extra args,
+// non-numeric or overflowing grace) is rejected so a destructive action is never
+// confirmed by a typo silently falling back to the default grace.
+func parseShutdownConfirm(s string) (grace uint32, ok bool) {
 	f := strings.Fields(strings.TrimSpace(s))
-	if len(f) == 0 {
-		return "", 0, false
+	if len(f) == 0 || len(f) > 2 || f[0] != "shutdown" {
+		return 0, false
 	}
 	grace = defaultShutdownGrace
-	if len(f) > 1 {
-		if n, err := strconv.ParseUint(f[1], 10, 32); err == nil {
-			grace = uint32(n)
+	if len(f) == 2 {
+		n, err := strconv.ParseUint(f[1], 10, 32)
+		if err != nil {
+			return 0, false
 		}
+		grace = uint32(n)
 	}
-	return f[0], grace, true
+	return grace, true
 }
 
 func (m *Model) adminListLen() int {

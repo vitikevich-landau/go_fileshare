@@ -139,6 +139,28 @@ func TestAdminShutdownConfirmFlow(t *testing.T) {
 	}
 }
 
+func TestParseShutdownConfirm(t *testing.T) {
+	valid := map[string]uint32{
+		"shutdown":      defaultShutdownGrace,
+		"shutdown 0":    0,
+		"shutdown 30":   30,
+		"  shutdown 5 ": 5,
+	}
+	for in, want := range valid {
+		if g, ok := parseShutdownConfirm(in); !ok || g != want {
+			t.Errorf("parse(%q) = (%d,%v), want (%d,true)", in, g, ok, want)
+		}
+	}
+	for _, in := range []string{
+		"", "halt", "shutdownnow", "shutdown nope",
+		"shutdown 10 20", "shutdown -1", "shutdown 99999999999999999999",
+	} {
+		if _, ok := parseShutdownConfirm(in); ok {
+			t.Errorf("parse(%q) should be rejected", in)
+		}
+	}
+}
+
 func TestAdminMenuReloadUsers(t *testing.T) {
 	m := New(Profile{})
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
