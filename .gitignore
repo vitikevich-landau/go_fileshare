@@ -1,11 +1,10 @@
-# Binaries
+# Binaries — anchored to the repo root so they do NOT match the cmd/ source
+# directories of the same name (that mistake dropped the entry points from Git).
 /bin/
 *.exe
 *.exe~
-fshare-daemon
-fshare-commander
-fshare-daemon.exe
-fshare-commander.exe
+/fshare-daemon
+/fshare-commander
 
 # Test / build artifacts
 *.test

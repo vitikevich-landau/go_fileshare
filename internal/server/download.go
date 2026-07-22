@@ -34,27 +34,33 @@ func (s *Server) startDownload(sess *Session, req proto.DownloadRequest) {
 
 	tid := s.nextTransfer.Add(1)
 	cancel := make(chan struct{})
-	sess.setCancel(cancel)
+	sess.setCancel(tid, cancel)
 	s.activeDownloads.Add(1)
 	sess.wg.Add(1)
 	go func() {
 		defer sess.wg.Done()
 		defer s.activeDownloads.Add(-1)
 		defer f.Close()
+		defer sess.touch() // refresh idle clock so post-download isn't reaped (RR-1)
 		defer sess.downloading.Store(false)
+		defer sess.clearCancel()  // a stale cancel must not touch a later transfer (R3-2)
 		defer sess.clearCurPath() // clear even if checksum/read errors (bug #2)
 
 		// A context that cancels when the transfer is cancelled or the session
-		// is torn down, so a rate-limit wait cannot block teardown.
+		// is torn down, so a rate-limit wait cannot block on either.
 		ctx, ctxCancel := context.WithCancel(context.Background())
 		defer ctxCancel()
 		go func() {
-			// ctx.Done() is included so this watcher exits when the transfer
-			// finishes normally (outer defer ctxCancel), not just on cancel/
-			// teardown — otherwise it would leak one goroutine per download.
+			// Cancel the rate-limit ctx on a client cancel OR teardown, so a
+			// cancel that lands while the stream is blocked in limiter.Wait wakes
+			// it promptly instead of stalling for minutes at a low bps (R3-1). The
+			// stream loop distinguishes the two: on a client cancel it sends the
+			// terminal CANCELLED error to keep the connection in sync (RR-3); on
+			// teardown it just stops. ctx.Done() also lets this watcher exit on
+			// normal completion, so it never leaks a goroutine.
 			select {
-			case <-cancel:
 			case <-sess.done:
+			case <-cancel:
 			case <-ctx.Done():
 			}
 			ctxCancel()
@@ -82,6 +88,9 @@ func (s *Server) streamFile(ctx context.Context, sess *Session, f *os.File, req 
 	for sent < total {
 		select {
 		case <-cancel:
+			// Client asked to cancel: send a defined terminal frame after the
+			// chunks already queued, so the client's loop ends in sync (RR-3).
+			s.sendErr(sess, proto.ErrCancelled)
 			return
 		case <-sess.done:
 			return
@@ -100,7 +109,15 @@ func (s *Server) streamFile(ctx context.Context, sess *Session, f *os.File, req 
 			// throttles this active transfer (docs/tz/09-go-port.md §5.6).
 			lim := s.hub.Current().Limits
 			if werr := s.limiter.Wait(ctx, clientKey, lim.PerClientBps, lim.GlobalBps, n); werr != nil {
-				return // cancelled or torn down
+				// The wait was interrupted. If the client asked to cancel, send the
+				// terminal CANCELLED frame so its loop ends in sync (R3-1); on a
+				// teardown, just stop (the connection is already closing).
+				select {
+				case <-cancel:
+					s.sendErr(sess, proto.ErrCancelled)
+				default:
+				}
+				return
 			}
 			// proto.Encode copies buf into a fresh frame, so reusing buf is safe.
 			if !sess.sendMsg(proto.ChunkData{TransferID: tid, Data: buf[:n]}) {
@@ -114,16 +131,56 @@ func (s *Server) streamFile(ctx context.Context, sess *Session, f *os.File, req 
 			break
 		}
 		if err != nil {
+			// A read error mid-transfer: tell the client instead of leaving it
+			// waiting, and never publish a partial file (CR-02).
+			s.sendErr(sess, proto.ErrInternal)
 			return
 		}
 	}
 
+	// If the file shrank during the transfer we delivered fewer bytes than
+	// announced; report an error rather than a success DONE the client would
+	// (rightly) reject (CR-02).
+	if sent != total {
+		s.sendErr(sess, proto.ErrInternal)
+		return
+	}
+
 	// The server always sends the checksum of the whole file; on a resumed
-	// download the client verifies the reassembled file against it.
-	_, algo, sum, cerr := s.vfs.Checksum(req.Path)
+	// download the client verifies the reassembled file against it. If the
+	// checksum cannot be computed we must NOT claim success — send an error so
+	// the client never publishes an unverifiable file. The hash is ctx-aware so a
+	// cancel that lands during a cache-miss checksum of a large file aborts it
+	// promptly instead of blocking for minutes (R4-3).
+	_, algo, sum, cerr := s.vfs.ChecksumCtx(ctx, req.Path)
 	if cerr != nil {
-		algo = proto.AlgoPending
-		sum = [proto.ChecksumLen]byte{}
+		// A cancel/teardown during the checksum: on a client cancel send the
+		// terminal CANCELLED frame (keeps the connection in sync); on teardown
+		// just stop. Any other checksum failure is an internal error.
+		if ctx.Err() != nil {
+			select {
+			case <-cancel:
+				s.sendErr(sess, proto.ErrCancelled)
+			default:
+			}
+			return
+		}
+		s.sendErr(sess, proto.ErrInternal)
+		return
+	}
+	if algo != proto.AlgoSHA256 {
+		s.sendErr(sess, proto.ErrInternal)
+		return
+	}
+	// A cancel that arrived after the checksum but before DONE still wins, so a
+	// cancelled transfer never reports success (R4-3).
+	select {
+	case <-cancel:
+		s.sendErr(sess, proto.ErrCancelled)
+		return
+	case <-sess.done:
+		return
+	default:
 	}
 	if sess.sendMsg(proto.DownloadDone{TransferID: tid, Algo: algo, Checksum: sum}) {
 		s.completed.Add(1)

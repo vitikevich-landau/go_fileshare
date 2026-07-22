@@ -5,9 +5,12 @@
 package client
 
 import (
+	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net"
 	"os"
@@ -80,10 +83,22 @@ func Dial(addr string, opts Options) (*Client, error) {
 	return handshake(conn, opts)
 }
 
+// maxAuthIters bounds the PBKDF2 iteration count the client will run on a
+// server-announced value, so a hostile/MITM server cannot pin a CPU (CR-04).
+const maxAuthIters = 10_000_000
+
 // handshake performs HELLO/AUTH over an already-connected socket and returns a
 // ready client. On failure it closes conn.
 func handshake(conn net.Conn, opts Options) (*Client, error) {
 	c := &Client{conn: conn, eventHandler: opts.EventHandler}
+
+	// Bound the whole handshake so a silent/MITM server cannot hang the client
+	// indefinitely (CR-04); cleared once authenticated.
+	hsTimeout := opts.DialTimeout
+	if hsTimeout == 0 {
+		hsTimeout = 10 * time.Second
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(hsTimeout))
 
 	name := opts.ClientName
 	if name == "" {
@@ -111,6 +126,20 @@ func handshake(conn net.Conn, opts Options) (*Client, error) {
 	c.authMode = helloOk.AuthMode
 	c.iters = int(helloOk.PBKDF2Iters)
 
+	// Validate the untrusted auth parameters before doing any expensive work.
+	switch helloOk.AuthMode {
+	case proto.AuthNone:
+		// no proof; iters irrelevant
+	case proto.AuthChallenge:
+		if c.iters < 1 || c.iters > maxAuthIters {
+			conn.Close()
+			return nil, fmt.Errorf("server requested %d PBKDF2 iterations, outside [1,%d]", c.iters, maxAuthIters)
+		}
+	default:
+		conn.Close()
+		return nil, fmt.Errorf("unsupported auth mode %d", helloOk.AuthMode)
+	}
+
 	var proof [proto.ProofLen]byte
 	if helloOk.AuthMode == proto.AuthChallenge {
 		proof = auth.Proof(opts.Password, opts.Login, c.iters, helloOk.Challenge[:])
@@ -130,6 +159,7 @@ func handshake(conn net.Conn, opts Options) (*Client, error) {
 		c.role = v.Role
 		c.sessionID = v.SessionID
 		c.motd = v.Motd
+		_ = conn.SetReadDeadline(time.Time{}) // clear the handshake deadline
 		return c, nil
 	case proto.AuthFail:
 		conn.Close()
@@ -246,20 +276,48 @@ func (c *Client) Subscribe(mask uint32) error {
 // recvExpect or PollEvents.
 func (c *Client) Ping() error { return c.writeMsg(proto.Ping{}) }
 
+// frameReadTimeout bounds how long PollEvents will wait to finish a frame once
+// its first byte has arrived. A well-behaved peer sends the small remainder of
+// an event/pong frame in milliseconds; this only fires if a peer sends one byte
+// then stalls without closing the socket, in which case PollEvents must not
+// wedge the idle pump (and clientMu) forever (R4-1). It is a var so tests can
+// shorten it.
+var frameReadTimeout = 30 * time.Second
+
 // PollEvents waits up to timeout for one asynchronous frame (EVENT_*/PONG),
 // routing it to the event handler. It returns whether a frame was received. A
 // timeout is reported as (false, nil). It must not run concurrently with a
 // request method — a single goroutine owns all reads (docs/tz/09-go-port.md §5.8).
+//
+// The idle deadline applies only to the FIRST byte of the next frame, so a
+// timeout before any byte arrives is a clean "no event" that consumes nothing
+// and cannot desync the next poll (R3-7). Once a frame has started, the rest is
+// read under a bounded frameReadTimeout instead of forever; if that fires the
+// frame is partly consumed and the stream is desynced, so the connection is
+// dropped rather than reused (R4-1).
 func (c *Client) PollEvents(timeout time.Duration) (bool, error) {
 	_ = c.conn.SetReadDeadline(time.Now().Add(timeout))
-	defer c.conn.SetReadDeadline(time.Time{})
-
-	m, err := c.readMsg()
-	if err != nil {
-		if isTimeout(err) {
-			return false, nil
+	var first [1]byte
+	n, err := c.conn.Read(first[:])
+	if n == 0 {
+		_ = c.conn.SetReadDeadline(time.Time{})
+		if err == nil || isTimeout(err) {
+			return false, nil // idle: no byte of a frame arrived in time
 		}
 		return false, err
+	}
+	// A frame has begun; finish reading it under a bounded deadline.
+	_ = c.conn.SetReadDeadline(time.Now().Add(frameReadTimeout))
+	typ, payload, rerr := proto.ReadFrameContinue(first[0], c.conn, proto.MaxControlPayload)
+	_ = c.conn.SetReadDeadline(time.Time{})
+	if rerr != nil {
+		// A stalled or broken mid-frame read leaves the stream desynced; drop the
+		// connection so a later poll/request cannot read leftover bytes (R4-1).
+		return false, c.abortConn(rerr)
+	}
+	m, derr := proto.Decode(typ, payload)
+	if derr != nil {
+		return false, derr
 	}
 	if isAsync(m) {
 		if c.eventHandler != nil {
@@ -284,13 +342,45 @@ type Progress struct {
 	Total    uint64
 }
 
-// Download fetches remotePath into localPath, resuming from localPath+".part"
+// Download is DownloadCtx with a background context (no cancellation).
+func (c *Client) Download(remotePath, localPath string, progress func(Progress)) error {
+	return c.DownloadCtx(context.Background(), remotePath, localPath, progress)
+}
+
+// DownloadCtx fetches remotePath into localPath, resuming from localPath+".part"
 // if present. On completion it verifies the reassembled file against the
 // server's whole-file checksum and atomically renames the .part into place.
-// progress may be nil.
-func (c *Client) Download(remotePath, localPath string, progress func(Progress)) error {
-	partPath := localPath + ".part"
+// progress may be nil. Cancelling ctx aborts the transfer and returns ctx.Err():
+// once the transfer id is known it sends DOWNLOAD_CANCEL and drains to the
+// server's terminal frame so the connection stays usable (RR-3); before then it
+// drops the connection, which cannot be resynced without a transfer id (R4-2).
+func (c *Client) DownloadCtx(ctx context.Context, remotePath, localPath string, progress func(Progress)) error {
+	err := c.downloadOnce(ctx, remotePath, localPath, progress)
 
+	// A stale/oversized .part offset is rejected by the server: discard the .part
+	// and retry ONCE from scratch. Removing it makes the retry's offset 0, which
+	// the server can never reject as UNSUPPORTED_OFFSET, so this cannot loop; if
+	// the .part cannot be removed we stop rather than recurse forever (R4-4).
+	var re *RemoteError
+	if errors.As(err, &re) && re.Code == proto.ErrUnsupportedOffset {
+		partPath := localPath + ".part"
+		if rmErr := os.Remove(partPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			return fmt.Errorf("cannot discard stale partial download %q: %w", partPath, rmErr)
+		}
+		return c.downloadOnce(ctx, remotePath, localPath, progress)
+	}
+	return err
+}
+
+// downloadOnce performs a single download attempt (no stale-offset retry). It
+// observes ctx for the whole attempt, including the wait for ACCEPT (R4-2), and
+// normalizes an error caused by cancellation to ctx.Err() via the named return.
+func (c *Client) downloadOnce(ctx context.Context, remotePath, localPath string, progress func(Progress)) (rerr error) {
+	if err := ctx.Err(); err != nil {
+		return err // already cancelled: send nothing
+	}
+
+	partPath := localPath + ".part"
 	var offset uint64
 	if fi, err := os.Stat(partPath); err == nil && !fi.IsDir() {
 		offset = uint64(fi.Size())
@@ -299,22 +389,59 @@ func (c *Client) Download(remotePath, localPath string, progress func(Progress))
 		return err
 	}
 
+	// Watch ctx for the whole attempt, including the wait for ACCEPT. Until the
+	// transfer id is known we cannot send a proper cancel or drain to a terminal
+	// frame, so a cancel then closes the connection to unblock the wait and abort
+	// (R4-2). Once ACCEPT arrives the watcher switches to the tid-aware
+	// DOWNLOAD_CANCEL that keeps the connection in sync (RR-3, R3-2). We await the
+	// watcher before returning so a cancel at the very end can never leak a
+	// DOWNLOAD_CANCEL into the next transfer (R3-2).
+	var tmu sync.Mutex
+	var cancelTID uint32
+	var haveTID bool
+	watchDone := make(chan struct{})
+	var watchWG sync.WaitGroup
+	watchWG.Add(1)
+	go func() {
+		defer watchWG.Done()
+		select {
+		case <-ctx.Done():
+			tmu.Lock()
+			tid, have := cancelTID, haveTID
+			tmu.Unlock()
+			if have {
+				_ = c.Cancel(tid)
+			} else {
+				c.conn.Close() // no transfer id yet: cannot resync, so drop it
+			}
+		case <-watchDone:
+		}
+	}()
+	defer func() {
+		close(watchDone)
+		watchWG.Wait()
+		// An error caused by the cancel (a closed conn, a CANCELLED terminal) is
+		// reported as ctx.Err(); a completed download keeps its nil success even
+		// if ctx was cancelled at the tail.
+		if rerr != nil && ctx.Err() != nil {
+			rerr = ctx.Err()
+		}
+	}()
+
 	if err := c.writeMsg(proto.DownloadRequest{Path: remotePath, Offset: offset}); err != nil {
 		return err
 	}
 	m, err := c.recvExpect(proto.MsgDownloadAccept)
 	if err != nil {
-		// A stale/oversized .part offset is rejected: discard it and restart
-		// from scratch rather than looping forever (bug #6).
-		var re *RemoteError
-		if offset > 0 && errors.As(err, &re) && re.Code == proto.ErrUnsupportedOffset {
-			os.Remove(partPath)
-			return c.Download(remotePath, localPath, progress)
-		}
 		return err
 	}
 	accept := m.(proto.DownloadAccept)
 	total := accept.TotalSize
+	tid := accept.TransferID
+	tmu.Lock()
+	cancelTID = tid
+	haveTID = true
+	tmu.Unlock()
 
 	flag := os.O_CREATE | os.O_WRONLY
 	if offset > 0 {
@@ -324,7 +451,10 @@ func (c *Client) Download(remotePath, localPath string, progress func(Progress))
 	}
 	pf, err := os.OpenFile(partPath, flag, 0o644)
 	if err != nil {
-		return err
+		// A local failure after ACCEPT: the server is about to stream the file,
+		// so drop the connection rather than leave its chunks buffered for the
+		// next request to misread (R3-3).
+		return c.abortConn(err)
 	}
 
 	received := offset
@@ -335,23 +465,36 @@ func (c *Client) Download(remotePath, localPath string, progress func(Progress))
 	for {
 		typ, payload, rerr := proto.ReadFrame(c.conn)
 		if rerr != nil {
+			// Either the socket died, or the server sent a malformed/oversize
+			// frame whose header was consumed but payload was not — which leaves
+			// the stream desynced. Drop the connection in both cases so no later
+			// request can read leftover bytes (R3-3).
 			pf.Close()
-			return rerr
+			return c.abortConn(rerr)
 		}
 		msg, derr := proto.Decode(typ, payload)
 		if derr != nil {
+			// The server sent a malformed frame; the stream is still aligned but
+			// its state is unknown and it keeps sending — drop the connection so
+			// the next request cannot read leftover frames (R3-3).
 			pf.Close()
-			return derr
+			return c.abortConn(derr)
 		}
 		switch v := msg.(type) {
 		case proto.ChunkData:
+			if v.TransferID != tid {
+				pf.Close()
+				return c.abortConn(fmt.Errorf("chunk for unexpected transfer %d (want %d)", v.TransferID, tid))
+			}
 			if received+uint64(len(v.Data)) > total {
 				pf.Close()
-				return fmt.Errorf("server sent more than total_size (%d > %d)", received+uint64(len(v.Data)), total)
+				return c.abortConn(fmt.Errorf("server sent more than total_size (%d > %d)", received+uint64(len(v.Data)), total))
 			}
 			if _, werr := pf.Write(v.Data); werr != nil {
+				// A local write failure (e.g. disk full) while the server keeps
+				// streaming: drop the connection to stay in sync (R3-3).
 				pf.Close()
-				return werr
+				return c.abortConn(werr)
 			}
 			received += uint64(len(v.Data))
 			if progress != nil {
@@ -361,15 +504,35 @@ func (c *Client) Download(remotePath, localPath string, progress func(Progress))
 			if cerr := pf.Close(); cerr != nil {
 				return cerr
 			}
-			if v.Algo == proto.AlgoSHA256 {
-				sum, herr := sha256File(partPath)
-				if herr != nil {
-					return herr
-				}
-				if sum != v.Checksum {
-					os.Remove(partPath) // avoid looping on a corrupt full-size .part
-					return errors.New("checksum mismatch after download")
-				}
+			// Integrity gates before publishing (CR-02): the DONE must be for
+			// this transfer, all announced bytes must have arrived, and it must
+			// carry a supported checksum that matches the reassembled file. A
+			// short read keeps the .part so it can be resumed; a checksum
+			// mismatch discards it so we don't loop on a corrupt full-size .part.
+			if v.TransferID != tid {
+				return fmt.Errorf("DOWNLOAD_DONE for unexpected transfer %d (want %d)", v.TransferID, tid)
+			}
+			if received != total {
+				return fmt.Errorf("incomplete download: got %d of %d bytes", received, total)
+			}
+			// Verify against whichever checksum the server used. SHA-256 fills
+			// the whole 32-byte field; CRC-32 uses the first 4 bytes (big-endian,
+			// the protocol's integer convention), the rest zero. This keeps
+			// interop with a CRC32-configured C++ server (RR-2). The verify is
+			// ctx-aware, so a cancel while hashing a large .part aborts promptly and
+			// (via the deferred normalizer) returns ctx.Err() (R5-1); the DONE is
+			// already fully read, so the connection stays in sync.
+			if bad, herr := checksumMismatch(ctx, partPath, v.Algo, v.Checksum); herr != nil {
+				return herr
+			} else if bad {
+				os.Remove(partPath)
+				return errors.New("checksum mismatch after download")
+			}
+			// A cancel that lands at 100% (after DONE, during/after verify) must
+			// not publish the file and report success. Keep the verified .part for
+			// a later resume and report the cancellation (R5-1).
+			if err := ctx.Err(); err != nil {
+				return err
 			}
 			if err := os.Rename(partPath, localPath); err != nil {
 				return err // bug #3: only report success if the file is in place
@@ -377,6 +540,12 @@ func (c *Client) Download(remotePath, localPath string, progress func(Progress))
 			return nil
 		case proto.Error:
 			pf.Close()
+			// If we asked to cancel, this ERROR is the server's terminal
+			// acknowledgement; the connection is now in sync. Report the
+			// cancellation, not a generic remote error.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return &RemoteError{Code: v.Code, Message: v.Message}
 		default:
 			if isAsync(msg) {
@@ -385,10 +554,23 @@ func (c *Client) Download(remotePath, localPath string, progress func(Progress))
 				}
 				continue
 			}
+			// An unexpected in-band frame mid-download: the server's stream state
+			// is out of sync with ours — drop the connection (R3-3).
 			pf.Close()
-			return fmt.Errorf("unexpected message during download: %s", typ)
+			return c.abortConn(fmt.Errorf("unexpected message during download: %s", typ))
 		}
 	}
+}
+
+// abortConn closes the connection and returns err. It is used when a download
+// fails locally or the server violates the protocol mid-stream: the server may
+// still be sending CHUNK_DATA, so the only way to keep a later request from
+// reading leftover frames is to drop the connection (R3-3). Terminal
+// server frames (DOWNLOAD_DONE / ERROR) leave the connection in sync and do not
+// go through here.
+func (c *Client) abortConn(err error) error {
+	c.conn.Close()
+	return err
 }
 
 // Cancel asks the server to abort the active transfer without closing the
@@ -483,7 +665,43 @@ func (c *Client) Interrupt() {
 // Close closes the connection.
 func (c *Client) Close() error { return c.conn.Close() }
 
-func sha256File(path string) ([proto.ChecksumLen]byte, error) {
+// checksumMismatch reports whether the file's checksum differs from want, using
+// the algorithm the server declared. An unsupported/absent algorithm is an
+// error. It is ctx-aware: verifying a large .part re-reads the whole file, so a
+// cancel during it aborts promptly and returns ctx.Err() (R5-1).
+func checksumMismatch(ctx context.Context, path string, algo proto.Algo, want [proto.ChecksumLen]byte) (bool, error) {
+	switch algo {
+	case proto.AlgoSHA256:
+		got, err := sha256File(ctx, path)
+		if err != nil {
+			return false, err
+		}
+		return got != want, nil
+	case proto.AlgoCRC32:
+		got, err := crc32File(ctx, path)
+		if err != nil {
+			return false, err
+		}
+		return got != binary.BigEndian.Uint32(want[:4]), nil
+	default:
+		return false, fmt.Errorf("server did not provide a verifiable checksum (algo %d)", algo)
+	}
+}
+
+func crc32File(ctx context.Context, path string) (uint32, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	h := crc32.NewIEEE()
+	if err := copyCtx(ctx, h, f); err != nil {
+		return 0, err
+	}
+	return h.Sum32(), nil
+}
+
+func sha256File(ctx context.Context, path string) ([proto.ChecksumLen]byte, error) {
 	var out [proto.ChecksumLen]byte
 	f, err := os.Open(path)
 	if err != nil {
@@ -491,9 +709,32 @@ func sha256File(path string) ([proto.ChecksumLen]byte, error) {
 	}
 	defer f.Close()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	if err := copyCtx(ctx, h, f); err != nil {
 		return out, err
 	}
 	copy(out[:], h.Sum(nil))
 	return out, nil
+}
+
+// copyCtx streams src into dst, checking ctx before each block so a long local
+// hash aborts promptly on cancellation, returning ctx.Err() (R5-1).
+func copyCtx(ctx context.Context, dst io.Writer, src io.Reader) error {
+	buf := make([]byte, 128<<10)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return werr
+			}
+		}
+		if rerr == io.EOF {
+			return nil
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
 }

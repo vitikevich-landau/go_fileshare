@@ -204,6 +204,9 @@ const (
 	ErrRateLimited        ErrCode = 11
 	ErrServerShuttingDown ErrCode = 12
 	ErrQuotaExceeded      ErrCode = 13
+	// ErrCancelled terminates a transfer the client asked to cancel, keeping the
+	// connection in sync (Go-port extension; see RR-3).
+	ErrCancelled ErrCode = 14
 )
 
 func (c ErrCode) String() string {
@@ -236,6 +239,8 @@ func (c ErrCode) String() string {
 		return "SERVER_SHUTTING_DOWN"
 	case ErrQuotaExceeded:
 		return "QUOTA_EXCEEDED"
+	case ErrCancelled:
+		return "CANCELLED"
 	}
 	return "ERR_UNKNOWN"
 }

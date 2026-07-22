@@ -31,6 +31,10 @@ type Options struct {
 	// ConfigPath, when set, is where accepted ADMIN_SET/reload changes are
 	// persisted atomically so they survive a restart.
 	ConfigPath string
+	// LogLevel, when set, is updated live when log.level changes so the hot
+	// setting actually takes effect (CR-08). Build the logger's handler with
+	// this same LevelVar.
+	LogLevel *slog.LevelVar
 	// AuthFailDelay is slept after each failed authentication to slow brute
 	// force (docs/tz/06-security.md §3). Tests set 0.
 	AuthFailDelay time.Duration
@@ -48,6 +52,7 @@ type Server struct {
 	start         time.Time
 	authFailDelay time.Duration
 	configPath    string
+	logLevelVar   *slog.LevelVar
 	limiter       *ratelimit.Limiter
 
 	reg *Registry
@@ -92,6 +97,7 @@ func New(opts Options) *Server {
 		start:         time.Now(),
 		authFailDelay: opts.AuthFailDelay,
 		configPath:    opts.ConfigPath,
+		logLevelVar:   opts.LogLevel,
 		limiter:       ratelimit.New(),
 		reg:           NewRegistry(),
 	}
@@ -104,6 +110,10 @@ func New(opts Options) *Server {
 // onConfigChange persists the current snapshot (if a config path is set) and
 // broadcasts EVENT_CONFIG to admin subscribers (docs/tz/09-go-port.md §5.4).
 func (s *Server) onConfigChange(key, value string) {
+	// Apply the hot log level to the live logger (CR-08).
+	if key == "log.level" && s.logLevelVar != nil {
+		s.logLevelVar.Set(parseLogLevel(value))
+	}
 	if s.configPath != "" {
 		if err := s.hub.Current().Save(s.configPath); err != nil {
 			s.log.Error("failed to persist config change", "key", key, "err", err)
@@ -111,6 +121,20 @@ func (s *Server) onConfigChange(key, value string) {
 	}
 	frame := proto.Encode(proto.EventConfig{Key: key, NewValue: value})
 	s.reg.broadcast(proto.SubConfig, frame)
+}
+
+// parseLogLevel maps a config level string to slog.Level (defaults to info).
+func parseLogLevel(level string) slog.Level {
+	switch level {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // Registry exposes the session registry (used by the watcher/admin layers).

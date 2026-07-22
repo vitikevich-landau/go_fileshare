@@ -15,22 +15,79 @@ func Frame(typ Msg, payload []byte) []byte {
 	return out
 }
 
+// HandshakeMaxPayload caps a frame accepted before authentication. It is large
+// enough for HELLO/AUTH_REQUEST/PING but far below MaxControlPayload, so an
+// unauthenticated peer cannot make the server allocate megabytes per connection
+// (CR-05).
+const HandshakeMaxPayload = MaxStringLen + 256
+
+// maxControlPayload bounds the ordinary control messages (those carrying at most
+// one length-prefixed string plus small fixed fields).
+const maxControlPayload = MaxStringLen + 256
+
+// maxPayloadFor returns the largest legitimate payload for a message type, so
+// the reader can reject an oversize length BEFORE allocating (CR-05). Only the
+// genuinely large server->client messages get the full 4 MiB ceiling.
+func maxPayloadFor(typ Msg) uint32 {
+	switch typ {
+	case MsgListDirResponse, MsgAdminConfig, MsgAdminClients:
+		return MaxControlPayload
+	case MsgChunkData:
+		return ChunkSize + 64
+	default:
+		return maxControlPayload
+	}
+}
+
 // ReadFrame reads one frame from r. On a clean connection close at a frame
 // boundary it returns io.EOF. A malformed frame (unknown type or oversize
-// payload) returns a non-EOF error; the caller tears down only that connection
-// (docs/tz/09-go-port.md §4.1).
+// payload for its type) returns a non-EOF error; the caller tears down only
+// that connection (docs/tz/09-go-port.md §4.1).
 func ReadFrame(r io.Reader) (Msg, []byte, error) {
+	return ReadFrameLimited(r, MaxControlPayload)
+}
+
+// ReadFrameLimited is ReadFrame with an additional caller-supplied payload
+// ceiling (used to keep pre-auth frames small).
+func ReadFrameLimited(r io.Reader, limit uint32) (Msg, []byte, error) {
 	var hdr [HeaderSize]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return 0, nil, err // io.EOF at the boundary is a clean close
 	}
+	return readFramePayload(hdr, r, limit)
+}
+
+// ReadFrameContinue reads a frame whose first header byte has already been
+// consumed into first, then reads the remaining header and payload. It lets a
+// caller peek the first byte under an idle deadline and, once a frame has
+// started, finish reading it with no deadline — so a slow or fragmented frame is
+// never left half-consumed and cannot desync the stream (R3-7).
+func ReadFrameContinue(first byte, r io.Reader, limit uint32) (Msg, []byte, error) {
+	var hdr [HeaderSize]byte
+	hdr[0] = first
+	if _, err := io.ReadFull(r, hdr[1:]); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF // a header cut short is not a clean close
+		}
+		return 0, nil, err
+	}
+	return readFramePayload(hdr, r, limit)
+}
+
+// readFramePayload validates an already-read 5-byte header and reads its payload
+// under limit. Shared by ReadFrameLimited and ReadFrameContinue.
+func readFramePayload(hdr [HeaderSize]byte, r io.Reader, limit uint32) (Msg, []byte, error) {
 	typ := Msg(hdr[0])
 	n := binary.BigEndian.Uint32(hdr[1:5])
 	if !typ.Known() {
 		return 0, nil, fmt.Errorf("proto: unknown msg type 0x%02x", hdr[0])
 	}
-	if n > MaxControlPayload {
-		return 0, nil, fmt.Errorf("proto: payload %d exceeds max %d", n, MaxControlPayload)
+	max := maxPayloadFor(typ)
+	if limit < max {
+		max = limit
+	}
+	if n > max {
+		return 0, nil, fmt.Errorf("proto: %s payload %d exceeds max %d", typ, n, max)
 	}
 	p := make([]byte, n)
 	if _, err := io.ReadFull(r, p); err != nil {

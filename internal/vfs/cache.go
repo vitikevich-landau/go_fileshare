@@ -17,6 +17,7 @@ type diskCache struct {
 type diskEntry struct {
 	Size  uint64 `json:"size"`
 	Mtime uint64 `json:"mtime"`
+	Ctime int64  `json:"ctime,omitempty"`
 	Algo  uint8  `json:"algo"`
 	Sum   string `json:"sum"` // hex
 }
@@ -38,7 +39,7 @@ func (v *VFS) loadCache() error {
 		}
 		var sum [proto.ChecksumLen]byte
 		copy(sum[:], raw)
-		cache[k] = cacheEntry{Size: de.Size, Mtime: de.Mtime, Algo: proto.Algo(de.Algo), Sum: sum}
+		cache[k] = cacheEntry{Size: de.Size, Mtime: de.Mtime, Ctime: de.Ctime, Algo: proto.Algo(de.Algo), Sum: sum}
 	}
 	v.mu.Lock()
 	v.cache = cache
@@ -60,7 +61,7 @@ func (v *VFS) SaveCache() error {
 	}
 	dc := diskCache{Entries: make(map[string]diskEntry, len(v.cache))}
 	for k, e := range v.cache {
-		dc.Entries[k] = diskEntry{Size: e.Size, Mtime: e.Mtime, Algo: uint8(e.Algo), Sum: hex.EncodeToString(e.Sum[:])}
+		dc.Entries[k] = diskEntry{Size: e.Size, Mtime: e.Mtime, Ctime: e.Ctime, Algo: uint8(e.Algo), Sum: hex.EncodeToString(e.Sum[:])}
 	}
 	v.mu.Unlock()
 

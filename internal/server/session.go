@@ -17,6 +17,9 @@ const writeDeadline = 30 * time.Second
 // frames before force-closing the socket.
 const flushTimeout = 2 * time.Second
 
+// idleCheckInterval is how often the idle watchdog re-evaluates a connection.
+const idleCheckInterval = time.Second
+
 // outBuffer is the per-session outgoing queue depth.
 const outBuffer = 64
 
@@ -38,17 +41,20 @@ type Session struct {
 
 	challenge []byte // set during handshake
 
-	mu       sync.Mutex
-	login    string
-	role     proto.Role
-	authed   bool
-	cancelDL chan struct{} // closes to cancel the active download
+	mu        sync.Mutex
+	login     string
+	role      proto.Role
+	authed    bool
+	cancelDL  chan struct{} // closes to cancel the active download
+	cancelTID uint32        // transfer id the cancel channel belongs to (R3-2)
 
-	subMask     atomic.Uint32
-	bytes       atomic.Uint64
-	curPath     atomic.Pointer[string]
-	downloading atomic.Bool
-	startedAt   time.Time
+	subMask      atomic.Uint32
+	bytes        atomic.Uint64
+	curPath      atomic.Pointer[string]
+	downloading  atomic.Bool
+	inFlight     atomic.Bool  // a request handler is running in dispatch (R3-6)
+	lastActivity atomic.Int64 // unix-nanos of the last completed frame / activity
+	startedAt    time.Time
 }
 
 func newSession(id uint64, conn net.Conn, ip string, wg *sync.WaitGroup) *Session {
@@ -62,7 +68,16 @@ func newSession(id uint64, conn net.Conn, ip string, wg *sync.WaitGroup) *Sessio
 		startedAt: time.Now(),
 	}
 	s.curPath.Store(&emptyPath)
+	s.lastActivity.Store(time.Now().UnixNano())
 	return s
+}
+
+// touch records activity for the idle watchdog.
+func (s *Session) touch() { s.lastActivity.Store(time.Now().UnixNano()) }
+
+// idleFor reports how long the session has been without activity.
+func (s *Session) idleFor() time.Duration {
+	return time.Since(time.Unix(0, s.lastActivity.Load()))
 }
 
 // send queues a frame, blocking for backpressure until it is accepted or the
@@ -149,22 +164,39 @@ func (s *Session) Authed() bool {
 	return s.authed
 }
 
-// setCancel installs the cancel channel for the active download.
-func (s *Session) setCancel(c chan struct{}) {
+// setCancel installs the cancel channel for the active download and records the
+// transfer id it belongs to, so a cancel request can be matched to it (R3-2).
+func (s *Session) setCancel(tid uint32, c chan struct{}) {
 	s.mu.Lock()
 	s.cancelDL = c
+	s.cancelTID = tid
 	s.mu.Unlock()
 }
 
-// cancelDownload closes the active download's cancel channel, if any.
-func (s *Session) cancelDownload() {
+// clearCancel drops the active download's cancel channel once the transfer has
+// finished, so a stale DOWNLOAD_CANCEL cannot touch a later transfer (R3-2).
+func (s *Session) clearCancel() {
+	s.mu.Lock()
+	s.cancelDL = nil
+	s.cancelTID = 0
+	s.mu.Unlock()
+}
+
+// cancelDownload closes the active download's cancel channel, but only if tid
+// matches the active transfer. A stray or late cancel for a different (e.g.
+// already-finished) transfer is ignored so it cannot abort the wrong one
+// (R3-2). It reports whether a cancel was actually delivered.
+func (s *Session) cancelDownload(tid uint32) bool {
 	s.mu.Lock()
 	c := s.cancelDL
+	if c == nil || s.cancelTID != tid {
+		s.mu.Unlock()
+		return false
+	}
 	s.cancelDL = nil
 	s.mu.Unlock()
-	if c != nil {
-		close(c)
-	}
+	close(c)
+	return true
 }
 
 func (s *Session) setCurPath(p string) { s.curPath.Store(&p) }
@@ -220,17 +252,26 @@ func (r *Registry) count() int {
 	return n
 }
 
-// countUser returns how many authenticated sessions share the given login.
-func (r *Registry) countUser(login string) int {
+// reserveUserSlot atomically enforces the per-user session cap and, if there is
+// room, marks sess authenticated — so concurrent handshakes for one user cannot
+// all slip past the check before any of them commits (CR-06). max <= 0 means no
+// limit. It returns whether the slot was granted.
+func (r *Registry) reserveUserSlot(sess *Session, login string, role proto.Role, max int) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	n := 0
-	for _, s := range r.sessions {
-		if s.Authed() && s.Login() == login {
-			n++
+	if max > 0 {
+		n := 0
+		for _, s := range r.sessions {
+			if s != sess && s.Authed() && s.Login() == login {
+				n++
+			}
+		}
+		if n >= max {
+			return false
 		}
 	}
-	return n
+	sess.setAuthed(login, role)
+	return true
 }
 
 // closeAll force-closes every session's socket (used on shutdown after grace).

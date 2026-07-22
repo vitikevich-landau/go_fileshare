@@ -34,13 +34,22 @@ func (h *Hub) SetOnChange(fn func(key, value string)) { h.onChange = fn }
 
 // Apply validates and swaps in an entirely new snapshot (used by SIGHUP reload).
 // It runs under the writer lock so it cannot race with Set.
-func (h *Hub) Apply(next Settings) error {
+func (h *Hub) Apply(next Settings) error { return h.ApplyWith(next, nil) }
+
+// ApplyWith is Apply that also runs effect against the new snapshot while still
+// holding the writer lock. This linearizes a full snapshot swap with its runtime
+// side effect (e.g. the live log level), so a concurrent Set can never publish a
+// snapshot and its effect in between the two and leave them diverged (R3-4).
+func (h *Hub) ApplyWith(next Settings, effect func(*Settings)) error {
 	if msg := next.Validate(); msg != "" {
 		return fmt.Errorf("config: %s", msg)
 	}
 	h.wmu.Lock()
+	defer h.wmu.Unlock()
 	h.snap.Store(&next)
-	h.wmu.Unlock()
+	if effect != nil {
+		effect(&next)
+	}
 	return nil
 }
 

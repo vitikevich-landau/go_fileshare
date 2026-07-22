@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"errors"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -52,7 +53,7 @@ func waitForActivity(events chan tea.Msg) tea.Cmd {
 // isConnLost reports whether err indicates a dropped connection rather than an
 // application-level (server ERROR / AUTH_FAIL) failure.
 func isConnLost(err error) bool {
-	if err == nil {
+	if err == nil || errors.Is(err, context.Canceled) {
 		return false
 	}
 	var re *client.RemoteError

@@ -8,6 +8,7 @@
 package vfs
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -91,6 +92,7 @@ type VFS struct {
 type cacheEntry struct {
 	Size  uint64
 	Mtime uint64
+	Ctime int64 // change-time nanos where available (0 otherwise) — RR-5
 	Algo  proto.Algo
 	Sum   [proto.ChecksumLen]byte
 }
@@ -273,6 +275,14 @@ func (v *VFS) Open(vpath string) (*os.File, fs.FileInfo, error) {
 // Checksum returns the checksum of the file at vpath, computing it lazily and
 // caching by (path, size, mtime). The current algorithm is SHA-256.
 func (v *VFS) Checksum(vpath string) (string, proto.Algo, [proto.ChecksumLen]byte, error) {
+	return v.ChecksumCtx(context.Background(), vpath)
+}
+
+// ChecksumCtx is Checksum that aborts a cache-miss hash when ctx is cancelled,
+// so a transfer that is cancelled during its final whole-file checksum stops
+// re-reading a large file promptly instead of blocking for minutes (R4-3). It
+// returns ctx.Err() unwrapped when cancelled, so callers can detect it.
+func (v *VFS) ChecksumCtx(ctx context.Context, vpath string) (string, proto.Algo, [proto.ChecksumLen]byte, error) {
 	var zero [proto.ChecksumLen]byte
 	clean, err := CleanPath(vpath)
 	if err != nil {
@@ -285,27 +295,63 @@ func (v *VFS) Checksum(vpath string) (string, proto.Algo, [proto.ChecksumLen]byt
 	defer f.Close()
 
 	size := uint64(info.Size())
-	mtime := uint64(info.ModTime().Unix())
+	// Nanosecond mtime granularity (CR-09) plus change-time (RR-5): ctime
+	// changes on any content/metadata modification even when mtime is preserved
+	// (unix), catching a same-size same-mtime replacement. This is the cache key
+	// only; the wire DirEntry.mtime stays unix seconds.
+	mtime := uint64(info.ModTime().UnixNano())
+	ctime, ctimeOK := changeTimeNanos(info)
 
+	// Only trust a cache hit when the platform gives a dependable change-time.
+	// Where it does not (e.g. Windows), (size, mtime) alone cannot prove the
+	// content is unchanged — a same-size replacement with the exact mtime
+	// restored would return a stale checksum — so recompute instead (R3-5).
 	v.mu.Lock()
-	if e, ok := v.cache[clean]; ok && e.Size == size && e.Mtime == mtime {
+	if e, ok := v.cache[clean]; ok && ctimeOK && e.Size == size && e.Mtime == mtime && e.Ctime == ctime {
 		v.mu.Unlock()
 		return clean, e.Algo, e.Sum, nil
 	}
 	v.mu.Unlock()
 
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return clean, proto.AlgoPending, zero, coded("checksum", clean, err)
+	if cerr := copyCtx(ctx, h, f); cerr != nil {
+		if ctx.Err() != nil {
+			return clean, proto.AlgoPending, zero, cerr // cancelled/deadline: report raw
+		}
+		return clean, proto.AlgoPending, zero, coded("checksum", clean, cerr)
 	}
 	var sum [proto.ChecksumLen]byte
 	copy(sum[:], h.Sum(nil))
 
 	v.mu.Lock()
-	v.cache[clean] = cacheEntry{Size: size, Mtime: mtime, Algo: proto.AlgoSHA256, Sum: sum}
+	v.cache[clean] = cacheEntry{Size: size, Mtime: mtime, Ctime: ctime, Algo: proto.AlgoSHA256, Sum: sum}
 	v.dirty = true
 	v.mu.Unlock()
 	return clean, proto.AlgoSHA256, sum, nil
+}
+
+// copyCtx streams src into dst, checking ctx before each block so a long hash
+// aborts promptly on cancellation. It returns ctx.Err() if cancelled, otherwise
+// the first read/write error, or nil at EOF.
+func copyCtx(ctx context.Context, dst io.Writer, src io.Reader) error {
+	buf := make([]byte, 128<<10)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return werr
+			}
+		}
+		if rerr == io.EOF {
+			return nil
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
 }
 
 // InvalidateChecksum drops any cached checksum for vpath (called when the

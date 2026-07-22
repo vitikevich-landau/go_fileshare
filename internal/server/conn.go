@@ -21,10 +21,12 @@ func (s *Server) handshake(sess *Session) bool {
 	deadline := time.Now().Add(time.Duration(cur.Limits.HandshakeTimeoutS) * time.Second)
 	_ = sess.conn.SetReadDeadline(deadline)
 
-	// Phase 1: wait for HELLO (PING is answered while we wait).
+	// Phase 1: wait for HELLO (PING is answered while we wait). Pre-auth frames
+	// are read with a small cap so an unauthenticated peer cannot pin memory
+	// with an oversized length header (CR-05).
 	var hello proto.Hello
 	for {
-		typ, payload, err := proto.ReadFrame(sess.conn)
+		typ, payload, err := proto.ReadFrameLimited(sess.conn, proto.HandshakeMaxPayload)
 		if err != nil {
 			// Unparseable first frame (e.g. a v1 client) — best-effort reject.
 			sess.trySendMsg(proto.Error{Code: proto.ErrUnsupportedVersion, Message: "expected HELLO"})
@@ -66,9 +68,10 @@ func (s *Server) handshake(sess *Session) bool {
 		PBKDF2Iters: uint32(cur.Auth.PBKDF2Iters),
 	})
 
-	// Phase 2: wait for AUTH_REQUEST (PING answered while we wait).
+	// Phase 2: wait for AUTH_REQUEST (PING answered while we wait), still under
+	// the small pre-auth payload cap (CR-05).
 	for {
-		typ, payload, err := proto.ReadFrame(sess.conn)
+		typ, payload, err := proto.ReadFrameLimited(sess.conn, proto.HandshakeMaxPayload)
 		if err != nil {
 			return false
 		}
@@ -130,24 +133,32 @@ func (s *Server) authenticate(sess *Session, req proto.AuthRequest, cur *config.
 		return false
 	}
 
-	// Enforce the per-user session cap before admitting.
-	if cur.Limits.MaxSessionsPerUser > 0 && s.reg.countUser(req.Login) >= cur.Limits.MaxSessionsPerUser {
+	// Atomically enforce the per-user session cap and mark authenticated, so
+	// concurrent logins for one user cannot all pass the check (CR-06).
+	if !s.reg.reserveUserSlot(sess, req.Login, role, cur.Limits.MaxSessionsPerUser) {
 		sess.sendMsg(proto.AuthFail{Reason: proto.AuthFailTooManySession, Message: "too many concurrent sessions"})
 		return false
 	}
-
-	sess.setAuthed(req.Login, role)
 	s.guard.Success(sess.IP)
 	sess.sendMsg(proto.AuthOk{Role: role, SessionID: sess.ID, Motd: cur.Server.Motd})
 	return true
 }
 
-// serveRequests is the post-auth request loop.
+// serveRequests is the post-auth request loop. Reads block without a per-frame
+// deadline (so a deadline can never fire mid-frame and desync the stream, RR-1);
+// a separate watchdog enforces the idle timeout by closing the connection, which
+// unblocks the read for a clean teardown. An active transfer is exempt (CR-03).
 func (s *Server) serveRequests(sess *Session) {
-	for {
-		cur := s.hub.Current()
-		_ = sess.conn.SetReadDeadline(time.Now().Add(time.Duration(cur.Limits.IdleTimeoutS) * time.Second))
+	_ = sess.conn.SetReadDeadline(time.Time{}) // clear the handshake deadline
+	sess.touch()
 
+	sess.wg.Add(1)
+	go func() {
+		defer sess.wg.Done()
+		s.idleWatchdog(sess)
+	}()
+
+	for {
 		typ, payload, err := proto.ReadFrame(sess.conn)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !isTimeout(err) {
@@ -156,6 +167,7 @@ func (s *Server) serveRequests(sess *Session) {
 			}
 			return
 		}
+		sess.touch()
 
 		if !roleAllows(sess.Role(), MinRole(typ)) {
 			s.sendErr(sess, proto.ErrAccessDenied)
@@ -169,7 +181,15 @@ func (s *Server) serveRequests(sess *Session) {
 			return
 		}
 
+		// Mark the connection as actively processing for the duration of the
+		// handler so a synchronous request that runs longer than idle_timeout_s
+		// (a checksum over a big file, a large listing, an admin call) is not
+		// reaped as idle mid-flight (R3-6). touch() afterwards gives the response
+		// a fresh idle window.
+		sess.inFlight.Store(true)
 		s.dispatch(sess, m)
+		sess.inFlight.Store(false)
+		sess.touch()
 	}
 }
 
@@ -178,7 +198,11 @@ func (s *Server) dispatch(sess *Session, m proto.Message) {
 	case proto.Ping:
 		sess.sendMsg(proto.Pong{})
 	case proto.Subscribe:
-		sess.subMask.Store(req.Mask)
+		mask := req.Mask
+		if sess.Role() != proto.RoleAdmin {
+			mask &^= proto.SubConfig // EVENT_CONFIG is admin-only (CR-07)
+		}
+		sess.subMask.Store(mask)
 	case proto.ListDirRequest:
 		s.handleList(sess, req)
 	case proto.StatRequest:
@@ -188,7 +212,7 @@ func (s *Server) dispatch(sess *Session, m proto.Message) {
 	case proto.DownloadRequest:
 		s.startDownload(sess, req)
 	case proto.DownloadCancel:
-		sess.cancelDownload()
+		sess.cancelDownload(req.TransferID)
 	case proto.AdminGetConfig, proto.AdminSet, proto.AdminListClients,
 		proto.AdminKick, proto.AdminStats, proto.AdminShutdown:
 		s.handleAdmin(sess, m)
@@ -204,7 +228,37 @@ func (s *Server) handleList(sess *Session, req proto.ListDirRequest) {
 		s.sendErr(sess, vfs.CodeOf(err))
 		return
 	}
-	sess.sendMsg(proto.ListDirResponse{Path: clean, Entries: entries})
+	frame, ok := listDirFrame(clean, entries)
+	if !ok {
+		// A listing that would exceed the frame limit is refused with a
+		// controlled error rather than an oversize frame that would break the
+		// connection (CR-10). Pagination is a future protocol extension.
+		s.log.Warn("directory listing exceeds frame limit", "path", clean, "entries", len(entries))
+		s.sendErr(sess, proto.ErrInternal)
+		return
+	}
+	sess.send(frame)
+}
+
+// listDirFrame encodes a LIST_DIR_RESPONSE, returning ok=false if its payload
+// would exceed the protocol frame limit. The size is computed BEFORE encoding
+// so an oversize listing is rejected without the large frame allocation (RR-6).
+func listDirFrame(clean string, entries []proto.DirEntry) ([]byte, bool) {
+	if listDirPayloadSize(clean, entries) > proto.MaxControlPayload {
+		return nil, false
+	}
+	return proto.Encode(proto.ListDirResponse{Path: clean, Entries: entries}), true
+}
+
+// listDirPayloadSize returns the exact wire payload size of a LIST_DIR_RESPONSE
+// without allocating it: path:str + count:u32, then each entry as name:str +
+// kind:u8 + size:u64 + mtime:u64 + flags:u8.
+func listDirPayloadSize(clean string, entries []proto.DirEntry) int {
+	size := 2 + len(clean) + 4
+	for _, e := range entries {
+		size += 2 + len(e.Name) + 1 + 8 + 8 + 1
+	}
+	return size
 }
 
 func (s *Server) handleStat(sess *Session, req proto.StatRequest) {
@@ -223,6 +277,37 @@ func (s *Server) handleChecksum(sess *Session, req proto.ChecksumRequest) {
 		return
 	}
 	sess.sendMsg(proto.ChecksumResponse{Path: clean, Algo: algo, Checksum: sum})
+}
+
+// idleWatchdog closes the connection once it has been idle past idle_timeout_s,
+// unless a transfer is active. Closing unblocks the reader for a clean teardown,
+// so an idle deadline never fires in the middle of a frame read (RR-1, CR-03).
+func (s *Server) idleWatchdog(sess *Session) {
+	t := time.NewTicker(idleCheckInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-sess.done:
+			return
+		case <-t.C:
+			idle := time.Duration(s.hub.Current().Limits.IdleTimeoutS) * time.Second
+			if s.reapable(sess, idle) {
+				sess.conn.Close()
+				return
+			}
+		}
+	}
+}
+
+// reapable reports whether the idle watchdog may close the connection now: it
+// must be idle past the timeout AND neither streaming a download nor running a
+// synchronous request handler, so long legitimate work is never reaped mid-flight
+// (CR-03, R3-6).
+func (s *Server) reapable(sess *Session, idle time.Duration) bool {
+	if sess.downloading.Load() || sess.inFlight.Load() {
+		return false
+	}
+	return sess.idleFor() >= idle
 }
 
 func (s *Server) sendErr(sess *Session, code proto.ErrCode) bool {
