@@ -47,7 +47,8 @@ func (m *Model) viewConnect() string {
 	}
 	b.WriteString(styDim.Render("  [Enter] connect   [Tab] next field   [Esc] quit") + "\n")
 	if m.connecting {
-		b.WriteString("\n  " + m.status + "\n")
+		b.WriteString("\n  " + m.spinner.View() + " " + m.status + "\n")
+		b.WriteString(styDim.Render("  TCP → handshake → auth → loading    [Esc to cancel]") + "\n")
 	}
 	if m.connectErr != "" {
 		b.WriteString("\n  " + styErr.Render("error: "+m.connectErr) + "\n")

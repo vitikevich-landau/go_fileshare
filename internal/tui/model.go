@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -51,11 +52,13 @@ type Model struct {
 	// connect screen
 	fields        []textinput.Model // host, port, login, password
 	focus         int
-	profiles      *Profiles
-	profileCursor int
-	connecting    bool
-	status        string
-	connectErr    string
+	profiles       *Profiles
+	profileCursor  int
+	connecting     bool
+	connectAborted bool // Esc pressed during a connect; ignore its late result
+	spinner        spinner.Model
+	status         string
+	connectErr     string
 
 	// commander
 	panels   [2]*Panel
@@ -140,11 +143,15 @@ func New(prefill Profile) *Model {
 	pw.EchoCharacter = '*'
 	pw.Width = 20
 
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+
 	m := &Model{
 		screen:           screenConnect,
 		fields:           []textinput.Model{host, port, login, pw},
 		profiles:         LoadProfiles(),
 		prog:             progress.New(progress.WithDefaultGradient()),
+		spinner:          sp,
 		events:           make(chan tea.Msg, 64),
 		link:             linkDown,
 		backoff:          time.Second,
@@ -197,7 +204,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd = m.onConnected(msg)
 	case connectErrMsg:
 		m.connecting = false
-		m.connectErr = msg.err.Error()
+		if m.connectAborted {
+			m.connectAborted = false // a cancelled attempt: swallow the error
+		} else {
+			m.connectErr = msg.err.Error()
+		}
+	case spinner.TickMsg:
+		if m.connecting {
+			var c tea.Cmd
+			m.spinner, c = m.spinner.Update(msg)
+			cmd = c
+		}
 	case remoteListingMsg:
 		m.onRemoteListing(msg)
 		cmd = m.afterRemoteOp()
@@ -327,6 +344,21 @@ func (m *Model) profilesFocus() int { return len(m.fields) }
 func (m *Model) hasProfiles() bool { return len(m.profiles.Profiles) > 0 }
 
 func (m *Model) handleConnectKey(k tea.KeyMsg) tea.Cmd {
+	// While a connect is in flight, only Esc (cancel) and Ctrl+C (quit) act.
+	if m.connecting {
+		switch k.String() {
+		case "esc":
+			m.connecting = false
+			m.connectAborted = true
+			m.status = ""
+			m.connectErr = "connection cancelled"
+			return nil
+		case "ctrl+c", "f10":
+			m.quitting = true
+			return tea.Quit
+		}
+		return nil
+	}
 	switch k.String() {
 	case "ctrl+c", "f10", "esc":
 		m.quitting = true
@@ -413,6 +445,7 @@ func (m *Model) doConnect() tea.Cmd {
 	}
 	m.connectErr = ""
 	m.connecting = true
+	m.connectAborted = false
 	m.status = "connecting to " + host + "…"
 
 	name := m.profile.Name
@@ -425,12 +458,18 @@ func (m *Model) doConnect() tea.Cmd {
 	prof := Profile{Name: name, Host: host, Port: port, Login: login, LastSeen: m.profile.LastSeen, DownloadsDir: m.profile.DownloadsDir}
 	addr := fmt.Sprintf("%s:%d", host, port)
 	opts := client.Options{Login: login, Password: pw, ClientName: "fshare-commander", EventHandler: m.eventForwarder()}
-	return dialCmd(addr, opts, prof)
+	return tea.Batch(dialCmd(addr, opts, prof), m.spinner.Tick)
 }
 
 // ---- commander ----
 
 func (m *Model) onConnected(msg connectedMsg) tea.Cmd {
+	if m.connectAborted {
+		// The user pressed Esc during the dial; drop the late connection.
+		m.connectAborted = false
+		msg.client.Close()
+		return nil
+	}
 	m.client = msg.client
 	m.role = msg.role
 	m.serverName = msg.serverName
