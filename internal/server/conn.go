@@ -142,20 +142,41 @@ func (s *Server) authenticate(sess *Session, req proto.AuthRequest, cur *config.
 	return true
 }
 
-// serveRequests is the post-auth request loop.
+// serveRequests is the post-auth request loop. It blocks on reads in bounded
+// polls so that an active transfer is never reaped by the idle timeout, while a
+// genuinely idle connection is still closed once idle_timeout_s elapses (CR-03).
 func (s *Server) serveRequests(sess *Session) {
+	lastActivity := time.Now()
 	for {
 		cur := s.hub.Current()
-		_ = sess.conn.SetReadDeadline(time.Now().Add(time.Duration(cur.Limits.IdleTimeoutS) * time.Second))
+		idle := time.Duration(cur.Limits.IdleTimeoutS) * time.Second
+		poll := idle
+		if poll > idlePollCap {
+			poll = idlePollCap
+		}
+		_ = sess.conn.SetReadDeadline(time.Now().Add(poll))
 
 		typ, payload, err := proto.ReadFrame(sess.conn)
 		if err != nil {
-			if !errors.Is(err, io.EOF) && !isTimeout(err) {
+			if isTimeout(err) {
+				// An active download is activity: reset the idle clock and keep
+				// serving. Otherwise disconnect only after a real idle window.
+				if sess.downloading.Load() {
+					lastActivity = time.Now()
+					continue
+				}
+				if time.Since(lastActivity) < idle {
+					continue
+				}
+				return // genuinely idle past idle_timeout_s
+			}
+			if !errors.Is(err, io.EOF) {
 				// Framing/protocol error: best-effort notice, then close.
 				sess.trySendMsg(proto.Error{Code: proto.ErrBadRequest, Message: "malformed frame"})
 			}
 			return
 		}
+		lastActivity = time.Now()
 
 		if !roleAllows(sess.Role(), MinRole(typ)) {
 			s.sendErr(sess, proto.ErrAccessDenied)

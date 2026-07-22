@@ -17,6 +17,11 @@ const writeDeadline = 30 * time.Second
 // frames before force-closing the socket.
 const flushTimeout = 2 * time.Second
 
+// idlePollCap bounds how long the request loop blocks on a single read before
+// re-checking idle/transfer state, so an active download is never mistaken for
+// an idle connection (CR-03).
+const idlePollCap = 15 * time.Second
+
 // outBuffer is the per-session outgoing queue depth.
 const outBuffer = 64
 
