@@ -1,8 +1,10 @@
-// Package ratelimit provides per-client and global token-bucket rate limiting
-// for downloads. Limits are read fresh on every chunk, so a live config change
-// throttles or unthrottles an already-active transfer (docs/tz/09-go-port.md
-// §5.6). Per-client buckets are keyed by login, so N parallel downloads by one
-// user share one budget (§8 bug 11).
+// Package ratelimit ограничивает скорость скачивания по схеме token bucket на
+// двух уровнях: глобальном и на клиента. Лимиты читаются заново на каждом чанке,
+// поэтому живое изменение конфига тормозит или ускоряет уже идущую передачу
+// (docs/tz/09-go-port.md §5.6). Персональные вёдра ключуются по ЛОГИНУ, так что N
+// параллельных закачек одного пользователя делят один бюджет (§8 bug 11).
+//
+// Смысл token bucket и словарь типов — в types.go.
 package ratelimit
 
 import (
@@ -13,25 +15,28 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// burstBytes is the bucket depth; it must be >= the largest chunk passed to Wait.
-const burstBytes = 1 << 16 // 64 KiB, matches proto.ChunkSize
+// burstBytes — глубина ведра; она должна быть >= самого большого чанка, который
+// передают в Wait (иначе один чанк никогда не поместится и Wait зависнет).
+const burstBytes = 1 << 16 // 64 КиБ, совпадает с proto.ChunkSize
 
-// Limiter enforces a global bucket plus one bucket per client key.
+// Limiter применяет глобальное ведро плюс по одному ведру на ключ клиента.
 type Limiter struct {
-	mu        sync.Mutex
-	global    *rate.Limiter
-	globalBps uint64
-	clients   map[string]*clientLim
+	mu        sync.Mutex            // защищает поля ниже
+	global    *rate.Limiter         // глобальное ведро (одно на весь сервер)
+	globalBps BytesPerSecond        // текущий глобальный лимит (для отслеживания смены)
+	clients   map[string]*clientLim // ключ ClientKey → персональное ведро
 }
 
+// clientLim — персональное ведро одного клиента плюс учёт «занятости», чтобы
+// сборщик (Cleanup) не удалил ведро прямо во время ожидания в нём.
 type clientLim struct {
-	lim      *rate.Limiter
-	bps      uint64
-	lastUsed time.Time
-	active   int // in-flight WaitN calls; a bucket with active > 0 is never reaped
+	lim      *rate.Limiter  // само ведро
+	bps      BytesPerSecond // лимит, на который оно настроено (для отслеживания смены)
+	lastUsed time.Time      // когда им пользовались в последний раз (для Cleanup)
+	active   int            // сколько WaitN сейчас «в полёте»; ведро с active > 0 не удаляют
 }
 
-// New returns a limiter that starts unlimited.
+// New возвращает лимитер, который стартует БЕЗ ограничений (rate.Inf).
 func New() *Limiter {
 	return &Limiter{
 		global:  rate.NewLimiter(rate.Inf, burstBytes),
@@ -39,10 +44,11 @@ func New() *Limiter {
 	}
 }
 
-// Wait blocks until n bytes may be sent for clientKey under the current
-// per-client and global limits. A limit of 0 means unlimited. ctx cancels the
-// wait (e.g. on cancel or connection teardown).
-func (l *Limiter) Wait(ctx context.Context, clientKey string, perClientBps, globalBps uint64, n int) error {
+// Wait блокируется, пока для clientKey можно будет отдать n байт при текущих
+// персональном и глобальном лимитах. Лимит 0 означает «без ограничения». ctx
+// отменяет ожидание (например, при отмене передачи или разрыве соединения).
+// Порядок важен: сначала ждём глобальное ведро, затем персональное.
+func (l *Limiter) Wait(ctx context.Context, clientKey ClientKey, perClientBps, globalBps BytesPerSecond, n ByteCount) error {
 	if g := l.globalLimiter(globalBps); g != nil {
 		if err := g.WaitN(ctx, n); err != nil {
 			return err
@@ -50,15 +56,17 @@ func (l *Limiter) Wait(ctx context.Context, clientKey string, perClientBps, glob
 	}
 	cl := l.acquireClient(clientKey, perClientBps)
 	if cl == nil {
-		return nil // unlimited per-client
+		return nil // персональный лимит не задан
 	}
 	defer l.releaseClient(clientKey)
 	return cl.lim.WaitN(ctx, n)
 }
 
-func (l *Limiter) globalLimiter(bps uint64) *rate.Limiter {
+// globalLimiter возвращает глобальное ведро, подстроив его под текущий лимит bps
+// (перенастройка на лету), либо nil если лимита нет.
+func (l *Limiter) globalLimiter(bps BytesPerSecond) *rate.Limiter {
 	if bps == 0 {
-		return nil // unlimited
+		return nil // без ограничения
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -69,12 +77,12 @@ func (l *Limiter) globalLimiter(bps uint64) *rate.Limiter {
 	return l.global
 }
 
-// acquireClient returns the per-client bucket (creating/retuning it) and marks
-// one in-flight reservation, so the reaper cannot drop it mid-wait. The caller
-// must pair every non-nil return with releaseClient.
-func (l *Limiter) acquireClient(key string, bps uint64) *clientLim {
+// acquireClient возвращает персональное ведро (создавая или перенастраивая его) и
+// помечает одну «занятость», чтобы сборщик не удалил ведро в середине ожидания.
+// На каждый ненулевой возврат вызывающий ОБЯЗАН вызвать releaseClient.
+func (l *Limiter) acquireClient(key ClientKey, bps BytesPerSecond) *clientLim {
 	if bps == 0 {
-		return nil // unlimited
+		return nil // без ограничения
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -91,9 +99,9 @@ func (l *Limiter) acquireClient(key string, bps uint64) *clientLim {
 	return cl
 }
 
-// releaseClient ends one reservation and refreshes lastUsed, so a bucket that
-// spent a long time in WaitN is dated from when the wait finished, not started.
-func (l *Limiter) releaseClient(key string) {
+// releaseClient снимает одну «занятость» и обновляет lastUsed, чтобы ведро,
+// долго простоявшее в WaitN, датировалось моментом окончания ожидания, а не начала.
+func (l *Limiter) releaseClient(key ClientKey) {
 	l.mu.Lock()
 	if cl := l.clients[key]; cl != nil {
 		if cl.active > 0 {
@@ -104,8 +112,9 @@ func (l *Limiter) releaseClient(key string) {
 	l.mu.Unlock()
 }
 
-// Cleanup drops per-client buckets unused for longer than ttl, bounding memory
-// for a churning set of users (§8 bug 11 follow-up).
+// Cleanup удаляет персональные вёдра, не использовавшиеся дольше ttl, ограничивая
+// память при постоянно меняющемся наборе пользователей (§8 bug 11, продолжение).
+// Ведро с active > 0 (в нём кто-то сейчас ждёт) не удаляется.
 func (l *Limiter) Cleanup(ttl time.Duration) {
 	cutoff := time.Now().Add(-ttl)
 	l.mu.Lock()
@@ -117,8 +126,8 @@ func (l *Limiter) Cleanup(ttl time.Duration) {
 	l.mu.Unlock()
 }
 
-// ClientCount returns the number of live per-client buckets. Used by the
-// bucket-reaper test and any future metrics.
+// ClientCount возвращает число живых персональных вёдер. Используется тестом
+// сборщика вёдер и любыми будущими метриками.
 func (l *Limiter) ClientCount() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
