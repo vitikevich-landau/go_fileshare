@@ -56,8 +56,16 @@ func dialLoopbackClient(t *testing.T) *client.Client {
 
 // The m.client pointer write in doDisconnect must be synchronized with the
 // locked background readers (pump/commands). With a REAL non-nil client, the
-// pre-fix code took the unsynchronized-write path and this test fails under
-// -race; the fixed code clears the pointer under clientMu. Run with -race.
+// pre-fix code took the unsynchronized-write path; the fixed code clears the
+// pointer under clientMu. Run with -race.
+//
+// Determinism: the reader performs a FIXED number of locked reads with no
+// early-stop, and main enters doDisconnect only after the startup barrier. So
+// every run executes both the write and all reads, and no happens-before edge
+// orders the (buggy, unsynchronized) write against any read — close(done)/<-done
+// only orders reader→main, never the reverse. The race detector compares vector
+// clocks, not physical overlap, so it must flag the old code on EVERY run — even
+// a scheduling where the write physically completes before the first read.
 func TestDisconnectClientPointerNoRace(t *testing.T) {
 	m := New(Profile{})
 	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
@@ -65,26 +73,25 @@ func TestDisconnectClientPointerNoRace(t *testing.T) {
 	m.panels = [2]*Panel{newPanel(false, "l", "/"), newPanel(true, "r", "/")}
 	m.client = dialLoopbackClient(t) // genuine non-nil client
 
-	// A background reader touches m.client under the lock, exactly like the pump.
-	stop := make(chan struct{})
+	started := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-				m.clientMu.Lock()
-				_ = m.client
-				m.clientMu.Unlock()
+		close(started) // startup barrier: main proceeds only once we are live
+		seen := 0
+		for i := 0; i < 1000; i++ { // mandatory reads, never skipped
+			m.clientMu.Lock()
+			if m.client != nil { // a real use, so the load cannot be elided
+				seen++
 			}
+			m.clientMu.Unlock()
 		}
+		_ = seen
 	}()
 
+	<-started
 	m.doDisconnect() // closes the real socket, then clears m.client under the lock
-	close(stop)
-	<-done
+	<-done           // every one of the 1000 reads has executed
 
 	if m.client != nil {
 		t.Fatal("disconnect should clear the client pointer")
