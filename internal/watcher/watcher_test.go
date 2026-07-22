@@ -118,6 +118,42 @@ func TestWatcherDropsWatchOnDirRemove(t *testing.T) {
 	}
 }
 
+// Removing a non-empty subtree must drop the watches on every descendant dir,
+// not just the top directory (§8 bug 15, nested case).
+func TestWatcherDropsNestedWatchesOnRemove(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	nested := filepath.Join(sub, "deep")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ch := make(chan Event, 16)
+	w, err := New(root, 30*time.Millisecond, func(e Event) { ch <- e })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.Start(ctx)
+
+	if !watchListContains(w, sub) || !watchListContains(w, nested) {
+		t.Fatalf("nested dirs not watched initially; WatchList=%v", w.fsw.WatchList())
+	}
+
+	if err := os.RemoveAll(sub); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.After(3 * time.Second)
+	for watchListContains(w, sub) || watchListContains(w, nested) {
+		select {
+		case <-deadline:
+			t.Fatalf("nested watches not dropped after subtree removal; WatchList=%v", w.fsw.WatchList())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 func TestWatcherReportsRemove(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "gone.txt")

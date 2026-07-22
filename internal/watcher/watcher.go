@@ -91,6 +91,19 @@ func (w *Watcher) Start(ctx context.Context) {
 	}()
 }
 
+// removeWatchTree drops the watch on dir and on every still-registered
+// descendant directory, so removing/renaming a non-empty subtree does not leak
+// the per-subdir watches that addRecursive created.
+func (w *Watcher) removeWatchTree(dir string) {
+	_ = w.fsw.Remove(dir)
+	prefix := dir + string(os.PathSeparator)
+	for _, p := range w.fsw.WatchList() {
+		if strings.HasPrefix(p, prefix) {
+			_ = w.fsw.Remove(p)
+		}
+	}
+}
+
 // addRecursive registers dir and all of its subdirectories.
 func (w *Watcher) addRecursive(dir string) error {
 	return filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
@@ -113,12 +126,12 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 		}
 	}
 
-	// A removed or renamed-away path may have been a watched directory; drop its
-	// watch explicitly so the fsnotify watch set stays bounded rather than
-	// relying on backend auto-removal (§8 bug 15, remove-half). Remove on a path
-	// that was not a watch is a harmless no-op.
+	// A removed or renamed-away path may have been a watched directory with
+	// watched descendants (addRecursive watches each subdir). Drop the whole
+	// subtree explicitly so the fsnotify watch set stays bounded rather than
+	// relying on backend auto-removal (§8 bug 15, remove-half).
 	if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-		_ = w.fsw.Remove(ev.Name)
+		w.removeWatchTree(ev.Name)
 	}
 
 	created := ev.Op&(fsnotify.Create|fsnotify.Rename) != 0
