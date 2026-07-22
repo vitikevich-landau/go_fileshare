@@ -311,3 +311,22 @@ VFS возвращает весь каталог, затем сервер код
 | RR-6 | P2 | Oversize listing аллоцировался до проверки | Размер payload вычисляется до `Encode`, oversize отклоняется без аллокации |
 
 Полный прогон `go test -race ./...` зелёный; линуксовый путь (ctime) проверен в Docker.
+
+## Повторное ревью (round 3): R3-1…R3-7 — исправлены
+
+Третий проход по head `076196c` показал, что исправления RR-1…RR-6 присутствуют,
+но 7 пограничных сценариев остались незакрытыми. Все исправлены (по коммиту на
+пункт, с регрессионными тестами):
+
+| ID | Приоритет | Замечание | Исправление |
+|---|---|---|---|
+| R3-1 | P1 | Cancel зависал внутри rate limiter: `limiter.Wait` не будился на client-cancel, при низком `per_client_bps` ожидание одного chunk длилось минуты | Rate-limit watcher теперь селектит и на `<-cancel` (будит `Wait` через `ctxCancel`); после возврата `Wait` поток отличает client-cancel (шлёт терминальный `ERROR(CANCELLED)`) от teardown |
+| R3-2 | P1 | Сервер игнорировал `TransferID` при cancel; гонка late-cancel могла оборвать следующую передачу | `cancelDownload(tid)` сверяет `tid` с активным `cancelTID`; клиентский `DownloadCtx` дожидается cancel-watcher (`WaitGroup`) перед возвратом, чтобы поздний `DOWNLOAD_CANCEL` не утёк в следующую передачу |
+| R3-3 | P2 | Локальная ошибка после `ACCEPT` (open/write `.part`) оставляла соединение рассинхронизированным | Любой локальный/аномальный ранний выход после `ACCEPT` вызывает `abortConn` (закрывает соединение); терминальные кадры сервера (`DONE`/`ERROR`, включая graceful RR-3 cancel) соединение не рвут |
+| R3-4 | P2 | SIGHUP и `ADMIN_SET log.level` могли рассинхронизировать snapshot и живой logger (без data race) | `Hub.ApplyWith` применяет runtime-эффект (LevelVar) под тем же writer lock, что и swap snapshot — линеаризовано с `Hub.Set` |
+| R3-5 | P2 | На non-Linux RR-5 не работал: возврат `0` сводил ключ к `(path,size,mtime)`, тест делал `Skip` | `changeTimeNanos` возвращает `(nanos, reliable)`; добавлен darwin (`Ctimespec`); где change-time ненадёжен (Windows) — кэш не отдаёт hit, а пересчитывает; тест больше не скипается |
+| R3-6 | P2 | Watchdog считал долгий синхронный `Checksum`/`List`/admin-обработчик простоем и мог оборвать соединение посреди запроса | `serveRequests` выставляет `inFlight` вокруг `dispatch` и `touch()` после; `reapable` не жнёт при `downloading` или `inFlight` |
+| R3-7 | P1 | `PollEvents` терял частично прочитанный frame: deadline стоял на весь `ReadFrame` | Deadline применяется только до первого байта (`conn.Read(first[:1])`); дальше `proto.ReadFrameContinue` дочитывает кадр без deadline — частичный frame не теряется |
+
+Полный прогон `go build ./...`, `go vet ./...`, `go test -race ./...` зелёный;
+кросс-сборка `GOOS=linux` и `GOOS=darwin` проходит.
