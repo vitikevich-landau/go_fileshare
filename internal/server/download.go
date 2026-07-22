@@ -114,16 +114,29 @@ func (s *Server) streamFile(ctx context.Context, sess *Session, f *os.File, req 
 			break
 		}
 		if err != nil {
+			// A read error mid-transfer: tell the client instead of leaving it
+			// waiting, and never publish a partial file (CR-02).
+			s.sendErr(sess, proto.ErrInternal)
 			return
 		}
 	}
 
+	// If the file shrank during the transfer we delivered fewer bytes than
+	// announced; report an error rather than a success DONE the client would
+	// (rightly) reject (CR-02).
+	if sent != total {
+		s.sendErr(sess, proto.ErrInternal)
+		return
+	}
+
 	// The server always sends the checksum of the whole file; on a resumed
-	// download the client verifies the reassembled file against it.
+	// download the client verifies the reassembled file against it. If the
+	// checksum cannot be computed we must NOT claim success — send an error so
+	// the client never publishes an unverifiable file.
 	_, algo, sum, cerr := s.vfs.Checksum(req.Path)
-	if cerr != nil {
-		algo = proto.AlgoPending
-		sum = [proto.ChecksumLen]byte{}
+	if cerr != nil || algo != proto.AlgoSHA256 {
+		s.sendErr(sess, proto.ErrInternal)
+		return
 	}
 	if sess.sendMsg(proto.DownloadDone{TransferID: tid, Algo: algo, Checksum: sum}) {
 		s.completed.Add(1)

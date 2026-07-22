@@ -315,6 +315,7 @@ func (c *Client) Download(remotePath, localPath string, progress func(Progress))
 	}
 	accept := m.(proto.DownloadAccept)
 	total := accept.TotalSize
+	tid := accept.TransferID
 
 	flag := os.O_CREATE | os.O_WRONLY
 	if offset > 0 {
@@ -345,6 +346,10 @@ func (c *Client) Download(remotePath, localPath string, progress func(Progress))
 		}
 		switch v := msg.(type) {
 		case proto.ChunkData:
+			if v.TransferID != tid {
+				pf.Close()
+				return fmt.Errorf("chunk for unexpected transfer %d (want %d)", v.TransferID, tid)
+			}
 			if received+uint64(len(v.Data)) > total {
 				pf.Close()
 				return fmt.Errorf("server sent more than total_size (%d > %d)", received+uint64(len(v.Data)), total)
@@ -361,15 +366,27 @@ func (c *Client) Download(remotePath, localPath string, progress func(Progress))
 			if cerr := pf.Close(); cerr != nil {
 				return cerr
 			}
-			if v.Algo == proto.AlgoSHA256 {
-				sum, herr := sha256File(partPath)
-				if herr != nil {
-					return herr
-				}
-				if sum != v.Checksum {
-					os.Remove(partPath) // avoid looping on a corrupt full-size .part
-					return errors.New("checksum mismatch after download")
-				}
+			// Integrity gates before publishing (CR-02): the DONE must be for
+			// this transfer, all announced bytes must have arrived, and it must
+			// carry a supported checksum that matches the reassembled file. A
+			// short read keeps the .part so it can be resumed; a checksum
+			// mismatch discards it so we don't loop on a corrupt full-size .part.
+			if v.TransferID != tid {
+				return fmt.Errorf("DOWNLOAD_DONE for unexpected transfer %d (want %d)", v.TransferID, tid)
+			}
+			if received != total {
+				return fmt.Errorf("incomplete download: got %d of %d bytes", received, total)
+			}
+			if v.Algo != proto.AlgoSHA256 {
+				return fmt.Errorf("server did not provide a verifiable checksum (algo %d)", v.Algo)
+			}
+			sum, herr := sha256File(partPath)
+			if herr != nil {
+				return herr
+			}
+			if sum != v.Checksum {
+				os.Remove(partPath)
+				return errors.New("checksum mismatch after download")
 			}
 			if err := os.Rename(partPath, localPath); err != nil {
 				return err // bug #3: only report success if the file is in place
