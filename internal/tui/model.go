@@ -84,6 +84,7 @@ type Model struct {
 	adminConfirm      confirmKind
 	adminConfirmArg   uint64          // e.g. session id for a kick confirm
 	adminConfirmInput textinput.Model // typed-word confirm (shutdown)
+	adminDetail       *proto.ClientInfo // Enter on Clients tab: session detail box
 
 	clientMu   sync.Mutex // serializes all client I/O across goroutines
 	client     *client.Client

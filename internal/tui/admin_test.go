@@ -163,6 +163,36 @@ func TestAdminKickConfirmFlow(t *testing.T) {
 	}
 }
 
+func TestAdminSessionDetail(t *testing.T) {
+	m := New(Profile{})
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.role = proto.RoleAdmin
+	m.admin = true
+	m.adminTab = adminTabClients
+	m.adminClients = []proto.ClientInfo{
+		{SessionID: 7, Login: "bob", IP: "10.0.0.5", Role: proto.RoleUser, CurrentPath: "/video", BytesSent: 2048, SpeedBps: 1000},
+	}
+	m.adminCursor = 0
+
+	// Enter opens the detail box for the selected session.
+	m.handleAdminKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.adminDetail == nil || m.adminDetail.SessionID != 7 {
+		t.Fatal("Enter on a client row should open its session detail")
+	}
+	out := m.viewAdmin()
+	for _, want := range []string{"Session 7", "bob", "10.0.0.5", "/video"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("detail view missing %q", want)
+		}
+	}
+
+	// Any key dismisses the box.
+	m.handleAdminKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if m.adminDetail != nil {
+		t.Fatal("a key press should dismiss the session-detail box")
+	}
+}
+
 func TestViewAdminRenders(t *testing.T) {
 	m := New(Profile{})
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})

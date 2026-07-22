@@ -199,12 +199,21 @@ func (m *Model) openAdmin() tea.Cmd {
 	m.adminTab = adminTabOverview
 	m.adminCursor = 0
 	m.adminMsg = ""
+	m.adminDetail = nil
+	m.adminConfirm = confirmNone
 	return tea.Batch(m.adminStatsCmd(), m.adminClientsCmd(), m.adminConfigCmd())
 }
 
 func (m *Model) handleAdminKey(k tea.KeyMsg) tea.Cmd {
 	if m.adminConfirm != confirmNone {
 		return m.handleAdminConfirmKey(k)
+	}
+	if m.adminDetail != nil {
+		if k.String() == "ctrl+c" {
+			return m.quit()
+		}
+		m.adminDetail = nil // any other key dismisses the session-detail box
+		return nil
 	}
 	if m.adminEditing {
 		switch k.String() {
@@ -258,8 +267,11 @@ func (m *Model) handleAdminKey(k tea.KeyMsg) tea.Cmd {
 			m.adminCursor++
 		}
 	case "enter":
-		if m.adminTab == adminTabSettings {
+		switch m.adminTab {
+		case adminTabSettings:
 			return m.startEditSetting()
+		case adminTabClients:
+			m.showClientDetail()
 		}
 	case "f2":
 		return m.startShutdownConfirm()
@@ -383,6 +395,16 @@ func (m *Model) kickSelected() tea.Cmd {
 	return nil
 }
 
+// showClientDetail opens the session-detail box for the selected client
+// (docs/tz/05-admin.md §2.2, "Enter — детали сессии").
+func (m *Model) showClientDetail() {
+	if m.adminCursor < 0 || m.adminCursor >= len(m.adminClients) {
+		return
+	}
+	c := m.adminClients[m.adminCursor] // snapshot, stable across refreshes
+	m.adminDetail = &c
+}
+
 // adminErr reports an admin op error, escalating a connection loss to reconnect.
 func (m *Model) adminErr(err error) tea.Cmd {
 	if isConnLost(err) {
@@ -434,6 +456,9 @@ func (m *Model) viewAdmin() string {
 	}
 	if m.adminEditing {
 		b.WriteString("\n  set " + m.adminEditKey + " = " + m.adminInput.View() + "   [Enter apply · Esc cancel]\n")
+	}
+	if m.adminDetail != nil {
+		b.WriteString("\n" + m.renderClientDetail())
 	}
 	switch m.adminConfirm {
 	case confirmShutdown:
@@ -527,6 +552,21 @@ func (m *Model) renderAdminSettings() string {
 		}
 	}
 	return b.String()
+}
+
+func (m *Model) renderClientDetail() string {
+	c := m.adminDetail
+	lines := []string{
+		styActiveTitle.Render(fit(fmt.Sprintf(" Session %d", c.SessionID), 20)),
+		fmt.Sprintf("  Login:   %s", c.Login),
+		fmt.Sprintf("  IP:      %s", c.IP),
+		fmt.Sprintf("  Role:    %s", c.Role.String()),
+		fmt.Sprintf("  Path:    %s", c.CurrentPath),
+		fmt.Sprintf("  Sent:    %s", formatSize(c.BytesSent)),
+		fmt.Sprintf("  Speed:   %s", limitStr(c.SpeedBps)),
+		styDim.Render("  [any key to close]"),
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 func limitStr(bps uint64) string {
