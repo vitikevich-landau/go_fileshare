@@ -6,8 +6,10 @@ package client
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net"
 	"os"
@@ -404,14 +406,13 @@ func (c *Client) Download(remotePath, localPath string, progress func(Progress))
 			if received != total {
 				return fmt.Errorf("incomplete download: got %d of %d bytes", received, total)
 			}
-			if v.Algo != proto.AlgoSHA256 {
-				return fmt.Errorf("server did not provide a verifiable checksum (algo %d)", v.Algo)
-			}
-			sum, herr := sha256File(partPath)
-			if herr != nil {
+			// Verify against whichever checksum the server used. SHA-256 fills
+			// the whole 32-byte field; CRC-32 uses the first 4 bytes (big-endian,
+			// the protocol's integer convention), the rest zero. This keeps
+			// interop with a CRC32-configured C++ server (RR-2).
+			if bad, herr := checksumMismatch(partPath, v.Algo, v.Checksum); herr != nil {
 				return herr
-			}
-			if sum != v.Checksum {
+			} else if bad {
 				os.Remove(partPath)
 				return errors.New("checksum mismatch after download")
 			}
@@ -526,6 +527,40 @@ func (c *Client) Interrupt() {
 
 // Close closes the connection.
 func (c *Client) Close() error { return c.conn.Close() }
+
+// checksumMismatch reports whether the file's checksum differs from want, using
+// the algorithm the server declared. An unsupported/absent algorithm is an error.
+func checksumMismatch(path string, algo proto.Algo, want [proto.ChecksumLen]byte) (bool, error) {
+	switch algo {
+	case proto.AlgoSHA256:
+		got, err := sha256File(path)
+		if err != nil {
+			return false, err
+		}
+		return got != want, nil
+	case proto.AlgoCRC32:
+		got, err := crc32File(path)
+		if err != nil {
+			return false, err
+		}
+		return got != binary.BigEndian.Uint32(want[:4]), nil
+	default:
+		return false, fmt.Errorf("server did not provide a verifiable checksum (algo %d)", algo)
+	}
+}
+
+func crc32File(path string) (uint32, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	h := crc32.NewIEEE()
+	if _, err := io.Copy(h, f); err != nil {
+		return 0, err
+	}
+	return h.Sum32(), nil
+}
 
 func sha256File(path string) ([proto.ChecksumLen]byte, error) {
 	var out [proto.ChecksumLen]byte
