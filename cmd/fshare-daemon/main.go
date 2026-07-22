@@ -227,7 +227,11 @@ func newLogger(level string) (*slog.Logger, *slog.LevelVar) {
 // applyReload merges a freshly-loaded config into the running hub on SIGHUP. It
 // preserves restart-only keys (port, share_root, workers, checksum, auth, and
 // events — the watcher is built once) from the current snapshot, and applies the
-// hot log.level to the live LevelVar (which Hub.Apply does not do) — RR-4.
+// hot log.level to the live LevelVar (which a plain Apply does not do) — RR-4.
+//
+// The LevelVar update is applied through ApplyWith so it runs under the same hub
+// writer lock as the snapshot swap: a concurrent ADMIN_SET log.level cannot
+// interleave and leave the snapshot and the live logger diverged (R3-4).
 func applyReload(hub *config.Hub, levelVar *slog.LevelVar, next config.Settings) error {
 	cur := hub.Current()
 	next.Server.Port = cur.Server.Port
@@ -236,13 +240,11 @@ func applyReload(hub *config.Hub, levelVar *slog.LevelVar, next config.Settings)
 	next.Checksum = cur.Checksum
 	next.Auth = cur.Auth
 	next.Events = cur.Events
-	if err := hub.Apply(next); err != nil {
-		return err
-	}
-	if levelVar != nil {
-		levelVar.Set(levelFromString(next.Log.Level))
-	}
-	return nil
+	return hub.ApplyWith(next, func(s *config.Settings) {
+		if levelVar != nil {
+			levelVar.Set(levelFromString(s.Log.Level))
+		}
+	})
 }
 
 func levelFromString(level string) slog.Level {
