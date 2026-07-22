@@ -80,10 +80,22 @@ func Dial(addr string, opts Options) (*Client, error) {
 	return handshake(conn, opts)
 }
 
+// maxAuthIters bounds the PBKDF2 iteration count the client will run on a
+// server-announced value, so a hostile/MITM server cannot pin a CPU (CR-04).
+const maxAuthIters = 10_000_000
+
 // handshake performs HELLO/AUTH over an already-connected socket and returns a
 // ready client. On failure it closes conn.
 func handshake(conn net.Conn, opts Options) (*Client, error) {
 	c := &Client{conn: conn, eventHandler: opts.EventHandler}
+
+	// Bound the whole handshake so a silent/MITM server cannot hang the client
+	// indefinitely (CR-04); cleared once authenticated.
+	hsTimeout := opts.DialTimeout
+	if hsTimeout == 0 {
+		hsTimeout = 10 * time.Second
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(hsTimeout))
 
 	name := opts.ClientName
 	if name == "" {
@@ -111,6 +123,20 @@ func handshake(conn net.Conn, opts Options) (*Client, error) {
 	c.authMode = helloOk.AuthMode
 	c.iters = int(helloOk.PBKDF2Iters)
 
+	// Validate the untrusted auth parameters before doing any expensive work.
+	switch helloOk.AuthMode {
+	case proto.AuthNone:
+		// no proof; iters irrelevant
+	case proto.AuthChallenge:
+		if c.iters < 1 || c.iters > maxAuthIters {
+			conn.Close()
+			return nil, fmt.Errorf("server requested %d PBKDF2 iterations, outside [1,%d]", c.iters, maxAuthIters)
+		}
+	default:
+		conn.Close()
+		return nil, fmt.Errorf("unsupported auth mode %d", helloOk.AuthMode)
+	}
+
 	var proof [proto.ProofLen]byte
 	if helloOk.AuthMode == proto.AuthChallenge {
 		proof = auth.Proof(opts.Password, opts.Login, c.iters, helloOk.Challenge[:])
@@ -130,6 +156,7 @@ func handshake(conn net.Conn, opts Options) (*Client, error) {
 		c.role = v.Role
 		c.sessionID = v.SessionID
 		c.motd = v.Motd
+		_ = conn.SetReadDeadline(time.Time{}) // clear the handshake deadline
 		return c, nil
 	case proto.AuthFail:
 		conn.Close()
