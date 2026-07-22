@@ -21,10 +21,12 @@ func (s *Server) handshake(sess *Session) bool {
 	deadline := time.Now().Add(time.Duration(cur.Limits.HandshakeTimeoutS) * time.Second)
 	_ = sess.conn.SetReadDeadline(deadline)
 
-	// Phase 1: wait for HELLO (PING is answered while we wait).
+	// Phase 1: wait for HELLO (PING is answered while we wait). Pre-auth frames
+	// are read with a small cap so an unauthenticated peer cannot pin memory
+	// with an oversized length header (CR-05).
 	var hello proto.Hello
 	for {
-		typ, payload, err := proto.ReadFrame(sess.conn)
+		typ, payload, err := proto.ReadFrameLimited(sess.conn, proto.HandshakeMaxPayload)
 		if err != nil {
 			// Unparseable first frame (e.g. a v1 client) — best-effort reject.
 			sess.trySendMsg(proto.Error{Code: proto.ErrUnsupportedVersion, Message: "expected HELLO"})
@@ -66,9 +68,10 @@ func (s *Server) handshake(sess *Session) bool {
 		PBKDF2Iters: uint32(cur.Auth.PBKDF2Iters),
 	})
 
-	// Phase 2: wait for AUTH_REQUEST (PING answered while we wait).
+	// Phase 2: wait for AUTH_REQUEST (PING answered while we wait), still under
+	// the small pre-auth payload cap (CR-05).
 	for {
-		typ, payload, err := proto.ReadFrame(sess.conn)
+		typ, payload, err := proto.ReadFrameLimited(sess.conn, proto.HandshakeMaxPayload)
 		if err != nil {
 			return false
 		}
