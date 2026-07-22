@@ -34,7 +34,7 @@ func (s *Server) startDownload(sess *Session, req proto.DownloadRequest) {
 
 	tid := s.nextTransfer.Add(1)
 	cancel := make(chan struct{})
-	sess.setCancel(cancel)
+	sess.setCancel(tid, cancel)
 	s.activeDownloads.Add(1)
 	sess.wg.Add(1)
 	go func() {
@@ -43,20 +43,24 @@ func (s *Server) startDownload(sess *Session, req proto.DownloadRequest) {
 		defer f.Close()
 		defer sess.touch() // refresh idle clock so post-download isn't reaped (RR-1)
 		defer sess.downloading.Store(false)
+		defer sess.clearCancel()  // a stale cancel must not touch a later transfer (R3-2)
 		defer sess.clearCurPath() // clear even if checksum/read errors (bug #2)
 
 		// A context that cancels when the transfer is cancelled or the session
-		// is torn down, so a rate-limit wait cannot block teardown.
+		// is torn down, so a rate-limit wait cannot block on either.
 		ctx, ctxCancel := context.WithCancel(context.Background())
 		defer ctxCancel()
 		go func() {
-			// The rate-limit ctx is cancelled only on teardown (not on a client
-			// cancel): a cancel is handled by the stream loop so it can send the
-			// terminal CANCELLED error and keep the connection in sync (RR-3).
-			// ctx.Done() also lets this watcher exit on normal completion, so it
-			// never leaks a goroutine.
+			// Cancel the rate-limit ctx on a client cancel OR teardown, so a
+			// cancel that lands while the stream is blocked in limiter.Wait wakes
+			// it promptly instead of stalling for minutes at a low bps (R3-1). The
+			// stream loop distinguishes the two: on a client cancel it sends the
+			// terminal CANCELLED error to keep the connection in sync (RR-3); on
+			// teardown it just stops. ctx.Done() also lets this watcher exit on
+			// normal completion, so it never leaks a goroutine.
 			select {
 			case <-sess.done:
+			case <-cancel:
 			case <-ctx.Done():
 			}
 			ctxCancel()
@@ -105,7 +109,15 @@ func (s *Server) streamFile(ctx context.Context, sess *Session, f *os.File, req 
 			// throttles this active transfer (docs/tz/09-go-port.md §5.6).
 			lim := s.hub.Current().Limits
 			if werr := s.limiter.Wait(ctx, clientKey, lim.PerClientBps, lim.GlobalBps, n); werr != nil {
-				return // cancelled or torn down
+				// The wait was interrupted. If the client asked to cancel, send the
+				// terminal CANCELLED frame so its loop ends in sync (R3-1); on a
+				// teardown, just stop (the connection is already closing).
+				select {
+				case <-cancel:
+					s.sendErr(sess, proto.ErrCancelled)
+				default:
+				}
+				return
 			}
 			// proto.Encode copies buf into a fresh frame, so reusing buf is safe.
 			if !sess.sendMsg(proto.ChunkData{TransferID: tid, Data: buf[:n]}) {

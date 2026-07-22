@@ -41,16 +41,18 @@ type Session struct {
 
 	challenge []byte // set during handshake
 
-	mu       sync.Mutex
-	login    string
-	role     proto.Role
-	authed   bool
-	cancelDL chan struct{} // closes to cancel the active download
+	mu        sync.Mutex
+	login     string
+	role      proto.Role
+	authed    bool
+	cancelDL  chan struct{} // closes to cancel the active download
+	cancelTID uint32        // transfer id the cancel channel belongs to (R3-2)
 
 	subMask      atomic.Uint32
 	bytes        atomic.Uint64
 	curPath      atomic.Pointer[string]
 	downloading  atomic.Bool
+	inFlight     atomic.Bool  // a request handler is running in dispatch (R3-6)
 	lastActivity atomic.Int64 // unix-nanos of the last completed frame / activity
 	startedAt    time.Time
 }
@@ -162,22 +164,39 @@ func (s *Session) Authed() bool {
 	return s.authed
 }
 
-// setCancel installs the cancel channel for the active download.
-func (s *Session) setCancel(c chan struct{}) {
+// setCancel installs the cancel channel for the active download and records the
+// transfer id it belongs to, so a cancel request can be matched to it (R3-2).
+func (s *Session) setCancel(tid uint32, c chan struct{}) {
 	s.mu.Lock()
 	s.cancelDL = c
+	s.cancelTID = tid
 	s.mu.Unlock()
 }
 
-// cancelDownload closes the active download's cancel channel, if any.
-func (s *Session) cancelDownload() {
+// clearCancel drops the active download's cancel channel once the transfer has
+// finished, so a stale DOWNLOAD_CANCEL cannot touch a later transfer (R3-2).
+func (s *Session) clearCancel() {
+	s.mu.Lock()
+	s.cancelDL = nil
+	s.cancelTID = 0
+	s.mu.Unlock()
+}
+
+// cancelDownload closes the active download's cancel channel, but only if tid
+// matches the active transfer. A stray or late cancel for a different (e.g.
+// already-finished) transfer is ignored so it cannot abort the wrong one
+// (R3-2). It reports whether a cancel was actually delivered.
+func (s *Session) cancelDownload(tid uint32) bool {
 	s.mu.Lock()
 	c := s.cancelDL
+	if c == nil || s.cancelTID != tid {
+		s.mu.Unlock()
+		return false
+	}
 	s.cancelDL = nil
 	s.mu.Unlock()
-	if c != nil {
-		close(c)
-	}
+	close(c)
+	return true
 }
 
 func (s *Session) setCurPath(p string) { s.curPath.Store(&p) }

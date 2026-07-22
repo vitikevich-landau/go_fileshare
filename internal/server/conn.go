@@ -181,7 +181,15 @@ func (s *Server) serveRequests(sess *Session) {
 			return
 		}
 
+		// Mark the connection as actively processing for the duration of the
+		// handler so a synchronous request that runs longer than idle_timeout_s
+		// (a checksum over a big file, a large listing, an admin call) is not
+		// reaped as idle mid-flight (R3-6). touch() afterwards gives the response
+		// a fresh idle window.
+		sess.inFlight.Store(true)
 		s.dispatch(sess, m)
+		sess.inFlight.Store(false)
+		sess.touch()
 	}
 }
 
@@ -204,7 +212,7 @@ func (s *Server) dispatch(sess *Session, m proto.Message) {
 	case proto.DownloadRequest:
 		s.startDownload(sess, req)
 	case proto.DownloadCancel:
-		sess.cancelDownload()
+		sess.cancelDownload(req.TransferID)
 	case proto.AdminGetConfig, proto.AdminSet, proto.AdminListClients,
 		proto.AdminKick, proto.AdminStats, proto.AdminShutdown:
 		s.handleAdmin(sess, m)
@@ -283,12 +291,23 @@ func (s *Server) idleWatchdog(sess *Session) {
 			return
 		case <-t.C:
 			idle := time.Duration(s.hub.Current().Limits.IdleTimeoutS) * time.Second
-			if !sess.downloading.Load() && sess.idleFor() >= idle {
+			if s.reapable(sess, idle) {
 				sess.conn.Close()
 				return
 			}
 		}
 	}
+}
+
+// reapable reports whether the idle watchdog may close the connection now: it
+// must be idle past the timeout AND neither streaming a download nor running a
+// synchronous request handler, so long legitimate work is never reaped mid-flight
+// (CR-03, R3-6).
+func (s *Server) reapable(sess *Session, idle time.Duration) bool {
+	if sess.downloading.Load() || sess.inFlight.Load() {
+		return false
+	}
+	return sess.idleFor() >= idle
 }
 
 func (s *Server) sendErr(sess *Session, code proto.ErrCode) bool {
