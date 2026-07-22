@@ -41,6 +41,7 @@ func (s *Server) startDownload(sess *Session, req proto.DownloadRequest) {
 		defer sess.wg.Done()
 		defer s.activeDownloads.Add(-1)
 		defer f.Close()
+		defer sess.touch() // refresh idle clock so post-download isn't reaped (RR-1)
 		defer sess.downloading.Store(false)
 		defer sess.clearCurPath() // clear even if checksum/read errors (bug #2)
 

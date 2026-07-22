@@ -17,10 +17,8 @@ const writeDeadline = 30 * time.Second
 // frames before force-closing the socket.
 const flushTimeout = 2 * time.Second
 
-// idlePollCap bounds how long the request loop blocks on a single read before
-// re-checking idle/transfer state, so an active download is never mistaken for
-// an idle connection (CR-03).
-const idlePollCap = 15 * time.Second
+// idleCheckInterval is how often the idle watchdog re-evaluates a connection.
+const idleCheckInterval = time.Second
 
 // outBuffer is the per-session outgoing queue depth.
 const outBuffer = 64
@@ -49,11 +47,12 @@ type Session struct {
 	authed   bool
 	cancelDL chan struct{} // closes to cancel the active download
 
-	subMask     atomic.Uint32
-	bytes       atomic.Uint64
-	curPath     atomic.Pointer[string]
-	downloading atomic.Bool
-	startedAt   time.Time
+	subMask      atomic.Uint32
+	bytes        atomic.Uint64
+	curPath      atomic.Pointer[string]
+	downloading  atomic.Bool
+	lastActivity atomic.Int64 // unix-nanos of the last completed frame / activity
+	startedAt    time.Time
 }
 
 func newSession(id uint64, conn net.Conn, ip string, wg *sync.WaitGroup) *Session {
@@ -67,7 +66,16 @@ func newSession(id uint64, conn net.Conn, ip string, wg *sync.WaitGroup) *Sessio
 		startedAt: time.Now(),
 	}
 	s.curPath.Store(&emptyPath)
+	s.lastActivity.Store(time.Now().UnixNano())
 	return s
+}
+
+// touch records activity for the idle watchdog.
+func (s *Session) touch() { s.lastActivity.Store(time.Now().UnixNano()) }
+
+// idleFor reports how long the session has been without activity.
+func (s *Session) idleFor() time.Duration {
+	return time.Since(time.Unix(0, s.lastActivity.Load()))
 }
 
 // send queues a frame, blocking for backpressure until it is accepted or the

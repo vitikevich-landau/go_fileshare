@@ -144,41 +144,30 @@ func (s *Server) authenticate(sess *Session, req proto.AuthRequest, cur *config.
 	return true
 }
 
-// serveRequests is the post-auth request loop. It blocks on reads in bounded
-// polls so that an active transfer is never reaped by the idle timeout, while a
-// genuinely idle connection is still closed once idle_timeout_s elapses (CR-03).
+// serveRequests is the post-auth request loop. Reads block without a per-frame
+// deadline (so a deadline can never fire mid-frame and desync the stream, RR-1);
+// a separate watchdog enforces the idle timeout by closing the connection, which
+// unblocks the read for a clean teardown. An active transfer is exempt (CR-03).
 func (s *Server) serveRequests(sess *Session) {
-	lastActivity := time.Now()
-	for {
-		cur := s.hub.Current()
-		idle := time.Duration(cur.Limits.IdleTimeoutS) * time.Second
-		poll := idle
-		if poll > idlePollCap {
-			poll = idlePollCap
-		}
-		_ = sess.conn.SetReadDeadline(time.Now().Add(poll))
+	_ = sess.conn.SetReadDeadline(time.Time{}) // clear the handshake deadline
+	sess.touch()
 
+	sess.wg.Add(1)
+	go func() {
+		defer sess.wg.Done()
+		s.idleWatchdog(sess)
+	}()
+
+	for {
 		typ, payload, err := proto.ReadFrame(sess.conn)
 		if err != nil {
-			if isTimeout(err) {
-				// An active download is activity: reset the idle clock and keep
-				// serving. Otherwise disconnect only after a real idle window.
-				if sess.downloading.Load() {
-					lastActivity = time.Now()
-					continue
-				}
-				if time.Since(lastActivity) < idle {
-					continue
-				}
-				return // genuinely idle past idle_timeout_s
-			}
-			if !errors.Is(err, io.EOF) {
+			if !errors.Is(err, io.EOF) && !isTimeout(err) {
 				// Framing/protocol error: best-effort notice, then close.
 				sess.trySendMsg(proto.Error{Code: proto.ErrBadRequest, Message: "malformed frame"})
 			}
 			return
 		}
-		lastActivity = time.Now()
+		sess.touch()
 
 		if !roleAllows(sess.Role(), MinRole(typ)) {
 			s.sendErr(sess, proto.ErrAccessDenied)
@@ -269,6 +258,26 @@ func (s *Server) handleChecksum(sess *Session, req proto.ChecksumRequest) {
 		return
 	}
 	sess.sendMsg(proto.ChecksumResponse{Path: clean, Algo: algo, Checksum: sum})
+}
+
+// idleWatchdog closes the connection once it has been idle past idle_timeout_s,
+// unless a transfer is active. Closing unblocks the reader for a clean teardown,
+// so an idle deadline never fires in the middle of a frame read (RR-1, CR-03).
+func (s *Server) idleWatchdog(sess *Session) {
+	t := time.NewTicker(idleCheckInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-sess.done:
+			return
+		case <-t.C:
+			idle := time.Duration(s.hub.Current().Limits.IdleTimeoutS) * time.Second
+			if !sess.downloading.Load() && sess.idleFor() >= idle {
+				sess.conn.Close()
+				return
+			}
+		}
+	}
 }
 
 func (s *Server) sendErr(sess *Session, code proto.ErrCode) bool {
