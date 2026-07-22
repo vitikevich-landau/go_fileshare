@@ -39,6 +39,21 @@ for them.
 M12–M14 (multi-user/quotas, upload, TLS) are future work. Every package ships
 tests run under `go test -race`.
 
+### Post-M11 hardening
+
+- **Admin F9 panel** completed to spec §2: live **Journal** tab, **graceful
+  shutdown** and **Reload users** (F2 lifecycle menu), **kick confirmation**,
+  **session details** (Enter), and **share stats** in the overview.
+- **Hot user management** — `users.json` is re-read on `SIGHUP` or admin request,
+  and sessions of a now-disabled/removed user are dropped (no restart).
+- **Auth** — PBKDF2 iteration floor raised to **600k** (rejected below it at config
+  load); failed authentications and IP bans are now **audited**.
+- **TUI client** — interactive **command line** (`:`), **F2/F3/F4/Ctrl+O** hotkeys
+  and invert-select, transfer **speed/ETA + queue** indicator, staged
+  **connecting screen**, colour-coded link indicator + **reconnect plaque**.
+- **Bounded growth** — idle rate-limit buckets are reaped and fsnotify watches are
+  dropped on directory removal (two former unbounded-growth leaks).
+
 ## Quickstart
 
 ```bash
