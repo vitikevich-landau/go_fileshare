@@ -52,13 +52,13 @@ type Model struct {
 	// connect screen
 	fields        []textinput.Model // host, port, login, password
 	focus         int
-	profiles       *Profiles
-	profileCursor  int
-	connecting     bool
-	connectAborted bool // Esc pressed during a connect; ignore its late result
-	spinner        spinner.Model
-	status         string
-	connectErr     string
+	profiles      *Profiles
+	profileCursor int
+	connecting    bool
+	connectGen    int // bumps per dial attempt; a result from a stale gen is ignored
+	spinner       spinner.Model
+	status        string
+	connectErr    string
 
 	// commander
 	panels   [2]*Panel
@@ -204,10 +204,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case connectedMsg:
 		cmd = m.onConnected(msg)
 	case connectErrMsg:
-		m.connecting = false
-		if m.connectAborted {
-			m.connectAborted = false // a cancelled attempt: swallow the error
-		} else {
+		if msg.gen == m.connectGen { // ignore a stale/cancelled attempt's error
+			m.connecting = false
 			m.connectErr = msg.err.Error()
 		}
 	case spinner.TickMsg:
@@ -350,7 +348,7 @@ func (m *Model) handleConnectKey(k tea.KeyMsg) tea.Cmd {
 		switch k.String() {
 		case "esc":
 			m.connecting = false
-			m.connectAborted = true
+			m.connectGen++ // invalidate the in-flight attempt; its late result is ignored
 			m.status = ""
 			m.connectErr = "connection cancelled"
 			return nil
@@ -446,7 +444,7 @@ func (m *Model) doConnect() tea.Cmd {
 	}
 	m.connectErr = ""
 	m.connecting = true
-	m.connectAborted = false
+	m.connectGen++ // this dial's generation; late results from older gens are dropped
 	m.status = "connecting to " + host + "…"
 
 	name := m.profile.Name
@@ -459,15 +457,15 @@ func (m *Model) doConnect() tea.Cmd {
 	prof := Profile{Name: name, Host: host, Port: port, Login: login, LastSeen: m.profile.LastSeen, DownloadsDir: m.profile.DownloadsDir}
 	addr := fmt.Sprintf("%s:%d", host, port)
 	opts := client.Options{Login: login, Password: pw, ClientName: "fshare-commander", EventHandler: m.eventForwarder()}
-	return tea.Batch(dialCmd(addr, opts, prof), m.spinner.Tick)
+	return tea.Batch(dialCmd(addr, opts, prof, m.connectGen), m.spinner.Tick)
 }
 
 // ---- commander ----
 
 func (m *Model) onConnected(msg connectedMsg) tea.Cmd {
-	if m.connectAborted {
-		// The user pressed Esc during the dial; drop the late connection.
-		m.connectAborted = false
+	if msg.gen != m.connectGen {
+		// A stale attempt (e.g. cancelled by Esc, or superseded by a newer dial):
+		// drop the late connection instead of adopting it.
 		msg.client.Close()
 		return nil
 	}

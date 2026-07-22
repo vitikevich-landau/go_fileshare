@@ -38,9 +38,13 @@ type connectedMsg struct {
 	motd       string
 	role       proto.Role
 	profile    Profile
+	gen        int // the dial attempt this result belongs to
 }
 
-type connectErrMsg struct{ err error }
+type connectErrMsg struct {
+	err error
+	gen int
+}
 
 type remoteListingMsg struct {
 	path    string
