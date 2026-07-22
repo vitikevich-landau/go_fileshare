@@ -233,13 +233,24 @@ func (s *Server) handleList(sess *Session, req proto.ListDirRequest) {
 }
 
 // listDirFrame encodes a LIST_DIR_RESPONSE, returning ok=false if its payload
-// would exceed the protocol frame limit.
+// would exceed the protocol frame limit. The size is computed BEFORE encoding
+// so an oversize listing is rejected without the large frame allocation (RR-6).
 func listDirFrame(clean string, entries []proto.DirEntry) ([]byte, bool) {
-	frame := proto.Encode(proto.ListDirResponse{Path: clean, Entries: entries})
-	if len(frame)-proto.HeaderSize > proto.MaxControlPayload {
+	if listDirPayloadSize(clean, entries) > proto.MaxControlPayload {
 		return nil, false
 	}
-	return frame, true
+	return proto.Encode(proto.ListDirResponse{Path: clean, Entries: entries}), true
+}
+
+// listDirPayloadSize returns the exact wire payload size of a LIST_DIR_RESPONSE
+// without allocating it: path:str + count:u32, then each entry as name:str +
+// kind:u8 + size:u64 + mtime:u64 + flags:u8.
+func listDirPayloadSize(clean string, entries []proto.DirEntry) int {
+	size := 2 + len(clean) + 4
+	for _, e := range entries {
+		size += 2 + len(e.Name) + 1 + 8 + 8 + 1
+	}
+	return size
 }
 
 func (s *Server) handleStat(sess *Session, req proto.StatRequest) {

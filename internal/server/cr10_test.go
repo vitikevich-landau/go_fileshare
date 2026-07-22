@@ -26,3 +26,19 @@ func TestListDirFrameSizeGuard(t *testing.T) {
 		t.Fatal("an oversize listing must be refused, not framed")
 	}
 }
+
+// TestListDirPayloadSizeExact ensures the pre-encode size matches the encoder,
+// so the guard rejects at exactly the right boundary (RR-6).
+func TestListDirPayloadSizeExact(t *testing.T) {
+	entries := []proto.DirEntry{
+		{Name: "a.txt", Size: 1, Mtime: 2, Flags: proto.FlagNew},
+		{Name: "файл с юникодом", Kind: proto.KindDir},
+		{Name: "", Size: 999},
+	}
+	clean := "/some/dir"
+	got := listDirPayloadSize(clean, entries)
+	want := len(proto.Encode(proto.ListDirResponse{Path: clean, Entries: entries})) - proto.HeaderSize
+	if got != want {
+		t.Fatalf("payload size predictor = %d, want %d", got, want)
+	}
+}
