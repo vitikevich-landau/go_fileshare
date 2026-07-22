@@ -376,7 +376,11 @@ func (m *Model) kickSelected() tea.Cmd {
 		m.adminMsg = "cannot kick your own session"
 		return nil
 	}
-	return m.adminKickCmd(target.SessionID)
+	// Confirm before kicking (docs/tz/05-admin.md §2.2).
+	m.adminConfirm = confirmKick
+	m.adminConfirmArg = target.SessionID
+	m.adminMsg = ""
+	return nil
 }
 
 // adminErr reports an admin op error, escalating a connection loss to reconnect.

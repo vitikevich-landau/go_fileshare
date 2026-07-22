@@ -130,6 +130,39 @@ func TestAdminShutdownConfirmFlow(t *testing.T) {
 	}
 }
 
+func TestAdminKickConfirmFlow(t *testing.T) {
+	m := New(Profile{})
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.role = proto.RoleAdmin
+	m.admin = true
+	m.adminTab = adminTabClients
+	m.adminClients = []proto.ClientInfo{{SessionID: 7, Login: "bob"}}
+	m.adminCursor = 0
+
+	// 'k' opens the confirm modal rather than kicking immediately.
+	if cmd := m.handleAdminKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")}); cmd != nil {
+		t.Fatal("kick should open a confirm modal, not issue a command directly")
+	}
+	if m.adminConfirm != confirmKick || m.adminConfirmArg != 7 {
+		t.Fatalf("expected kick confirm for session 7, got kind=%d arg=%d", m.adminConfirm, m.adminConfirmArg)
+	}
+
+	// Any non-'y' key cancels.
+	m.handleAdminConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	if m.adminConfirm != confirmNone {
+		t.Fatal("'n' should cancel the kick")
+	}
+
+	// Re-open and confirm with 'y' issues the kick command.
+	m.handleAdminKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if cmd := m.handleAdminConfirmKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")}); cmd == nil {
+		t.Fatal("'y' should issue the kick command")
+	}
+	if m.adminConfirm != confirmNone {
+		t.Fatal("modal should close after confirming the kick")
+	}
+}
+
 func TestViewAdminRenders(t *testing.T) {
 	m := New(Profile{})
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
