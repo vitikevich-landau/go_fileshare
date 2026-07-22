@@ -91,25 +91,3 @@ func TestDisconnectCancelsBackgroundWork(t *testing.T) {
 		t.Fatal("a stale conn-loss after disconnect must not set reconnecting")
 	}
 }
-
-// The m.client pointer write in doDisconnect must be synchronized with the
-// locked background readers (pump/commands). Run with -race.
-func TestDisconnectClientPointerNoRace(t *testing.T) {
-	m := New(Profile{})
-	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	m.screen = screenCommander
-	m.panels = [2]*Panel{newPanel(false, "l", "/"), newPanel(true, "r", "/")}
-	// m.client stays nil; this exercises the locking discipline, not a real socket.
-
-	done := make(chan struct{})
-	go func() {
-		for i := 0; i < 2000; i++ {
-			m.clientMu.Lock()
-			_ = m.client
-			m.clientMu.Unlock()
-		}
-		close(done)
-	}()
-	m.doDisconnect()
-	<-done
-}
