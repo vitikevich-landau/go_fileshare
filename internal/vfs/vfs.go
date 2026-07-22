@@ -394,17 +394,21 @@ func (v *VFS) refreshStats() {
 	v.statsMu.Unlock()
 }
 
-// walkStats counts regular files and sums their sizes under root. Symlinks are
-// not followed (WalkDir treats them as leaves), so the walk cannot loop.
+// walkStats counts regular files and sums their sizes under root. Non-regular
+// entries (symlinks, sockets, devices) are excluded from BOTH the count and the
+// size. Symlinks are not followed (WalkDir treats them as leaves), so the walk
+// cannot loop.
 func walkStats(root string) (files, bytes uint64) {
 	_ = filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
-		files++
-		if info, e := d.Info(); e == nil && info.Mode().IsRegular() {
-			bytes += uint64(info.Size())
+		info, e := d.Info()
+		if e != nil || !info.Mode().IsRegular() {
+			return nil
 		}
+		files++
+		bytes += uint64(info.Size())
 		return nil
 	})
 	return files, bytes

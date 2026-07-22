@@ -48,6 +48,25 @@ func TestShareStats(t *testing.T) {
 	}
 }
 
+// walkStats must count only regular files, excluding symlinks from both the
+// count and the size (R6-9).
+func TestShareStatsIgnoresSymlinks(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "real.txt"), "hello") // 5 bytes, regular
+
+	if err := os.Symlink(filepath.Join(root, "real.txt"), filepath.Join(root, "link.txt")); err != nil {
+		t.Skipf("symlinks unsupported on this platform: %v", err)
+	}
+
+	files, bytes := walkStats(root)
+	if files != 1 {
+		t.Fatalf("files = %d, want 1 (the symlink must not be counted)", files)
+	}
+	if bytes != 5 {
+		t.Fatalf("bytes = %d, want 5 (only the regular file)", bytes)
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
