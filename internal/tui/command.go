@@ -155,16 +155,24 @@ func (m *Model) cmdInfo(names []string) tea.Cmd {
 	return nil
 }
 
-// doDisconnect closes the connection and returns to the connect screen.
+// doDisconnect closes the connection and returns to the connect screen. It must
+// not wait on clientMu (an active download holds it for the whole transfer), so
+// it cancels the transfer and any pending reconnect first, then closes the
+// socket directly — which unblocks the download's read. m.client is only ever
+// assigned on this (Update) goroutine, so reading it here without the lock is
+// safe (same rationale as quit()).
 func (m *Model) doDisconnect() tea.Cmd {
 	m.stopPump()
-	m.clientMu.Lock()
+	if m.dlCancel != nil {
+		m.dlCancel() // cancel the active transfer's context
+	}
+	m.reconnecting = false // invalidate any pending reconnect (guarded in onReconnected)
 	if m.client != nil {
 		m.client.Close()
 		m.client = nil
 	}
-	m.clientMu.Unlock()
 	m.transfer = nil
+	m.dlCancel = nil
 	m.queue = nil
 	m.busy = false
 	m.link = linkDown

@@ -179,6 +179,14 @@ func (m *Model) reconnectCmd() tea.Cmd {
 }
 
 func (m *Model) onReconnected(msg reconnectedMsg) tea.Cmd {
+	if !m.reconnecting || m.screen != screenCommander {
+		// We disconnected (or reset) while this reconnect was in flight: drop the
+		// late connection rather than adopting it invisibly.
+		if msg.client != nil {
+			msg.client.Close()
+		}
+		return nil
+	}
 	m.clientMu.Lock()
 	m.client = msg.client
 	m.clientMu.Unlock()
@@ -201,6 +209,9 @@ func (m *Model) onReconnected(msg reconnectedMsg) tea.Cmd {
 }
 
 func (m *Model) onReconnectFailed(msg reconnectFailedMsg) tea.Cmd {
+	if !m.reconnecting {
+		return nil // disconnected meanwhile: stop retrying
+	}
 	m.backoff *= 2
 	if m.backoff > maxBackoff {
 		m.backoff = maxBackoff

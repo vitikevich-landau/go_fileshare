@@ -45,3 +45,39 @@ func TestCommandLine(t *testing.T) {
 		t.Fatal("Esc should close command mode")
 	}
 }
+
+func TestDisconnectCancelsBackgroundWork(t *testing.T) {
+	m := New(Profile{})
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.screen = screenCommander
+	m.panels = [2]*Panel{newPanel(false, "l", "/"), newPanel(true, "r", "/")}
+	m.active = 1
+	m.reconnecting = true // pretend a reconnect is in flight
+
+	cancelled := false
+	m.transfer = &transferState{name: "big.bin"}
+	m.dlCancel = func() { cancelled = true }
+	m.queue = []downloadJob{{name: "next.bin"}}
+
+	m.doDisconnect()
+	if !cancelled {
+		t.Fatal("disconnect should cancel the active transfer")
+	}
+	if m.screen != screenConnect {
+		t.Fatal("disconnect should return to the connect screen")
+	}
+	if m.reconnecting {
+		t.Fatal("disconnect should clear the reconnecting flag")
+	}
+	if m.transfer != nil || len(m.queue) != 0 {
+		t.Fatal("disconnect should clear the transfer and queue")
+	}
+
+	// A late reconnect result is dropped, not adopted onto the connect screen.
+	if cmd := m.onReconnected(reconnectedMsg{client: nil}); cmd != nil {
+		t.Fatal("a late reconnect after disconnect should be dropped")
+	}
+	if m.screen != screenConnect {
+		t.Fatal("a dropped reconnect must not move back to the commander")
+	}
+}
