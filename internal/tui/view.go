@@ -82,7 +82,11 @@ func (m *Model) viewCommander() string {
 		b.WriteString(m.renderOpLog(4))
 	}
 	b.WriteString(m.renderTransfer() + "\n")
-	b.WriteString(m.renderPrompt() + "\n")
+	if m.dlCancelConfirm {
+		b.WriteString(styErr.Render(fit("Cancel current download? [y] yes · any other key no", m.width)) + "\n")
+	} else {
+		b.WriteString(m.renderPrompt() + "\n")
+	}
 	b.WriteString(m.renderFbar())
 	return b.String()
 }
@@ -117,22 +121,26 @@ func (m *Model) renderPanelLines(idx, colW int) []string {
 	p := m.panels[idx]
 	active := idx == m.active
 
-	titleText := p.Label
-	if p.Remote {
-		link := "○"
-		switch m.link {
-		case linkUp:
-			link = "●"
-		case linkReconnect:
-			link = "◐"
-		}
-		titleText = fmt.Sprintf("%s %s", link, p.Label)
-	}
 	titleStyle := styInactiveTitle
 	if active {
 		titleStyle = styActiveTitle
 	}
-	lines := []string{titleStyle.Render(fit(titleText, colW-2))}
+	var title string
+	if p.Remote {
+		// The connection symbol is colour-coded (green/yellow/red) and sits
+		// outside the title bar so it keeps its own colour.
+		sym := "○"
+		switch m.link {
+		case linkUp:
+			sym = "●"
+		case linkReconnect:
+			sym = "◐"
+		}
+		title = linkColor(m.link).Render(sym) + " " + titleStyle.Render(fit(p.Label, colW-4))
+	} else {
+		title = titleStyle.Render(fit(p.Label, colW-2))
+	}
+	lines := []string{title}
 
 	for row := 0; row < m.panelRows; row++ {
 		idxE := p.Top + row
@@ -151,6 +159,14 @@ func (m *Model) renderPanelLines(idx, colW int) []string {
 		status += fmt.Sprintf(" · new: %d", n)
 	}
 	lines = append(lines, styDim.Render(fit(status, colW)))
+
+	// While reconnecting, drop a red plaque across the remote panel.
+	if p.Remote && m.link == linkReconnect {
+		mid := 1 + m.panelRows/2 // below the title
+		if mid > 0 && mid < len(lines)-1 {
+			lines[mid] = styPlaque.Render(fit("  ⚠ CONNECTION LOST — reconnecting…", colW))
+		}
+	}
 	return lines
 }
 

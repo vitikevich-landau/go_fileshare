@@ -112,8 +112,9 @@ type Model struct {
 	cmdInput textinput.Model
 
 	// hotkey overlays
-	fullLog bool     // Ctrl+O: fullscreen op-log
-	infoBox []string // F3/F4: entry info/checksum box (nil = closed)
+	fullLog         bool     // Ctrl+O: fullscreen op-log
+	infoBox         []string // F3/F4: entry info/checksum box (nil = closed)
+	dlCancelConfirm bool     // Esc during a transfer asks before cancelling
 
 	events   chan tea.Msg
 	quitting bool
@@ -494,6 +495,12 @@ func (m *Model) onConnected(msg connectedMsg) tea.Cmd {
 	}
 	m.log(lineOK, "connected to "+m.serverName+" as "+m.role.String())
 
+	// Remember the connection (host/login/name only — never the password).
+	remembered := m.profile
+	remembered.Secret = ""
+	m.profiles.Upsert(remembered)
+	_ = m.profiles.Save()
+
 	m.subscribeFS()
 	m.startPump()
 	m.busy = true
@@ -507,6 +514,15 @@ func (m *Model) handleCommanderKey(k tea.KeyMsg) tea.Cmd {
 			return m.quit()
 		}
 		m.infoBox = nil
+		return nil
+	}
+	// A pending "cancel download?" confirmation: 'y' confirms, anything else aborts.
+	if m.dlCancelConfirm {
+		m.dlCancelConfirm = false
+		if k.String() == "y" && m.transfer != nil && m.dlCancel != nil {
+			m.dlCancel()
+			m.log(lineInfo, "cancelling "+m.transfer.name+"…")
+		}
 		return nil
 	}
 	switch k.String() {
@@ -558,8 +574,7 @@ func (m *Model) handleCommanderKey(k tea.KeyMsg) tea.Cmd {
 		return m.openAdmin()
 	case "esc":
 		if m.transfer != nil && m.dlCancel != nil {
-			m.dlCancel()
-			m.log(lineInfo, "cancelling "+m.transfer.name+"…")
+			m.dlCancelConfirm = true // confirm before cancelling (spec §7)
 		}
 	case ":":
 		m.enterCmdMode()
