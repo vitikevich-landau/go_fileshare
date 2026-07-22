@@ -91,6 +91,7 @@ type VFS struct {
 type cacheEntry struct {
 	Size  uint64
 	Mtime uint64
+	Ctime int64 // change-time nanos where available (0 otherwise) — RR-5
 	Algo  proto.Algo
 	Sum   [proto.ChecksumLen]byte
 }
@@ -285,13 +286,15 @@ func (v *VFS) Checksum(vpath string) (string, proto.Algo, [proto.ChecksumLen]byt
 	defer f.Close()
 
 	size := uint64(info.Size())
-	// Nanosecond granularity so a same-size change within the same wall-clock
-	// second still invalidates the cache (CR-09). This is the cache key only;
-	// the wire DirEntry.mtime stays unix seconds.
+	// Nanosecond mtime granularity (CR-09) plus change-time (RR-5): ctime
+	// changes on any content/metadata modification even when mtime is preserved
+	// (unix), catching a same-size same-mtime replacement. This is the cache key
+	// only; the wire DirEntry.mtime stays unix seconds.
 	mtime := uint64(info.ModTime().UnixNano())
+	ctime := changeTimeNanos(info)
 
 	v.mu.Lock()
-	if e, ok := v.cache[clean]; ok && e.Size == size && e.Mtime == mtime {
+	if e, ok := v.cache[clean]; ok && e.Size == size && e.Mtime == mtime && e.Ctime == ctime {
 		v.mu.Unlock()
 		return clean, e.Algo, e.Sum, nil
 	}
@@ -305,7 +308,7 @@ func (v *VFS) Checksum(vpath string) (string, proto.Algo, [proto.ChecksumLen]byt
 	copy(sum[:], h.Sum(nil))
 
 	v.mu.Lock()
-	v.cache[clean] = cacheEntry{Size: size, Mtime: mtime, Algo: proto.AlgoSHA256, Sum: sum}
+	v.cache[clean] = cacheEntry{Size: size, Mtime: mtime, Ctime: ctime, Algo: proto.AlgoSHA256, Sum: sum}
 	v.dirty = true
 	v.mu.Unlock()
 	return clean, proto.AlgoSHA256, sum, nil
