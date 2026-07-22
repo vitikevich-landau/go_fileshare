@@ -47,31 +47,50 @@ func Load(path string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	var ff fileForm
-	if err := json.Unmarshal(b, &ff); err != nil {
+	byLogin, order, err := parseUsersFile(b)
+	if err != nil {
 		return nil, fmt.Errorf("auth: parse %s: %w", path, err)
 	}
-	for _, r := range ff.Users {
-		if _, dup := db.byLogin[r.Login]; !dup {
-			db.order = append(db.order, r.Login)
-		}
-		db.byLogin[r.Login] = r
-	}
+	db.byLogin, db.order = byLogin, order
 	return db, nil
+}
+
+// parseUsersFile decodes a users.json body into a login map and insertion order.
+func parseUsersFile(b []byte) (map[string]Record, []string, error) {
+	var ff fileForm
+	if err := json.Unmarshal(b, &ff); err != nil {
+		return nil, nil, err
+	}
+	byLogin := map[string]Record{}
+	var order []string
+	for _, r := range ff.Users {
+		if _, dup := byLogin[r.Login]; !dup {
+			order = append(order, r.Login)
+		}
+		byLogin[r.Login] = r
+	}
+	return byLogin, order, nil
 }
 
 // Reload re-reads the users file from disk, replacing the in-memory set. It is
 // used for hot user management (SIGHUP / admin reload) so disabling or adding a
-// user takes effect without a restart (docs/tz/03-server-daemon.md §3.3). On a
-// read/parse error the current set is left unchanged.
+// user takes effect without a restart (docs/tz/03-server-daemon.md §3.3).
+//
+// Unlike startup Load, a MISSING or unreadable file is an error here, not an
+// empty bootstrap DB: silently emptying the set on reload would flip the daemon
+// to the no-auth mode (any login becomes ADMIN) after an accidental delete or
+// rename. On any error the current in-memory set is left unchanged (fail closed).
 func (db *DB) Reload() error {
-	fresh, err := Load(db.path)
+	b, err := os.ReadFile(db.path)
 	if err != nil {
-		return err
+		return fmt.Errorf("auth: reload %s: %w", db.path, err)
+	}
+	byLogin, order, err := parseUsersFile(b)
+	if err != nil {
+		return fmt.Errorf("auth: reload parse %s: %w", db.path, err)
 	}
 	db.mu.Lock()
-	db.byLogin = fresh.byLogin
-	db.order = fresh.order
+	db.byLogin, db.order = byLogin, order
 	db.mu.Unlock()
 	return nil
 }
