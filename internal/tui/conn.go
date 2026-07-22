@@ -118,8 +118,10 @@ func (m *Model) onEvent(pm proto.Message) tea.Cmd {
 		}
 	case proto.EventNotice:
 		m.log(lineInfo, "notice: "+e.Text)
+		m.journal(lineEvent, "notice: "+e.Text)
 	case proto.EventConfig:
 		m.log(lineInfo, fmt.Sprintf("config: %s = %s", e.Key, e.NewValue))
+		m.journal(lineInfo, fmt.Sprintf("config: %s = %s", e.Key, e.NewValue))
 		m.onAdminConfigEvent(e) // live-update the settings tab if open
 	}
 	return nil

@@ -78,6 +78,7 @@ type Model struct {
 	adminInput   textinput.Model
 	adminEditKey string
 	adminMsg     string
+	adminJournal []logLine // live tail of EVENT_NOTICE/EVENT_CONFIG (Journal tab)
 
 	clientMu   sync.Mutex // serializes all client I/O across goroutines
 	client     *client.Client

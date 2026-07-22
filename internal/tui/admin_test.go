@@ -67,6 +67,29 @@ func TestAdminSetResultRefreshesAndReports(t *testing.T) {
 	}
 }
 
+func TestAdminJournalAccumulatesAndRenders(t *testing.T) {
+	m := New(Profile{})
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.role = proto.RoleAdmin
+	m.admin = true
+
+	// EVENT_NOTICE (e.g. a kick) and EVENT_CONFIG feed the journal tail.
+	m.Update(eventMsg{m: proto.EventNotice{Severity: proto.SevWarn, Text: "vit kicked session 7 (bob)"}})
+	m.Update(eventMsg{m: proto.EventConfig{Key: "limits.global_bps", NewValue: "1000000"}})
+
+	if len(m.adminJournal) != 2 {
+		t.Fatalf("journal len = %d, want 2", len(m.adminJournal))
+	}
+
+	m.adminTab = adminTabJournal
+	out := m.viewAdmin()
+	for _, want := range []string{"4 Journal", "kicked session 7", "limits.global_bps = 1000000"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("journal view missing %q\n%s", want, out)
+		}
+	}
+}
+
 func TestViewAdminRenders(t *testing.T) {
 	m := New(Profile{})
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})

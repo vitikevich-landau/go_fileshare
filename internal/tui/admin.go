@@ -24,7 +24,17 @@ const (
 	adminTabOverview = 0
 	adminTabClients  = 1
 	adminTabSettings = 2
+	adminTabJournal  = 3
+	adminTabCount    = 4
 )
+
+// journal appends one line to the admin Journal tab's live tail (bounded).
+func (m *Model) journal(kind lineKind, text string) {
+	m.adminJournal = append(m.adminJournal, logLine{kind: kind, text: time.Now().Format("15:04:05") + " " + text})
+	if len(m.adminJournal) > 200 {
+		m.adminJournal = m.adminJournal[len(m.adminJournal)-200:]
+	}
+}
 
 // ---- admin async messages (Cmd results) ----
 
@@ -138,6 +148,8 @@ func (m *Model) adminRefreshTab() tea.Cmd {
 		return m.adminClientsCmd()
 	case adminTabSettings:
 		return m.adminConfigCmd()
+	case adminTabJournal:
+		return nil // passively accumulated from the event stream
 	default:
 		return m.adminStatsCmd()
 	}
@@ -191,8 +203,11 @@ func (m *Model) handleAdminKey(k tea.KeyMsg) tea.Cmd {
 	case "3":
 		m.adminTab, m.adminCursor = adminTabSettings, 0
 		return m.adminConfigCmd()
+	case "4":
+		m.adminTab, m.adminCursor = adminTabJournal, 0
+		return nil
 	case "tab":
-		m.adminTab = (m.adminTab + 1) % 3
+		m.adminTab = (m.adminTab + 1) % adminTabCount
 		m.adminCursor = 0
 		return m.adminRefreshTab()
 	case "ctrl+r":
@@ -282,7 +297,7 @@ func (m *Model) onAdminConfigEvent(e proto.EventConfig) {
 
 func (m *Model) viewAdmin() string {
 	var b strings.Builder
-	tabs := []string{"1 Overview", "2 Clients", "3 Settings"}
+	tabs := []string{"1 Overview", "2 Clients", "3 Settings", "4 Journal"}
 	var header []string
 	for i, tname := range tabs {
 		if i == m.adminTab {
@@ -300,6 +315,8 @@ func (m *Model) viewAdmin() string {
 		b.WriteString(m.renderAdminClients())
 	case adminTabSettings:
 		b.WriteString(m.renderAdminSettings())
+	case adminTabJournal:
+		b.WriteString(m.renderAdminJournal())
 	}
 
 	if m.adminMsg != "" {
@@ -308,7 +325,37 @@ func (m *Model) viewAdmin() string {
 	if m.adminEditing {
 		b.WriteString("\n  set " + m.adminEditKey + " = " + m.adminInput.View() + "   [Enter apply · Esc cancel]\n")
 	}
-	b.WriteString("\n" + styFbar.Render(fit("Tab/1/2/3 switch · ↑↓ move · Enter edit · F8/k kick · Ctrl+R refresh · Esc back", m.width)))
+	b.WriteString("\n" + styFbar.Render(fit("Tab/1-4 switch · ↑↓ move · Enter edit · F8/k kick · Ctrl+R refresh · Esc back", m.width)))
+	return b.String()
+}
+
+// renderAdminJournal shows the live tail of server notices and config changes
+// (docs/tz/05-admin.md §2.4). Newest lines are at the bottom.
+func (m *Model) renderAdminJournal() string {
+	if len(m.adminJournal) == 0 {
+		return styDim.Render("  (no events yet — logins, kicks and config changes appear here)") + "\n"
+	}
+	rows := m.height - 8
+	if rows < 3 {
+		rows = 3
+	}
+	start := len(m.adminJournal) - rows
+	if start < 0 {
+		start = 0
+	}
+	var b strings.Builder
+	for _, ll := range m.adminJournal[start:] {
+		var st = styDim
+		switch ll.kind {
+		case lineErr:
+			st = styErr
+		case lineOK:
+			st = styOK
+		case lineEvent:
+			st = styEvent
+		}
+		b.WriteString("  " + st.Render(fit(ll.text, m.width-2)) + "\n")
+	}
 	return b.String()
 }
 

@@ -85,6 +85,7 @@ func (s *Server) adminKick(sess *Session, req proto.AdminKick) {
 		return
 	}
 	s.log.Info("admin kick", "admin", sess.Login(), "target_session", req.SessionID, "target_login", target.Login())
+	s.BroadcastNotice(proto.SevWarn, fmt.Sprintf("%s kicked session %d (%s)", sess.Login(), req.SessionID, target.Login()))
 	target.conn.Close() // unblocks its reader/writer; the handler tears down
 	sess.sendMsg(proto.AdminKickResult{OK: true, Message: fmt.Sprintf("kicked session %d", req.SessionID)})
 }
