@@ -58,12 +58,14 @@ type Settings struct {
 	Log      LogSettings      `json:"log"`
 }
 
-// MinPBKDF2Iters is the minimum accepted PBKDF2 iteration count (the security
-// floor from docs/tz/06-security.md §2). Because the daemon announces this value
-// in HELLO_OK *before* it learns the login (challenge/response), it is a
-// deployment-wide constant: raising it invalidates any user hashed with a lower
-// count, who must be re-created with --reset-password. A per-user count would
-// require moving the login earlier in the handshake (the deferred B1-full work).
+// MinPBKDF2Iters is the recommended PBKDF2 iteration count (the security floor
+// from docs/tz/06-security.md §2). It is ADVISORY, not enforced at load: because
+// the daemon announces this value in HELLO_OK *before* it learns the login
+// (challenge/response), it is a deployment-wide constant, so raising it would
+// invalidate every existing hash. Rejecting a below-floor config at load would
+// also block --reset-password (the very tool used to migrate). The daemon
+// therefore warns at startup instead, leaving old installs runnable while they
+// migrate. A per-user count needs the deferred B1-full handshake change.
 const MinPBKDF2Iters = 600_000
 
 // Default returns the built-in defaults (docs/tz/09-go-port.md §12.1).
@@ -102,13 +104,6 @@ func Load(path string) (Settings, error) {
 	}
 	if msg := s.Validate(); msg != "" {
 		return s, fmt.Errorf("config: invalid %s: %s", path, msg)
-	}
-	// The iteration floor is enforced only at the config-file trust boundary, not
-	// in Validate: Validate also runs on every hot admin Set against the whole
-	// running snapshot, and must not reject an unrelated change just because the
-	// deployment predates the floor. A file below the floor is refused at load.
-	if s.Auth.PBKDF2Iters < MinPBKDF2Iters {
-		return s, fmt.Errorf("config: invalid %s: auth.pbkdf2_iters %d is below the minimum %d", path, s.Auth.PBKDF2Iters, MinPBKDF2Iters)
 	}
 	return s, nil
 }

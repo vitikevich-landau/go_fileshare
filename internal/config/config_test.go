@@ -63,24 +63,24 @@ func TestValidateErrors(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsWeakPBKDF2(t *testing.T) {
+func TestLoadAcceptsLegacyPBKDF2(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	s := Default()
-	s.Auth.PBKDF2Iters = 200000 // below the floor
+	s.Auth.PBKDF2Iters = 200000 // below the recommended floor
 	if err := s.Save(path); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(path); err == nil {
-		t.Fatal("Load should reject a config file below the PBKDF2 floor")
+	// A below-floor value is advisory: it must still load (so old installs run
+	// and --reset-password works), preserving the legacy value.
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("legacy below-floor config must still load: %v", err)
 	}
-
-	// The floor value itself loads fine.
-	s.Auth.PBKDF2Iters = MinPBKDF2Iters
-	if err := s.Save(path); err != nil {
-		t.Fatal(err)
+	if loaded.Auth.PBKDF2Iters != 200000 {
+		t.Fatalf("legacy iters not preserved: got %d", loaded.Auth.PBKDF2Iters)
 	}
-	if _, err := Load(path); err != nil {
-		t.Fatalf("Load rejected a config at the floor: %v", err)
+	if loaded.Auth.PBKDF2Iters >= MinPBKDF2Iters {
+		t.Fatal("test precondition: value should be below the floor")
 	}
 }
 
