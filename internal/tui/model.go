@@ -80,6 +80,11 @@ type Model struct {
 	adminMsg     string
 	adminJournal []logLine // live tail of EVENT_NOTICE/EVENT_CONFIG (Journal tab)
 
+	// admin confirmation modal (F2 shutdown / kick)
+	adminConfirm      confirmKind
+	adminConfirmArg   uint64          // e.g. session id for a kick confirm
+	adminConfirmInput textinput.Model // typed-word confirm (shutdown)
+
 	clientMu   sync.Mutex // serializes all client I/O across goroutines
 	client     *client.Client
 	profile    Profile
@@ -258,6 +263,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.adminMsg = msg.msg
 			cmd = m.adminClientsCmd()
+		}
+	case adminShutdownResultMsg:
+		if msg.err != nil {
+			cmd = m.adminErr(msg.err)
+		} else {
+			m.adminMsg = "shutdown: " + msg.msg
 		}
 	}
 

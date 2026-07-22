@@ -90,6 +90,46 @@ func TestAdminJournalAccumulatesAndRenders(t *testing.T) {
 	}
 }
 
+func TestAdminShutdownConfirmFlow(t *testing.T) {
+	m := New(Profile{})
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.role = proto.RoleAdmin
+	m.admin = true
+
+	// F2 opens the shutdown confirmation modal.
+	m.handleAdminKey(tea.KeyMsg{Type: tea.KeyF2})
+	if m.adminConfirm != confirmShutdown {
+		t.Fatalf("F2 should open the shutdown confirm modal, got %d", m.adminConfirm)
+	}
+
+	// A wrong confirmation word is rejected and keeps the modal open.
+	m.adminConfirmInput.SetValue("halt")
+	if cmd := m.handleAdminConfirmKey(tea.KeyMsg{Type: tea.KeyEnter}); cmd != nil {
+		t.Fatal("a wrong confirm word must not issue a shutdown command")
+	}
+	if m.adminConfirm != confirmShutdown {
+		t.Fatal("modal must stay open after a wrong word")
+	}
+
+	// The exact word with an explicit grace issues the command and closes it.
+	m.adminConfirmInput.SetValue("shutdown 30")
+	if cmd := m.handleAdminConfirmKey(tea.KeyMsg{Type: tea.KeyEnter}); cmd == nil {
+		t.Fatal("the confirm word should issue a shutdown command")
+	}
+	if m.adminConfirm != confirmNone {
+		t.Fatal("modal must close after confirming")
+	}
+
+	// Esc from a fresh modal cancels without a command.
+	m.handleAdminKey(tea.KeyMsg{Type: tea.KeyF2})
+	if cmd := m.handleAdminConfirmKey(tea.KeyMsg{Type: tea.KeyEsc}); cmd != nil {
+		t.Fatal("Esc must cancel the shutdown modal")
+	}
+	if m.adminConfirm != confirmNone {
+		t.Fatal("Esc should close the modal")
+	}
+}
+
 func TestViewAdminRenders(t *testing.T) {
 	m := New(Profile{})
 	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})

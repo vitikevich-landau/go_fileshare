@@ -3,6 +3,7 @@ package tui
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +28,20 @@ const (
 	adminTabJournal  = 3
 	adminTabCount    = 4
 )
+
+// confirmKind identifies which lifecycle action the admin confirmation modal is
+// gating (docs/tz/05-admin.md §2.5 / §2.2).
+type confirmKind int
+
+const (
+	confirmNone confirmKind = iota
+	confirmShutdown
+	confirmKick
+)
+
+// defaultShutdownGrace is used when the admin confirms a shutdown without an
+// explicit "shutdown <seconds>" grace.
+const defaultShutdownGrace = 10
 
 // journal appends one line to the admin Journal tab's live tail (bounded).
 func (m *Model) journal(kind lineKind, text string) {
@@ -57,6 +72,11 @@ type adminSetResultMsg struct {
 	err error
 }
 type adminKickResultMsg struct {
+	ok  bool
+	msg string
+	err error
+}
+type adminShutdownResultMsg struct {
 	ok  bool
 	msg string
 	err error
@@ -141,6 +161,20 @@ func (m *Model) adminKickCmd(id uint64) tea.Cmd {
 	}
 }
 
+func (m *Model) adminShutdownCmd(grace uint32) tea.Cmd {
+	return func() tea.Msg {
+		m.clientMu.Lock()
+		c := m.client
+		if c == nil {
+			m.clientMu.Unlock()
+			return adminShutdownResultMsg{err: errClientClosed}
+		}
+		ok, msg, err := c.AdminShutdown(grace)
+		m.clientMu.Unlock()
+		return adminShutdownResultMsg{ok: ok, msg: msg, err: err}
+	}
+}
+
 // adminRefreshTab reloads the data for the current tab.
 func (m *Model) adminRefreshTab() tea.Cmd {
 	switch m.adminTab {
@@ -169,6 +203,9 @@ func (m *Model) openAdmin() tea.Cmd {
 }
 
 func (m *Model) handleAdminKey(k tea.KeyMsg) tea.Cmd {
+	if m.adminConfirm != confirmNone {
+		return m.handleAdminConfirmKey(k)
+	}
 	if m.adminEditing {
 		switch k.String() {
 		case "esc":
@@ -224,12 +261,81 @@ func (m *Model) handleAdminKey(k tea.KeyMsg) tea.Cmd {
 		if m.adminTab == adminTabSettings {
 			return m.startEditSetting()
 		}
+	case "f2":
+		return m.startShutdownConfirm()
 	case "f8", "k":
 		if m.adminTab == adminTabClients {
 			return m.kickSelected()
 		}
 	}
 	return nil
+}
+
+// startShutdownConfirm opens the typed-word confirmation for a graceful
+// shutdown (docs/tz/05-admin.md §2.5): the admin must type "shutdown".
+func (m *Model) startShutdownConfirm() tea.Cmd {
+	ti := textinput.New()
+	ti.Placeholder = "shutdown [seconds]"
+	ti.Focus()
+	ti.Width = 24
+	m.adminConfirmInput = ti
+	m.adminConfirm = confirmShutdown
+	m.adminMsg = ""
+	return textinput.Blink
+}
+
+// handleAdminConfirmKey drives the confirmation modal (F2 shutdown / kick).
+func (m *Model) handleAdminConfirmKey(k tea.KeyMsg) tea.Cmd {
+	switch m.adminConfirm {
+	case confirmShutdown:
+		switch k.String() {
+		case "esc":
+			m.adminConfirm = confirmNone
+			m.adminMsg = "shutdown cancelled"
+			return nil
+		case "enter":
+			word, grace, ok := parseShutdownConfirm(m.adminConfirmInput.Value())
+			if !ok || word != "shutdown" {
+				m.adminMsg = "type the word 'shutdown' to confirm"
+				return nil
+			}
+			m.adminConfirm = confirmNone
+			m.adminMsg = fmt.Sprintf("requesting shutdown (grace %ds)…", grace)
+			return m.adminShutdownCmd(grace)
+		default:
+			var c tea.Cmd
+			m.adminConfirmInput, c = m.adminConfirmInput.Update(k)
+			return c
+		}
+	case confirmKick:
+		switch k.String() {
+		case "y", "enter":
+			id := m.adminConfirmArg
+			m.adminConfirm = confirmNone
+			return m.adminKickCmd(id)
+		default: // any other key (n/esc/…) cancels
+			m.adminConfirm = confirmNone
+			m.adminMsg = "kick cancelled"
+			return nil
+		}
+	}
+	return nil
+}
+
+// parseShutdownConfirm parses "shutdown" or "shutdown <seconds>" into the
+// confirmation word and grace period (defaulting to defaultShutdownGrace).
+func parseShutdownConfirm(s string) (word string, grace uint32, ok bool) {
+	f := strings.Fields(strings.TrimSpace(s))
+	if len(f) == 0 {
+		return "", 0, false
+	}
+	grace = defaultShutdownGrace
+	if len(f) > 1 {
+		if n, err := strconv.ParseUint(f[1], 10, 32); err == nil {
+			grace = uint32(n)
+		}
+	}
+	return f[0], grace, true
 }
 
 func (m *Model) adminListLen() int {
@@ -325,7 +431,14 @@ func (m *Model) viewAdmin() string {
 	if m.adminEditing {
 		b.WriteString("\n  set " + m.adminEditKey + " = " + m.adminInput.View() + "   [Enter apply · Esc cancel]\n")
 	}
-	b.WriteString("\n" + styFbar.Render(fit("Tab/1-4 switch · ↑↓ move · Enter edit · F8/k kick · Ctrl+R refresh · Esc back", m.width)))
+	switch m.adminConfirm {
+	case confirmShutdown:
+		b.WriteString("\n  " + styErr.Render("GRACEFUL SHUTDOWN") +
+			" — type 'shutdown [seconds]' to confirm: " + m.adminConfirmInput.View() + "   [Enter · Esc cancel]\n")
+	case confirmKick:
+		b.WriteString("\n  " + styErr.Render(fmt.Sprintf("Kick session %d?", m.adminConfirmArg)) + "   [y confirm · any other key cancel]\n")
+	}
+	b.WriteString("\n" + styFbar.Render(fit("Tab/1-4 switch · ↑↓ move · Enter edit · F8/k kick · F2 shutdown · Ctrl+R refresh · Esc back", m.width)))
 	return b.String()
 }
 
