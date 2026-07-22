@@ -98,3 +98,11 @@ func (l *Limiter) Cleanup(ttl time.Duration) {
 	}
 	l.mu.Unlock()
 }
+
+// ClientCount returns the number of live per-client buckets. Used by the
+// bucket-reaper test and any future metrics.
+func (l *Limiter) ClientCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.clients)
+}
