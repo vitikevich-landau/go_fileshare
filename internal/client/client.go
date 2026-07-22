@@ -280,16 +280,31 @@ func (c *Client) Ping() error { return c.writeMsg(proto.Ping{}) }
 // routing it to the event handler. It returns whether a frame was received. A
 // timeout is reported as (false, nil). It must not run concurrently with a
 // request method — a single goroutine owns all reads (docs/tz/09-go-port.md §5.8).
+//
+// The deadline applies only to the FIRST byte of the next frame. Once a frame
+// has started arriving, the rest is read with no deadline, so a slow or
+// fragmented frame is never left half-consumed and cannot desync the stream on
+// the next poll (R3-7). A timeout before any byte means "no event".
 func (c *Client) PollEvents(timeout time.Duration) (bool, error) {
 	_ = c.conn.SetReadDeadline(time.Now().Add(timeout))
-	defer c.conn.SetReadDeadline(time.Time{})
-
-	m, err := c.readMsg()
-	if err != nil {
-		if isTimeout(err) {
-			return false, nil
+	var first [1]byte
+	n, err := c.conn.Read(first[:])
+	if n == 0 {
+		_ = c.conn.SetReadDeadline(time.Time{})
+		if err == nil || isTimeout(err) {
+			return false, nil // idle: no byte of a frame arrived in time
 		}
 		return false, err
+	}
+	// A frame has begun; finish reading it without a deadline.
+	_ = c.conn.SetReadDeadline(time.Time{})
+	typ, payload, rerr := proto.ReadFrameContinue(first[0], c.conn, proto.MaxControlPayload)
+	if rerr != nil {
+		return false, rerr
+	}
+	m, derr := proto.Decode(typ, payload)
+	if derr != nil {
+		return false, derr
 	}
 	if isAsync(m) {
 		if c.eventHandler != nil {
@@ -354,15 +369,23 @@ func (c *Client) DownloadCtx(ctx context.Context, remotePath, localPath string, 
 	tid := accept.TransferID
 
 	// Once ctx is cancelled, ask the server to abort. We keep reading until its
-	// terminal frame so the connection stays in sync (RR-3).
+	// terminal frame so the connection stays in sync (RR-3). We await the watcher
+	// before returning so a cancel triggered exactly as the transfer ends can
+	// never leak a DOWNLOAD_CANCEL into the next transfer (R3-2).
 	watchDone := make(chan struct{})
-	defer close(watchDone)
+	var watchWG sync.WaitGroup
+	watchWG.Add(1)
 	go func() {
+		defer watchWG.Done()
 		select {
 		case <-ctx.Done():
 			_ = c.Cancel(tid)
 		case <-watchDone:
 		}
+	}()
+	defer func() {
+		close(watchDone)
+		watchWG.Wait()
 	}()
 
 	flag := os.O_CREATE | os.O_WRONLY
@@ -373,7 +396,10 @@ func (c *Client) DownloadCtx(ctx context.Context, remotePath, localPath string, 
 	}
 	pf, err := os.OpenFile(partPath, flag, 0o644)
 	if err != nil {
-		return err
+		// A local failure after ACCEPT: the server is about to stream the file,
+		// so drop the connection rather than leave its chunks buffered for the
+		// next request to misread (R3-3).
+		return c.abortConn(err)
 	}
 
 	received := offset
@@ -384,27 +410,36 @@ func (c *Client) DownloadCtx(ctx context.Context, remotePath, localPath string, 
 	for {
 		typ, payload, rerr := proto.ReadFrame(c.conn)
 		if rerr != nil {
+			// Either the socket died, or the server sent a malformed/oversize
+			// frame whose header was consumed but payload was not — which leaves
+			// the stream desynced. Drop the connection in both cases so no later
+			// request can read leftover bytes (R3-3).
 			pf.Close()
-			return rerr
+			return c.abortConn(rerr)
 		}
 		msg, derr := proto.Decode(typ, payload)
 		if derr != nil {
+			// The server sent a malformed frame; the stream is still aligned but
+			// its state is unknown and it keeps sending — drop the connection so
+			// the next request cannot read leftover frames (R3-3).
 			pf.Close()
-			return derr
+			return c.abortConn(derr)
 		}
 		switch v := msg.(type) {
 		case proto.ChunkData:
 			if v.TransferID != tid {
 				pf.Close()
-				return fmt.Errorf("chunk for unexpected transfer %d (want %d)", v.TransferID, tid)
+				return c.abortConn(fmt.Errorf("chunk for unexpected transfer %d (want %d)", v.TransferID, tid))
 			}
 			if received+uint64(len(v.Data)) > total {
 				pf.Close()
-				return fmt.Errorf("server sent more than total_size (%d > %d)", received+uint64(len(v.Data)), total)
+				return c.abortConn(fmt.Errorf("server sent more than total_size (%d > %d)", received+uint64(len(v.Data)), total))
 			}
 			if _, werr := pf.Write(v.Data); werr != nil {
+				// A local write failure (e.g. disk full) while the server keeps
+				// streaming: drop the connection to stay in sync (R3-3).
 				pf.Close()
-				return werr
+				return c.abortConn(werr)
 			}
 			received += uint64(len(v.Data))
 			if progress != nil {
@@ -455,10 +490,23 @@ func (c *Client) DownloadCtx(ctx context.Context, remotePath, localPath string, 
 				}
 				continue
 			}
+			// An unexpected in-band frame mid-download: the server's stream state
+			// is out of sync with ours — drop the connection (R3-3).
 			pf.Close()
-			return fmt.Errorf("unexpected message during download: %s", typ)
+			return c.abortConn(fmt.Errorf("unexpected message during download: %s", typ))
 		}
 	}
+}
+
+// abortConn closes the connection and returns err. It is used when a download
+// fails locally or the server violates the protocol mid-stream: the server may
+// still be sending CHUNK_DATA, so the only way to keep a later request from
+// reading leftover frames is to drop the connection (R3-3). Terminal
+// server frames (DOWNLOAD_DONE / ERROR) leave the connection in sync and do not
+// go through here.
+func (c *Client) abortConn(err error) error {
+	c.conn.Close()
+	return err
 }
 
 // Cancel asks the server to abort the active transfer without closing the

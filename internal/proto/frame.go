@@ -54,6 +54,29 @@ func ReadFrameLimited(r io.Reader, limit uint32) (Msg, []byte, error) {
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return 0, nil, err // io.EOF at the boundary is a clean close
 	}
+	return readFramePayload(hdr, r, limit)
+}
+
+// ReadFrameContinue reads a frame whose first header byte has already been
+// consumed into first, then reads the remaining header and payload. It lets a
+// caller peek the first byte under an idle deadline and, once a frame has
+// started, finish reading it with no deadline — so a slow or fragmented frame is
+// never left half-consumed and cannot desync the stream (R3-7).
+func ReadFrameContinue(first byte, r io.Reader, limit uint32) (Msg, []byte, error) {
+	var hdr [HeaderSize]byte
+	hdr[0] = first
+	if _, err := io.ReadFull(r, hdr[1:]); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF // a header cut short is not a clean close
+		}
+		return 0, nil, err
+	}
+	return readFramePayload(hdr, r, limit)
+}
+
+// readFramePayload validates an already-read 5-byte header and reads its payload
+// under limit. Shared by ReadFrameLimited and ReadFrameContinue.
+func readFramePayload(hdr [HeaderSize]byte, r io.Reader, limit uint32) (Msg, []byte, error) {
 	typ := Msg(hdr[0])
 	n := binary.BigEndian.Uint32(hdr[1:5])
 	if !typ.Known() {
