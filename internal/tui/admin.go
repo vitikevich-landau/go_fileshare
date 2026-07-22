@@ -13,8 +13,8 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/proto"
 )
 
-// configKey mirrors config.KeyInfo for decoding ADMIN_CONFIG without importing
-// the server config package into the TUI.
+// configKey зеркалит config.KeyInfo для разбора ADMIN_CONFIG, не втягивая в TUI
+// серверный пакет config (клиент не должен зависеть от внутренностей сервера).
 type configKey struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`

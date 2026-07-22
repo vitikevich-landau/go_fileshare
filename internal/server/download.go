@@ -9,10 +9,10 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/vfs"
 )
 
-// startDownload validates the request and, on success, streams the file from a
-// dedicated goroutine so the reader stays free to handle PING/DOWNLOAD_CANCEL
-// and events can be pushed mid-stream (docs/tz/09-go-port.md §5.5). Only one
-// active transfer per session is allowed.
+// startDownload проверяет запрос и при успехе отдаёт файл ИЗ ОТДЕЛЬНОЙ горутины,
+// чтобы читатель оставался свободен для PING/DOWNLOAD_CANCEL, а события могли
+// проталкиваться посреди стрима (docs/tz/09-go-port.md §5.5). На сессию
+// разрешена лишь одна активная передача (охраняется CompareAndSwap).
 func (s *Server) startDownload(sess *Session, req proto.DownloadRequest) {
 	if !sess.downloading.CompareAndSwap(false, true) {
 		sess.sendMsg(proto.Error{Code: proto.ErrBadRequest, Message: "a transfer is already in progress"})
@@ -41,23 +41,23 @@ func (s *Server) startDownload(sess *Session, req proto.DownloadRequest) {
 		defer sess.wg.Done()
 		defer s.activeDownloads.Add(-1)
 		defer f.Close()
-		defer sess.touch() // refresh idle clock so post-download isn't reaped (RR-1)
+		defer sess.touch() // освежаем часы простоя, чтобы «после закачки» не скосили (RR-1)
 		defer sess.downloading.Store(false)
-		defer sess.clearCancel()  // a stale cancel must not touch a later transfer (R3-2)
-		defer sess.clearCurPath() // clear even if checksum/read errors (bug #2)
+		defer sess.clearCancel()  // запоздавшая отмена не должна задеть следующую передачу (R3-2)
+		defer sess.clearCurPath() // чистим, даже если ошибка checksum/чтения (bug #2)
 
-		// A context that cancels when the transfer is cancelled or the session
-		// is torn down, so a rate-limit wait cannot block on either.
+		// Контекст, который отменяется при отмене передачи ИЛИ сворачивании сессии,
+		// чтобы ожидание rate-limit не могло зависнуть ни на том, ни на другом.
 		ctx, ctxCancel := context.WithCancel(context.Background())
 		defer ctxCancel()
 		go func() {
-			// Cancel the rate-limit ctx on a client cancel OR teardown, so a
-			// cancel that lands while the stream is blocked in limiter.Wait wakes
-			// it promptly instead of stalling for minutes at a low bps (R3-1). The
-			// stream loop distinguishes the two: on a client cancel it sends the
-			// terminal CANCELLED error to keep the connection in sync (RR-3); on
-			// teardown it just stops. ctx.Done() also lets this watcher exit on
-			// normal completion, so it never leaks a goroutine.
+			// Отменяем ctx лимитера при отмене клиентом ИЛИ teardown, чтобы отмена,
+			// пришедшая, пока стрим заблокирован в limiter.Wait, разбудила его сразу,
+			// а не ждала минутами на низком bps (R3-1). Цикл стрима различает эти два
+			// случая: при отмене клиентом шлёт терминальный CANCELLED, чтобы соединение
+			// осталось в согласии (RR-3); при teardown просто останавливается. ctx.Done()
+			// также позволяет этому наблюдателю выйти при штатном завершении — горутина
+			// не утекает.
 			select {
 			case <-sess.done:
 			case <-cancel:
@@ -66,12 +66,16 @@ func (s *Server) startDownload(sess *Session, req proto.DownloadRequest) {
 			ctxCancel()
 		}()
 
-		sess.setCurPath(req.Path) // set before ACCEPT so drain sees an active transfer (bug #5)
+		sess.setCurPath(req.Path) // ставим до ACCEPT, чтобы drain видел активную передачу (bug #5)
 		s.streamFile(ctx, sess, f, req, tid, total, cancel)
 	}()
 }
 
-func (s *Server) streamFile(ctx context.Context, sess *Session, f *os.File, req proto.DownloadRequest, tid uint32, total uint64, cancel chan struct{}) {
+// streamFile отдаёт файл чанками от offset до total, соблюдая лимиты скорости, и
+// завершает передачу контрольной суммой. Тонкость: на каждом шаге проверяется
+// отмена/teardown, а размер чтения ограничивается объявленным остатком, чтобы
+// дозапись в файл посреди передачи не заставила превысить total_size.
+func (s *Server) streamFile(ctx context.Context, sess *Session, f *os.File, req proto.DownloadRequest, tid TransferID, total uint64, cancel chan struct{}) {
 	if req.Offset > 0 {
 		if _, err := f.Seek(int64(req.Offset), io.SeekStart); err != nil {
 			s.sendErr(sess, proto.ErrInternal)
@@ -88,30 +92,30 @@ func (s *Server) streamFile(ctx context.Context, sess *Session, f *os.File, req 
 	for sent < total {
 		select {
 		case <-cancel:
-			// Client asked to cancel: send a defined terminal frame after the
-			// chunks already queued, so the client's loop ends in sync (RR-3).
+			// Клиент попросил отмену: шлём определённый терминальный кадр после уже
+			// поставленных в очередь чанков, чтобы цикл клиента завершился в согласии (RR-3).
 			s.sendErr(sess, proto.ErrCancelled)
 			return
 		case <-sess.done:
 			return
 		default:
 		}
-		// Clamp the read to the announced remaining size so a file appended to
-		// mid-transfer never makes us overshoot total_size (which the client
-		// rejects); we deliver exactly the originally-announced prefix.
+		// Ограничиваем чтение объявленным остатком, чтобы дозапись в файл посреди
+		// передачи не заставила превысить total_size (который клиент отвергнет);
+		// отдаём ровно изначально объявленный префикс.
 		toRead := buf
 		if rem := total - sent; rem < uint64(len(buf)) {
 			toRead = buf[:rem]
 		}
 		n, err := f.Read(toRead)
 		if n > 0 {
-			// Rate-limit against the CURRENT limits so a live config change
-			// throttles this active transfer (docs/tz/09-go-port.md §5.6).
+			// Тормозим по ТЕКУЩИМ лимитам, чтобы живое изменение конфига применилось
+			// к этой активной передаче (docs/tz/09-go-port.md §5.6).
 			lim := s.hub.Current().Limits
 			if werr := s.limiter.Wait(ctx, clientKey, lim.PerClientBps, lim.GlobalBps, n); werr != nil {
-				// The wait was interrupted. If the client asked to cancel, send the
-				// terminal CANCELLED frame so its loop ends in sync (R3-1); on a
-				// teardown, just stop (the connection is already closing).
+				// Ожидание прервано. Если клиент попросил отмену — шлём терминальный
+				// CANCELLED, чтобы его цикл завершился в согласии (R3-1); при teardown
+				// просто останавливаемся (соединение и так закрывается).
 				select {
 				case <-cancel:
 					s.sendErr(sess, proto.ErrCancelled)
@@ -119,7 +123,7 @@ func (s *Server) streamFile(ctx context.Context, sess *Session, f *os.File, req 
 				}
 				return
 			}
-			// proto.Encode copies buf into a fresh frame, so reusing buf is safe.
+			// proto.Encode копирует buf в новый кадр, поэтому buf можно переиспользовать.
 			if !sess.sendMsg(proto.ChunkData{TransferID: tid, Data: buf[:n]}) {
 				return
 			}
@@ -131,32 +135,31 @@ func (s *Server) streamFile(ctx context.Context, sess *Session, f *os.File, req 
 			break
 		}
 		if err != nil {
-			// A read error mid-transfer: tell the client instead of leaving it
-			// waiting, and never publish a partial file (CR-02).
+			// Ошибка чтения посреди передачи: сообщаем клиенту, а не оставляем его
+			// ждать, и никогда не публикуем частичный файл (CR-02).
 			s.sendErr(sess, proto.ErrInternal)
 			return
 		}
 	}
 
-	// If the file shrank during the transfer we delivered fewer bytes than
-	// announced; report an error rather than a success DONE the client would
-	// (rightly) reject (CR-02).
+	// Если файл ужался во время передачи, мы отдали меньше байт, чем объявили;
+	// сообщаем об ошибке, а не «успешный» DONE, который клиент (справедливо)
+	// отвергнет (CR-02).
 	if sent != total {
 		s.sendErr(sess, proto.ErrInternal)
 		return
 	}
 
-	// The server always sends the checksum of the whole file; on a resumed
-	// download the client verifies the reassembled file against it. If the
-	// checksum cannot be computed we must NOT claim success — send an error so
-	// the client never publishes an unverifiable file. The hash is ctx-aware so a
-	// cancel that lands during a cache-miss checksum of a large file aborts it
-	// promptly instead of blocking for minutes (R4-3).
+	// Сервер всегда шлёт контрольную сумму всего файла; при докачке клиент сверяет
+	// с ней пересобранный файл. Если сумму посчитать не удалось, мы НЕ должны
+	// заявлять успех — шлём ошибку, чтобы клиент не опубликовал непроверяемый файл.
+	// Хеш учитывает ctx, поэтому отмена во время подсчёта суммы большого файла (при
+	// промахе кэша) прерывает его сразу, а не блокирует на минуты (R4-3).
 	_, algo, sum, cerr := s.vfs.ChecksumCtx(ctx, req.Path)
 	if cerr != nil {
-		// A cancel/teardown during the checksum: on a client cancel send the
-		// terminal CANCELLED frame (keeps the connection in sync); on teardown
-		// just stop. Any other checksum failure is an internal error.
+		// Отмена/teardown во время подсчёта суммы: при отмене клиентом шлём
+		// терминальный CANCELLED (держит соединение в согласии); при teardown просто
+		// останавливаемся. Любой другой сбой суммы — внутренняя ошибка.
 		if ctx.Err() != nil {
 			select {
 			case <-cancel:
@@ -172,8 +175,8 @@ func (s *Server) streamFile(ctx context.Context, sess *Session, f *os.File, req 
 		s.sendErr(sess, proto.ErrInternal)
 		return
 	}
-	// A cancel that arrived after the checksum but before DONE still wins, so a
-	// cancelled transfer never reports success (R4-3).
+	// Отмена, пришедшая после подсчёта суммы, но до DONE, всё равно побеждает —
+	// отменённая передача никогда не отчитывается успехом (R4-3).
 	select {
 	case <-cancel:
 		s.sendErr(sess, proto.ErrCancelled)

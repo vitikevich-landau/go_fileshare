@@ -1,40 +1,66 @@
-// Package proto implements the fileshare v2 wire protocol.
+// Package proto реализует проводной протокол fileshare v2.
 //
-// The framing and message layout follow docs/tz/09-go-port.md §4 byte-for-byte,
-// so a Go peer is interoperable with the reference C++ implementation. Every
-// message is a 5-byte header (msg_type:u8, payload_length:u32 big-endian)
-// followed by the payload. All integers are big-endian.
+// ─────────────────────────────────────────────────────────────────────────────
+// Как устроен протокол (в двух словах)
+//
+// Общение идёт КАДРАМИ. Каждый кадр — это 5-байтовый заголовок, за которым
+// следует тело (payload):
+//
+//	┌────────────┬───────────────────────┬───────────────────────────┐
+//	│ msg_type   │ payload_length         │ payload                   │
+//	│ 1 байт u8  │ 4 байта u32, big-endian│ payload_length байт       │
+//	└────────────┴───────────────────────┴───────────────────────────┘
+//
+// Все целые на проводе — big-endian. Раскладка кадров и тел повторяет
+// docs/tz/09-go-port.md §4 БАЙТ-В-БАЙТ, поэтому Go-узел совместим с эталонной
+// реализацией на C++: Go-сервер обслуживает C++-клиента и наоборот.
+//
+// Роли файлов пакета:
+//   - proto.go     — константы протокола и ПЕРЕЧИСЛЕНИЯ (Msg, Role, ErrCode…);
+//   - types.go     — словарь доменных величин (псевдонимы примитивов);
+//   - messages.go  — структуры сообщений и их кодирование/декодирование;
+//   - frame.go     — сборка и чтение кадра (заголовок + защита от переполнения);
+//   - codec.go     — низкоуровневые чтение/запись big-endian с проверкой границ.
+//
+// ─────────────────────────────────────────────────────────────────────────────
 package proto
 
-// Protocol-wide constants (docs/tz/09-go-port.md §4.3).
+// Общие константы протокола (docs/tz/09-go-port.md §4.3). Это «пределы и
+// размеры», единые для обеих сторон; менять их — значит менять протокол.
 const (
-	ProtoVersion      = 2
-	MaxPathLen        = 4096
-	MaxNameLen        = 255
-	MaxStringLen      = 65535 // u16 length prefix ceiling
-	MaxControlPayload = 4 << 20
-	ChunkSize         = 64 << 10
-	ChallengeLen      = 16
-	ProofLen          = 32
-	ChecksumLen       = 32
-	MaxListEntries    = 1 << 20
-	HeaderSize        = 5
+	ProtoVersion      = 2        // единственная поддерживаемая версия
+	MaxPathLen        = 4096     // потолок длины пути в VFS
+	MaxNameLen        = 255      // потолок длины имени одной записи каталога
+	MaxStringLen      = 65535    // максимум для строки с префиксом длины u16
+	MaxControlPayload = 4 << 20  // 4 МиБ — потолок тела для больших сообщений
+	ChunkSize         = 64 << 10 // 64 КиБ — размер куска файла в CHUNK_DATA
+	ChallengeLen      = 16       // длина challenge (nonce) в байтах
+	ProofLen          = 32       // длина доказательства пароля (HMAC) в байтах
+	ChecksumLen       = 32       // длина контрольной суммы (буфер под SHA-256)
+	MaxListEntries    = 1 << 20  // потолок числа записей в списке (анти-DoS)
+	HeaderSize        = 5        // размер заголовка кадра: u8 + u32
 )
 
-// Msg is a one-byte message type code (docs/tz/09-go-port.md §4.4).
+// Msg — однобайтовый код типа сообщения (docs/tz/09-go-port.md §4.4). Это
+// defined-тип (не псевдоним): у него есть методы Known и String, а «семейство»
+// сообщения читается по старшему полубайту кода — 0x1x рукопожатие, 0x2x
+// файловая система, 0x3x передача, 0x4x события, 0x5x админ-канал.
 type Msg uint8
 
 const (
+	// Служебные (0x0x): ошибка и heartbeat.
 	MsgError Msg = 0x06
 	MsgPing  Msg = 0x07
 	MsgPong  Msg = 0x08
 
+	// Рукопожатие и аутентификация (0x1x).
 	MsgHello       Msg = 0x10
 	MsgHelloOk     Msg = 0x11
 	MsgAuthRequest Msg = 0x12
 	MsgAuthOk      Msg = 0x13
 	MsgAuthFail    Msg = 0x14
 
+	// Файловая система: листинг, метаданные, контрольные суммы (0x2x).
 	MsgListDirRequest  Msg = 0x20
 	MsgListDirResponse Msg = 0x21
 	MsgStatRequest     Msg = 0x22
@@ -42,17 +68,20 @@ const (
 	MsgChecksumRequest Msg = 0x24
 	MsgChecksumResp    Msg = 0x25
 
+	// Передача файла: запрос, согласие, чанки, финиш, отмена (0x3x).
 	MsgDownloadRequest Msg = 0x30
 	MsgDownloadAccept  Msg = 0x31
 	MsgChunkData       Msg = 0x32
 	MsgDownloadDone    Msg = 0x33
 	MsgDownloadCancel  Msg = 0x34
 
+	// Подписка и push-события (0x4x).
 	MsgSubscribe   Msg = 0x40
 	MsgEventFs     Msg = 0x41
 	MsgEventNotice Msg = 0x42
 	MsgEventConfig Msg = 0x43
 
+	// Админ-канал: конфиг, клиенты, kick, статистика, остановка, users (0x5x).
 	MsgAdminGetConfig      Msg = 0x50
 	MsgAdminConfig         Msg = 0x51
 	MsgAdminSet            Msg = 0x52
@@ -69,8 +98,9 @@ const (
 	MsgAdminReloadUsersRes Msg = 0x5D
 )
 
-// Known reports whether m is a message type defined by the protocol. Framing
-// rejects unknown types (docs/tz/09-go-port.md §4.1).
+// Known сообщает, определён ли код m протоколом. Слой кадрирования отвергает
+// неизвестные типы ещё до чтения тела (docs/tz/09-go-port.md §4.1), поэтому
+// «мусорный» первый байт не заставит сервер что-то выделять.
 func (m Msg) Known() bool {
 	switch m {
 	case MsgError, MsgPing, MsgPong,
@@ -114,30 +144,32 @@ var msgNames = map[Msg]string{
 	MsgAdminReloadUsers: "ADMIN_RELOAD_USERS", MsgAdminReloadUsersRes: "ADMIN_RELOAD_USERS_RESULT",
 }
 
-// AuthMode is the server's authentication requirement, announced in HELLO_OK.
+// AuthMode — требование сервера к аутентификации, объявляемое в HELLO_OK.
 type AuthMode uint8
 
 const (
-	AuthNone      AuthMode = 0 // no-auth bootstrap: any login becomes ADMIN
-	AuthChallenge AuthMode = 1
+	AuthNone      AuthMode = 0 // bootstrap без пароля: ЛЮБОЙ логин становится admin
+	AuthChallenge AuthMode = 1 // обычный режим challenge–response
 )
 
-// Algo identifies a checksum algorithm.
+// Algo — какой алгоритм контрольной суммы использован.
 type Algo uint8
 
 const (
-	AlgoPending Algo = 0
-	AlgoCRC32   Algo = 1
-	AlgoSHA256  Algo = 2
+	AlgoPending Algo = 0 // сумма ещё не посчитана (ленивое вычисление в процессе)
+	AlgoCRC32   Algo = 1 // быстрый CRC32 (первые 4 байта поля Checksum)
+	AlgoSHA256  Algo = 2 // криптостойкий SHA-256 (все 32 байта)
 )
 
-// Role is a session's authorization level.
+// Role — уровень доступа сессии. Диспетчер сравнивает роль сессии с минимально
+// требуемой для каждого типа сообщения, поэтому проверки прав не размазаны по
+// обработчикам (docs/tz/01-architecture.md §3).
 type Role uint8
 
 const (
-	RoleAnonymous Role = 0
-	RoleUser      Role = 1
-	RoleAdmin     Role = 2
+	RoleAnonymous Role = 0 // ещё не вошёл: можно только HELLO/AUTH/PING
+	RoleUser      Role = 1 // обычный пользователь: листинг и скачивание
+	RoleAdmin     Role = 2 // администратор: плюс весь админ-канал
 )
 
 func (r Role) String() string {
@@ -152,64 +184,68 @@ func (r Role) String() string {
 	return "unknown"
 }
 
-// Kind distinguishes files from directories in a DirEntry.
+// Kind — файл это или директория (поле DirEntry.Kind).
 type Kind uint8
 
 const (
-	KindFile Kind = 0
-	KindDir  Kind = 1
+	KindFile Kind = 0 // обычный файл
+	KindDir  Kind = 1 // директория
 )
 
-// FsOp is the operation reported by an EVENT_FS message.
+// FsOp — какое изменение в файловой системе описывает EVENT_FS.
 type FsOp uint8
 
 const (
-	FsCreated  FsOp = 1
-	FsModified FsOp = 2
-	FsRemoved  FsOp = 3
+	FsCreated  FsOp = 1 // запись появилась
+	FsModified FsOp = 2 // запись изменилась
+	FsRemoved  FsOp = 3 // запись удалена
 )
 
-// Severity classifies an EVENT_NOTICE.
+// Severity — важность (и цвет) уведомления EVENT_NOTICE.
 type Severity uint8
 
 const (
-	SevInfo  Severity = 0
-	SevWarn  Severity = 1
-	SevError Severity = 2
+	SevInfo  Severity = 0 // информация
+	SevWarn  Severity = 1 // предупреждение
+	SevError Severity = 2 // ошибка
 )
 
-// SUBSCRIBE mask bits (docs/tz/09-go-port.md §4.3).
+// Биты маски SUBSCRIBE (docs/tz/09-go-port.md §4.3). Клиент складывает нужные
+// биты в SubscriptionMask и шлёт в SUBSCRIBE; сервер рассылает событие только
+// тем, у кого установлен соответствующий бит.
 const (
-	SubFS     uint32 = 1
-	SubNotice uint32 = 2
-	SubConfig uint32 = 4
+	SubFS     uint32 = 1 // события файловой системы (EVENT_FS)
+	SubNotice uint32 = 2 // текстовые уведомления (EVENT_NOTICE)
+	SubConfig uint32 = 4 // изменения конфигурации (EVENT_CONFIG)
 )
 
-// DirEntry flag bits.
+// Биты флагов записи каталога (DirEntry.Flags).
 const (
-	FlagNew uint8 = 1 // bit0: entry is "new" since the client's last visit
+	FlagNew uint8 = 1 // бит 0: запись «новая» с момента прошлого визита клиента
 )
 
-// ErrCode is an application-level error code carried by ERROR (docs/tz/02-protocol-v2.md §2.6).
+// ErrCode — код ошибки уровня приложения, который несёт ERROR
+// (docs/tz/02-protocol-v2.md §2.6). Отдельный от сетевых сбоев: соединение живо,
+// просто конкретный запрос не выполнен.
 type ErrCode uint16
 
 const (
-	ErrOK                 ErrCode = 0
-	ErrFileNotFound       ErrCode = 1
-	ErrUnsupportedOffset  ErrCode = 2
-	ErrBadRequest         ErrCode = 3
-	ErrInternal           ErrCode = 4
-	ErrUnsupportedVersion ErrCode = 5
-	ErrAuthRequired       ErrCode = 6
-	ErrAuthFailed         ErrCode = 7
-	ErrAccessDenied       ErrCode = 8
-	ErrNotADirectory      ErrCode = 9
-	ErrIsADirectory       ErrCode = 10
-	ErrRateLimited        ErrCode = 11
-	ErrServerShuttingDown ErrCode = 12
-	ErrQuotaExceeded      ErrCode = 13
-	// ErrCancelled terminates a transfer the client asked to cancel, keeping the
-	// connection in sync (Go-port extension; see RR-3).
+	ErrOK                 ErrCode = 0  // ошибки нет
+	ErrFileNotFound       ErrCode = 1  // путь не существует
+	ErrUnsupportedOffset  ErrCode = 2  // offset за пределами файла (докачка невозможна)
+	ErrBadRequest         ErrCode = 3  // некорректный запрос (формат/параметры)
+	ErrInternal           ErrCode = 4  // внутренняя ошибка сервера
+	ErrUnsupportedVersion ErrCode = 5  // несовместимая версия протокола
+	ErrAuthRequired       ErrCode = 6  // операция требует входа
+	ErrAuthFailed         ErrCode = 7  // аутентификация не прошла
+	ErrAccessDenied       ErrCode = 8  // нет прав на операцию
+	ErrNotADirectory      ErrCode = 9  // ждали каталог, а это файл
+	ErrIsADirectory       ErrCode = 10 // ждали файл, а это каталог
+	ErrRateLimited        ErrCode = 11 // превышен лимит скорости/частоты
+	ErrServerShuttingDown ErrCode = 12 // сервер останавливается
+	ErrQuotaExceeded      ErrCode = 13 // превышена квота (перспектива M13)
+	// ErrCancelled завершает передачу, которую сам клиент попросил отменить,
+	// оставляя соединение в согласованном состоянии (расширение Go-порта; RR-3).
 	ErrCancelled ErrCode = 14
 )
 
@@ -249,14 +285,14 @@ func (c ErrCode) String() string {
 	return "ERR_UNKNOWN"
 }
 
-// AuthFailReason codes carried by AUTH_FAIL. The wire spec leaves these to the
-// implementation; these values are stable within this project.
+// AuthFailReason — код причины в AUTH_FAIL. Проводной формат оставляет эти
+// значения на усмотрение реализации; в рамках проекта они стабильны.
 type AuthFailReason uint16
 
 const (
-	AuthFailBadCredentials AuthFailReason = 1
-	AuthFailUserDisabled   AuthFailReason = 2
-	AuthFailBanned         AuthFailReason = 3
-	AuthFailTooManySession AuthFailReason = 4
-	AuthFailMalformed      AuthFailReason = 5
+	AuthFailBadCredentials AuthFailReason = 1 // неверный логин или пароль
+	AuthFailUserDisabled   AuthFailReason = 2 // учётка отключена
+	AuthFailBanned         AuthFailReason = 3 // IP временно забанен гардом
+	AuthFailTooManySession AuthFailReason = 4 // превышен лимит сессий на пользователя
+	AuthFailMalformed      AuthFailReason = 5 // некорректный AUTH_REQUEST
 )

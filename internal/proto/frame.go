@@ -6,7 +6,8 @@ import (
 	"io"
 )
 
-// Frame builds a complete on-the-wire frame (5-byte header + payload).
+// Frame собирает готовый кадр для отправки: 5-байтовый заголовок
+// (тип + длина тела) плюс само тело.
 func Frame(typ Msg, payload []byte) []byte {
 	out := make([]byte, HeaderSize+len(payload))
 	out[0] = byte(typ)
@@ -15,19 +16,20 @@ func Frame(typ Msg, payload []byte) []byte {
 	return out
 }
 
-// HandshakeMaxPayload caps a frame accepted before authentication. It is large
-// enough for HELLO/AUTH_REQUEST/PING but far below MaxControlPayload, so an
-// unauthenticated peer cannot make the server allocate megabytes per connection
-// (CR-05).
+// HandshakeMaxPayload — потолок размера кадра, принимаемого ДО аутентификации.
+// Его хватает на HELLO/AUTH_REQUEST/PING, но он много меньше MaxControlPayload,
+// поэтому неаутентифицированный собеседник не может заставить сервер выделять
+// мегабайты на соединение (CR-05).
 const HandshakeMaxPayload = MaxStringLen + 256
 
-// maxControlPayload bounds the ordinary control messages (those carrying at most
-// one length-prefixed string plus small fixed fields).
+// maxControlPayload ограничивает обычные управляющие сообщения (те, что несут
+// максимум одну строку с префиксом длины плюс небольшие фиксированные поля).
 const maxControlPayload = MaxStringLen + 256
 
-// maxPayloadFor returns the largest legitimate payload for a message type, so
-// the reader can reject an oversize length BEFORE allocating (CR-05). Only the
-// genuinely large server->client messages get the full 4 MiB ceiling.
+// maxPayloadFor возвращает наибольший ДОПУСТИМЫЙ размер тела для данного типа
+// сообщения, чтобы читатель отверг завышенную длину ЕЩЁ ДО выделения памяти
+// (CR-05). Полный потолок 4 МиБ получают только по-настоящему большие
+// сообщения сервер→клиент.
 func maxPayloadFor(typ Msg) uint32 {
 	switch typ {
 	case MsgListDirResponse, MsgAdminConfig, MsgAdminClients:
@@ -39,43 +41,44 @@ func maxPayloadFor(typ Msg) uint32 {
 	}
 }
 
-// ReadFrame reads one frame from r. On a clean connection close at a frame
-// boundary it returns io.EOF. A malformed frame (unknown type or oversize
-// payload for its type) returns a non-EOF error; the caller tears down only
-// that connection (docs/tz/09-go-port.md §4.1).
+// ReadFrame читает один кадр из r. При ЧИСТОМ закрытии соединения на границе
+// кадра возвращает io.EOF. Битый кадр (неизвестный тип или тело больше
+// допустимого для этого типа) даёт не-EOF ошибку; вызывающий рвёт ТОЛЬКО это
+// соединение, не трогая остальные (docs/tz/09-go-port.md §4.1).
 func ReadFrame(r io.Reader) (Msg, []byte, error) {
 	return ReadFrameLimited(r, MaxControlPayload)
 }
 
-// ReadFrameLimited is ReadFrame with an additional caller-supplied payload
-// ceiling (used to keep pre-auth frames small).
+// ReadFrameLimited — то же, что ReadFrame, но с дополнительным потолком на тело,
+// который задаёт вызывающий (нужно, чтобы держать до-аутентификационные кадры
+// маленькими).
 func ReadFrameLimited(r io.Reader, limit uint32) (Msg, []byte, error) {
 	var hdr [HeaderSize]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return 0, nil, err // io.EOF at the boundary is a clean close
+		return 0, nil, err // io.EOF на границе кадра — это чистое закрытие
 	}
 	return readFramePayload(hdr, r, limit)
 }
 
-// ReadFrameContinue reads a frame whose first header byte has already been
-// consumed into first, then reads the remaining header and payload. It lets a
-// caller peek the first byte under an idle deadline and, once a frame has
-// started, finish reading it with no deadline — so a slow or fragmented frame is
-// never left half-consumed and cannot desync the stream (R3-7).
+// ReadFrameContinue дочитывает кадр, первый байт заголовка которого уже прочитан
+// в first, а затем берёт остаток заголовка и тело. Это позволяет вызывающему
+// «подсмотреть» первый байт под дедлайном простоя, а как только кадр начался —
+// дочитать его БЕЗ дедлайна. Так медленный или фрагментированный кадр никогда не
+// остаётся прочитанным наполовину и не рассинхронизирует поток (R3-7).
 func ReadFrameContinue(first byte, r io.Reader, limit uint32) (Msg, []byte, error) {
 	var hdr [HeaderSize]byte
 	hdr[0] = first
 	if _, err := io.ReadFull(r, hdr[1:]); err != nil {
 		if err == io.EOF {
-			err = io.ErrUnexpectedEOF // a header cut short is not a clean close
+			err = io.ErrUnexpectedEOF // оборванный заголовок — не чистое закрытие
 		}
 		return 0, nil, err
 	}
 	return readFramePayload(hdr, r, limit)
 }
 
-// readFramePayload validates an already-read 5-byte header and reads its payload
-// under limit. Shared by ReadFrameLimited and ReadFrameContinue.
+// readFramePayload проверяет уже прочитанный 5-байтовый заголовок и читает его
+// тело в пределах limit. Общий код для ReadFrameLimited и ReadFrameContinue.
 func readFramePayload(hdr [HeaderSize]byte, r io.Reader, limit uint32) (Msg, []byte, error) {
 	typ := Msg(hdr[0])
 	n := binary.BigEndian.Uint32(hdr[1:5])
@@ -92,14 +95,14 @@ func readFramePayload(hdr [HeaderSize]byte, r io.Reader, limit uint32) (Msg, []b
 	p := make([]byte, n)
 	if _, err := io.ReadFull(r, p); err != nil {
 		if err == io.EOF {
-			err = io.ErrUnexpectedEOF // truncated payload is not a clean close
+			err = io.ErrUnexpectedEOF // обрезанное тело — не чистое закрытие
 		}
 		return 0, nil, err
 	}
 	return typ, p, nil
 }
 
-// WriteFrame writes one framed message to w.
+// WriteFrame записывает один кадр в w.
 func WriteFrame(w io.Writer, typ Msg, payload []byte) error {
 	_, err := w.Write(Frame(typ, payload))
 	return err

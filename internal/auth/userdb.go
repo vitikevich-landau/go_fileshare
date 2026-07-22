@@ -12,32 +12,36 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/proto"
 )
 
-// ErrNoSuchUser is returned when updating a user that does not exist.
+// ErrNoSuchUser возвращается при попытке изменить несуществующего пользователя.
 var ErrNoSuchUser = errors.New("auth: no such user")
 
-// Record is one user entry in users.json. StoredKey is hex(SHA256(ClientKey)).
+// Record — одна запись пользователя в users.json. Ключевой момент: хранится не
+// пароль и не его хеш, а только StoredKey (hex от SHA256(ClientKey)) — верификатор,
+// из которого нельзя ни узнать пароль, ни собрать доказательство.
 type Record struct {
-	Login     string `json:"login"`
+	Login     Login  `json:"login"`
 	Role      string `json:"role"` // "admin" | "user"
 	StoredKey string `json:"stored_key"`
 	Enabled   bool   `json:"enabled"`
 }
 
+// fileForm — обёртка верхнего уровня JSON-файла users.json ({"users": [...]}).
 type fileForm struct {
 	Users []Record `json:"users"`
 }
 
-// DB is the user database. It is safe for concurrent use.
+// DB — база пользователей. Безопасна для конкурентного использования (RWMutex).
 type DB struct {
 	path string
 
 	mu      sync.RWMutex
-	byLogin map[string]Record
-	order   []string
+	byLogin map[string]Record // логин → запись (для быстрого поиска)
+	order   []string          // логины в порядке добавления (для стабильной записи)
 }
 
-// Load reads users.json from path. A missing file yields an empty DB (the
-// no-auth bootstrap: any login authenticates as ADMIN), which is not an error.
+// Load читает users.json по пути path. ОТСУТСТВУЮЩИЙ файл даёт пустую БД (это и
+// есть bootstrap без аутентификации: любой логин входит как ADMIN) и НЕ считается
+// ошибкой. Сравните с Reload ниже, где отсутствие файла — уже ошибка.
 func Load(path string) (*DB, error) {
 	db := &DB{path: path, byLogin: map[string]Record{}}
 	b, err := os.ReadFile(path)
@@ -55,7 +59,8 @@ func Load(path string) (*DB, error) {
 	return db, nil
 }
 
-// parseUsersFile decodes a users.json body into a login map and insertion order.
+// parseUsersFile разбирает тело users.json в карту по логину и порядок вставки.
+// Дубликаты логинов не задваивают порядок: побеждает последняя запись.
 func parseUsersFile(b []byte) (map[string]Record, []string, error) {
 	var ff fileForm
 	if err := json.Unmarshal(b, &ff); err != nil {
@@ -72,14 +77,16 @@ func parseUsersFile(b []byte) (map[string]Record, []string, error) {
 	return byLogin, order, nil
 }
 
-// Reload re-reads the users file from disk, replacing the in-memory set. It is
-// used for hot user management (SIGHUP / admin reload) so disabling or adding a
-// user takes effect without a restart (docs/tz/03-server-daemon.md §3.3).
+// Reload перечитывает файл пользователей с диска, заменяя набор в памяти.
+// Используется для ГОРЯЧЕГО управления учётками (SIGHUP / запрос админа): включение,
+// отключение или добавление пользователя вступает в силу без перезапуска
+// (docs/tz/03-server-daemon.md §3.3).
 //
-// Unlike startup Load, a MISSING or unreadable file is an error here, not an
-// empty bootstrap DB: silently emptying the set on reload would flip the daemon
-// to the no-auth mode (any login becomes ADMIN) after an accidental delete or
-// rename. On any error the current in-memory set is left unchanged (fail closed).
+// В отличие от стартового Load, ОТСУТСТВУЮЩИЙ или нечитаемый файл здесь — ошибка,
+// а не пустая bootstrap-БД: молча опустошить набор при reload означало бы
+// перевести демон в режим без аутентификации (любой логин = ADMIN) после случайного
+// удаления или переименования. При любой ошибке текущий набор в памяти остаётся
+// нетронутым (fail closed — «падаем в закрытое, безопасное состояние»).
 func (db *DB) Reload() error {
 	b, err := os.ReadFile(db.path)
 	if err != nil {
@@ -95,15 +102,16 @@ func (db *DB) Reload() error {
 	return nil
 }
 
-// Empty reports whether the DB has no users (no-auth bootstrap).
+// Empty сообщает, что в БД нет пользователей (режим bootstrap без аутентификации).
 func (db *DB) Empty() bool {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	return len(db.byLogin) == 0
 }
 
-// Lookup returns the decoded StoredKey, role, and enabled flag for a login.
-func (db *DB) Lookup(login string) (storedKey [proto.ChecksumLen]byte, role proto.Role, enabled, ok bool) {
+// Lookup возвращает раскодированный StoredKey, роль и флаг «включён» для логина.
+// ok == false, если пользователя нет или его StoredKey в файле повреждён.
+func (db *DB) Lookup(login Login) (storedKey [proto.ChecksumLen]byte, role proto.Role, enabled, ok bool) {
 	db.mu.RLock()
 	r, found := db.byLogin[login]
 	db.mu.RUnlock()
@@ -118,9 +126,9 @@ func (db *DB) Lookup(login string) (storedKey [proto.ChecksumLen]byte, role prot
 	return storedKey, roleFromString(r.Role), r.Enabled, true
 }
 
-// SetUser adds or replaces a user, computing StoredKey from the password using
-// the given iteration count.
-func (db *DB) SetUser(login string, role proto.Role, password string, iters int) {
+// SetUser добавляет или заменяет пользователя, вычисляя StoredKey из пароля с
+// заданным числом итераций. Пароль после этого нигде не сохраняется.
+func (db *DB) SetUser(login Login, role proto.Role, password Password, iters Iterations) {
 	sk := StoredKey(password, login, iters)
 	rec := Record{
 		Login:     login,
@@ -136,9 +144,9 @@ func (db *DB) SetUser(login string, role proto.Role, password string, iters int)
 	db.mu.Unlock()
 }
 
-// SetPassword resets an existing user's password. It errors if the user is
-// absent.
-func (db *DB) SetPassword(login, password string, iters int) error {
+// SetPassword сбрасывает пароль существующего пользователя. Возвращает ошибку,
+// если такого пользователя нет.
+func (db *DB) SetPassword(login Login, password Password, iters Iterations) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	r, ok := db.byLogin[login]
@@ -151,8 +159,9 @@ func (db *DB) SetPassword(login, password string, iters int) error {
 	return nil
 }
 
-// SetEnabled toggles a user's enabled flag. It errors if the user is absent.
-func (db *DB) SetEnabled(login string, enabled bool) error {
+// SetEnabled переключает флаг «включён» у пользователя. Возвращает ошибку, если
+// такого пользователя нет.
+func (db *DB) SetEnabled(login Login, enabled bool) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	r, ok := db.byLogin[login]
@@ -164,7 +173,8 @@ func (db *DB) SetEnabled(login string, enabled bool) error {
 	return nil
 }
 
-// Save atomically writes the DB to its file (temp + rename).
+// Save атомарно пишет БД в свой файл (временный файл + rename), сохраняя порядок
+// добавления пользователей. Атомарность защищает от «полузаписанного» users.json.
 func (db *DB) Save() error {
 	db.mu.RLock()
 	ff := fileForm{Users: make([]Record, 0, len(db.order))}
@@ -213,7 +223,8 @@ func roleToString(r proto.Role) string {
 	return "user"
 }
 
-// RoleFromString exposes role parsing for CLI flags.
+// RoleFromString разбирает роль из строки для флагов CLI (--role). Второе
+// значение — успешно ли распознана роль.
 func RoleFromString(s string) (proto.Role, bool) {
 	switch s {
 	case "admin":

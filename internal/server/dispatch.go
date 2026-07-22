@@ -2,11 +2,12 @@ package server
 
 import "github.com/vitikevich-landau/go_fileshare/internal/proto"
 
-// MinRole returns the minimum role a client must hold to send a message type
-// (docs/tz/09-go-port.md §5.5). Handshake and keepalive are anonymous;
-// filesystem/transfer/subscribe require a user; admin messages require admin.
-// Server-only (response/event) codes default to admin so a client cannot send
-// them; the dispatcher additionally rejects them as BAD_REQUEST.
+// MinRole возвращает МИНИМАЛЬНУЮ роль, которую должен иметь клиент, чтобы послать
+// сообщение данного типа (docs/tz/09-go-port.md §5.5). Это единая точка
+// авторизации: рукопожатие и keepalive — анонимны; файловая
+// система/передача/подписка требуют роль user; админ-сообщения — admin.
+// Коды «только для сервера» (ответы/события) по умолчанию требуют admin, чтобы
+// клиент не мог их слать; диспетчер вдобавок отвергает их как BAD_REQUEST.
 func MinRole(m proto.Msg) proto.Role {
 	switch m {
 	case proto.MsgHello, proto.MsgAuthRequest, proto.MsgPing, proto.MsgPong, proto.MsgError:
@@ -19,5 +20,6 @@ func MinRole(m proto.Msg) proto.Role {
 	}
 }
 
-// roleAllows reports whether have satisfies the need level.
+// roleAllows сообщает, удовлетворяет ли роль have минимально требуемой need.
+// Роли упорядочены (anonymous < user < admin), поэтому достаточно сравнения.
 func roleAllows(have, need proto.Role) bool { return have >= need }

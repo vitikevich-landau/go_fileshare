@@ -6,16 +6,28 @@ import (
 	"fmt"
 )
 
-// ErrShort is returned when a payload is truncated (a read would run past the
-// end of the buffer). Callers treat any decode error as "malformed frame" and
-// tear down only that connection.
+// ─────────────────────────────────────────────────────────────────────────────
+// codec.go — низкоуровневые кирпичики сериализации: чтение и запись примитивов в
+// big-endian с ПРОВЕРКОЙ ГРАНИЦ. Здесь нет знания о конкретных сообщениях —
+// только «прочитай u32», «запиши строку с префиксом длины». messages.go
+// собирает из этих кирпичиков разбор/сборку каждого сообщения.
+//
+// Главный принцип: получатель НИКОГДА не доверяет входным байтам. Любое чтение
+// сначала проверяет, что нужное число байт реально есть (need), и возвращает
+// ошибку вместо паники. Так битый или враждебный кадр рвёт одно соединение, а не
+// роняет процесс (docs/tz/09-go-port.md §5.1).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ErrShort возвращается, когда тело обрезано (чтение вышло бы за конец буфера).
+// Вызывающий трактует любую ошибку декодирования как «битый кадр» и рвёт только
+// это соединение.
 var ErrShort = errors.New("proto: short buffer")
 
-// reader is a bounds-checked cursor over a message payload. Every accessor
-// returns an error on underflow rather than panicking (docs/tz/09-go-port.md §5.1).
+// reader — курсор по телу сообщения с проверкой границ. Каждый аксессор при
+// нехватке байт возвращает ошибку, а не паникует (docs/tz/09-go-port.md §5.1).
 type reader struct {
-	b []byte
-	i int
+	b []byte // всё тело
+	i int    // сколько уже прочитано (позиция курсора)
 }
 
 func newReader(b []byte) *reader { return &reader{b: b} }
@@ -65,9 +77,8 @@ func (r *reader) u64() (uint64, error) {
 	return v, nil
 }
 
-// take returns a copy of the next n bytes. A copy (not a sub-slice of the
-// payload) is returned so callers may retain it after the payload buffer is
-// reused.
+// take возвращает КОПИЮ следующих n байт. Именно копию (а не под-срез тела),
+// чтобы вызывающий мог хранить её и после того, как буфер тела переиспользуют.
 func (r *reader) take(n int) ([]byte, error) {
 	if err := r.need(n); err != nil {
 		return nil, err
@@ -78,7 +89,7 @@ func (r *reader) take(n int) ([]byte, error) {
 	return out, nil
 }
 
-// str reads a u16-length-prefixed UTF-8 string, rejecting lengths above max.
+// str читает строку с префиксом длины u16, отвергая длину больше max.
 func (r *reader) str(max int) (string, error) {
 	n, err := r.u16()
 	if err != nil {
@@ -95,7 +106,8 @@ func (r *reader) str(max int) (string, error) {
 	return s, nil
 }
 
-// fixedInto reads exactly len(dst) bytes into dst.
+// fixedInto читает ровно len(dst) байт в dst (для полей фиксированной длины:
+// challenge, proof, checksum).
 func (r *reader) fixedInto(dst []byte) error {
 	if err := r.need(len(dst)); err != nil {
 		return err
@@ -105,7 +117,8 @@ func (r *reader) fixedInto(dst []byte) error {
 	return nil
 }
 
-// rest returns a copy of all remaining bytes (used by CHUNK_DATA).
+// rest возвращает копию всех оставшихся байт (используется в CHUNK_DATA, где
+// длину данных задаёт граница кадра, а не префикс).
 func (r *reader) rest() []byte {
 	out := make([]byte, r.remaining())
 	copy(out, r.b[r.i:])
@@ -113,8 +126,9 @@ func (r *reader) rest() []byte {
 	return out
 }
 
-// end asserts the payload was fully consumed. It mirrors require_end in the C++
-// reference: trailing bytes indicate a format mismatch (docs/tz/09-go-port.md §5.1).
+// end проверяет, что тело израсходовано ПОЛНОСТЬЮ. Зеркалит require_end из
+// эталона на C++: «хвост» лишних байт означает несовпадение формата
+// (docs/tz/09-go-port.md §5.1).
 func (r *reader) end() error {
 	if r.remaining() != 0 {
 		return fmt.Errorf("proto: %d trailing bytes", r.remaining())
@@ -122,7 +136,7 @@ func (r *reader) end() error {
 	return nil
 }
 
-// writer accumulates a payload in big-endian wire order.
+// writer накапливает тело сообщения в проводном порядке байт (big-endian).
 type writer struct {
 	buf []byte
 }
@@ -134,8 +148,9 @@ func (w *writer) u64(v uint64) { w.buf = binary.BigEndian.AppendUint64(w.buf, v)
 
 func (w *writer) raw(b []byte) { w.buf = append(w.buf, b...) }
 
-// str writes a u16-length-prefixed string. Over-long strings are clamped to
-// MaxStringLen; callers control the values so this is a defensive backstop.
+// str пишет строку с префиксом длины u16. Слишком длинные строки обрезаются до
+// MaxStringLen; значения контролирует вызывающий, так что это лишь защитный
+// предохранитель.
 func (w *writer) str(s string) {
 	if len(s) > MaxStringLen {
 		s = s[:MaxStringLen]
@@ -144,7 +159,8 @@ func (w *writer) str(s string) {
 	w.buf = append(w.buf, s...)
 }
 
-// fixed writes exactly n bytes: b is zero-padded if short, truncated if long.
+// fixed пишет ровно n байт: если b короче — дополняет нулями, если длиннее —
+// обрезает. Так поля фиксированной длины всегда занимают ровно n байт.
 func (w *writer) fixed(b []byte, n int) {
 	if len(b) >= n {
 		w.buf = append(w.buf, b[:n]...)

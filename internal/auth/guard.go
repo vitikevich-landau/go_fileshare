@@ -5,41 +5,44 @@ import (
 	"time"
 )
 
-// Guard throttles password guessing by banning an IP after too many
-// consecutive authentication failures (docs/tz/09-go-port.md §5.3). Time is
-// passed in so behaviour is deterministic in tests.
+// Guard тормозит подбор пароля, забанивая IP после слишком многих ПОДРЯД идущих
+// неудачных попыток входа (docs/tz/09-go-port.md §5.3). Текущее время передаётся
+// аргументом, чтобы поведение было детерминированным в тестах (не зовём
+// time.Now() внутри). Безопасен для конкурентного использования.
 type Guard struct {
-	maxFails int
+	maxFails FailCount // после стольких неудач подряд — бан
 
 	mu      sync.Mutex
-	entries map[string]*guardEntry
+	entries map[string]*guardEntry // ключ — ClientIP
 }
 
+// guardEntry — учёт по одному IP: сколько неудач подряд и до какого момента бан.
 type guardEntry struct {
-	fails    int
-	banUntil time.Time
+	fails    FailCount // неудачи подряд (сбрасывается при успехе или бане)
+	banUntil time.Time // до этого момента IP забанен
 }
 
-// NewGuard returns a Guard that bans after maxFails consecutive failures.
-func NewGuard(maxFails int) *Guard {
+// NewGuard возвращает Guard, который банит после maxFails неудач подряд
+// (значение меньше 1 трактуется как 3).
+func NewGuard(maxFails FailCount) *Guard {
 	if maxFails < 1 {
 		maxFails = 3
 	}
 	return &Guard{maxFails: maxFails, entries: map[string]*guardEntry{}}
 }
 
-// Banned reports whether ip is currently banned as of now.
-func (g *Guard) Banned(ip string, now time.Time) bool {
+// Banned сообщает, забанен ли ip прямо сейчас (по времени now).
+func (g *Guard) Banned(ip ClientIP, now time.Time) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	e := g.entries[ip]
 	return e != nil && now.Before(e.banUntil)
 }
 
-// Fail records a failed attempt from ip. When the failure count reaches
-// maxFails the ip is banned for banDur (and the counter resets). It returns
-// whether the ip is now banned.
-func (g *Guard) Fail(ip string, now time.Time, banDur time.Duration) bool {
+// Fail фиксирует неудачную попытку с ip. Когда счётчик неудач достигает
+// maxFails, ip банится на banDur (а счётчик сбрасывается). Возвращает, забанен ли
+// ip теперь.
+func (g *Guard) Fail(ip ClientIP, now time.Time, banDur time.Duration) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	e := g.entries[ip]
@@ -56,15 +59,15 @@ func (g *Guard) Fail(ip string, now time.Time, banDur time.Duration) bool {
 	return false
 }
 
-// Success clears any recorded failures for ip.
-func (g *Guard) Success(ip string) {
+// Success сбрасывает накопленные неудачи для ip (успешный вход «прощает» историю).
+func (g *Guard) Success(ip ClientIP) {
 	g.mu.Lock()
 	delete(g.entries, ip)
 	g.mu.Unlock()
 }
 
-// Cleanup drops entries whose ban has expired and that have no pending
-// failures, bounding memory for a churning set of client IPs.
+// Cleanup удаляет записи, у которых бан истёк и нет накопленных неудач, ограничивая
+// память при постоянно меняющемся наборе клиентских IP (иначе карта только росла бы).
 func (g *Guard) Cleanup(now time.Time) {
 	g.mu.Lock()
 	for ip, e := range g.entries {

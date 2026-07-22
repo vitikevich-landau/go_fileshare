@@ -8,8 +8,9 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/watcher"
 )
 
-// startWatcher launches the filesystem watcher (if events are enabled) bound to
-// ctx, so changes under the share root are broadcast as EVENT_FS.
+// startWatcher запускает файловый watcher (если события включены), привязанный к
+// ctx, чтобы изменения под корнем раздачи рассылались как EVENT_FS. Если watcher
+// не удалось создать, сервер работает дальше без push-событий.
 func (s *Server) startWatcher(ctx context.Context) {
 	cur := s.hub.Current()
 	if !cur.Events.Enabled {
@@ -25,8 +26,9 @@ func (s *Server) startWatcher(ctx context.Context) {
 	s.log.Info("filesystem watcher started", "debounce_ms", cur.Events.DebounceMs)
 }
 
-// handleFsEvent invalidates the checksum cache for the changed path and
-// broadcasts an EVENT_FS to subscribers (docs/tz/09-go-port.md §5.7).
+// handleFsEvent сбрасывает checksum-кэш для изменившегося пути и рассылает
+// EVENT_FS подписчикам (docs/tz/09-go-port.md §5.7). Сброс кэша обязателен: иначе
+// после изменения файла клиент получил бы устаревшую сумму.
 func (s *Server) handleFsEvent(ev watcher.Event) {
 	s.vfs.InvalidateChecksum(ev.VPath)
 	frame := proto.Encode(proto.EventFs{
@@ -39,7 +41,8 @@ func (s *Server) handleFsEvent(ev watcher.Event) {
 	s.reg.broadcast(proto.SubFS, frame)
 }
 
-// BroadcastNotice sends an EVENT_NOTICE to subscribers of server notices.
+// BroadcastNotice рассылает EVENT_NOTICE подписчикам серверных уведомлений
+// (например, о смене настройки, kick-е или скорой остановке).
 func (s *Server) BroadcastNotice(sev proto.Severity, text string) {
 	frame := proto.Encode(proto.EventNotice{Severity: sev, Text: text})
 	s.reg.broadcast(proto.SubNotice, frame)

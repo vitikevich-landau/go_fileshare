@@ -1,8 +1,9 @@
-// Package config holds the daemon settings and the hot-reload hub.
+// Package config хранит настройки демона и хаб горячей перезагрузки.
 //
-// Settings is a plain value struct (no pointers/slices/maps), so a snapshot is
-// a cheap by-value copy — the basis for lock-free hot config via Hub
-// (docs/tz/09-go-port.md §5.4, §12.1).
+// Settings — плоская value-структура (без указателей/срезов/карт), поэтому её
+// снимок (snapshot) — дешёвая копия по значению. Это основа lock-free горячего
+// конфига через Hub (docs/tz/09-go-port.md §5.4, §12.1). Механизм снапшотов и
+// деление настроек на «горячие» и «рестарт-» подробно описаны в types.go.
 package config
 
 import (
@@ -13,42 +14,50 @@ import (
 	"path/filepath"
 )
 
+// ServerSettings — «кто и откуда» раздаётся. Почти всё здесь restart-only.
 type ServerSettings struct {
-	Port      int    `json:"port"`       // restart
-	ShareRoot string `json:"share_root"` // restart
-	Workers   int    `json:"workers"`    // restart; 0 = num CPUs
-	Motd      string `json:"motd"`       // hot
+	Port      Port   `json:"port"`       // restart: TCP-порт демона
+	ShareRoot string `json:"share_root"` // restart: корневая директория раздачи
+	Workers   int    `json:"workers"`    // restart: число воркеров; 0 = по числу CPU
+	Motd      string `json:"motd"`       // hot: приветствие в AUTH_OK
 }
 
+// LimitsSettings — лимиты и тайм-ауты. Все — «горячие»: меняются на лету.
 type LimitsSettings struct {
-	MaxConnections     int    `json:"max_connections"`       // hot; 0 = unlimited
-	MaxSessionsPerUser int    `json:"max_sessions_per_user"` // hot; 0 = unlimited
-	PerClientBps       uint64 `json:"per_client_bps"`        // hot; 0 = unlimited
-	GlobalBps          uint64 `json:"global_bps"`            // hot; 0 = unlimited
-	HandshakeTimeoutS  int    `json:"handshake_timeout_s"`   // hot
-	IdleTimeoutS       int    `json:"idle_timeout_s"`        // hot
-	AuthFailBanS       int    `json:"auth_fail_ban_s"`       // hot
+	MaxConnections     int            `json:"max_connections"`       // hot; 0 = без лимита
+	MaxSessionsPerUser int            `json:"max_sessions_per_user"` // hot; 0 = без лимита
+	PerClientBps       BytesPerSecond `json:"per_client_bps"`        // hot; 0 = без лимита
+	GlobalBps          BytesPerSecond `json:"global_bps"`            // hot; 0 = без лимита
+	HandshakeTimeoutS  Seconds        `json:"handshake_timeout_s"`   // hot: тайм-аут рукопожатия
+	IdleTimeoutS       Seconds        `json:"idle_timeout_s"`        // hot: тайм-аут простоя
+	AuthFailBanS       Seconds        `json:"auth_fail_ban_s"`       // hot: срок бана за брутфорс
 }
 
+// ChecksumSettings — где лежит checksum-кэш VFS.
 type ChecksumSettings struct {
-	CacheFile string `json:"cache_file"` // restart
+	CacheFile string `json:"cache_file"` // restart: файл checksum-кэша
 }
 
+// EventsSettings — параметры watcher-а (push-события EVENT_FS). Строятся один раз
+// при старте, поэтому restart-only.
 type EventsSettings struct {
-	Enabled    bool `json:"enabled"`     // restart (watcher built once at startup)
-	DebounceMs int  `json:"debounce_ms"` // restart (watcher built once at startup)
+	Enabled    bool         `json:"enabled"`     // restart: включён ли watcher
+	DebounceMs Milliseconds `json:"debounce_ms"` // restart: пауза «схлопывания» событий
 }
 
+// AuthSettings — путь к users.json и число итераций PBKDF2. Сам ФАЙЛ читается
+// горячо (Reload), а вот путь и число итераций — restart.
 type AuthSettings struct {
-	UsersFile   string `json:"users_file"`   // restart (path); contents are hot
-	PBKDF2Iters int    `json:"pbkdf2_iters"` // restart
+	UsersFile   string `json:"users_file"`   // restart (путь); содержимое — горячее
+	PBKDF2Iters int    `json:"pbkdf2_iters"` // restart: итераций PBKDF2
 }
 
+// LogSettings — уровень логирования (меняется на лету).
 type LogSettings struct {
-	Level string `json:"level"` // hot
+	Level string `json:"level"` // hot: debug|info|warn|error
 }
 
-// Settings is the full daemon configuration.
+// Settings — полная конфигурация демона: дерево из подгрупп выше.
 type Settings struct {
 	Server   ServerSettings   `json:"server"`
 	Limits   LimitsSettings   `json:"limits"`
@@ -58,17 +67,18 @@ type Settings struct {
 	Log      LogSettings      `json:"log"`
 }
 
-// MinPBKDF2Iters is the recommended PBKDF2 iteration count (the security floor
-// from docs/tz/06-security.md §2). It is ADVISORY, not enforced at load: because
-// the daemon announces this value in HELLO_OK *before* it learns the login
-// (challenge/response), it is a deployment-wide constant, so raising it would
-// invalidate every existing hash. Rejecting a below-floor config at load would
-// also block --reset-password (the very tool used to migrate). The daemon
-// therefore warns at startup instead, leaving old installs runnable while they
-// migrate. A per-user count needs the deferred B1-full handshake change.
+// MinPBKDF2Iters — рекомендуемое число итераций PBKDF2 (порог безопасности из
+// docs/tz/06-security.md §2). Это СОВЕТ, не жёсткое требование при загрузке:
+// демон объявляет это значение в HELLO_OK *до* того, как узнает логин
+// (challenge/response), значит оно едино для всей установки — поднять его значит
+// обесценить все существующие хеши. Отвергать конфиг ниже порога при загрузке
+// заодно заблокировало бы --reset-password (тот самый инструмент миграции).
+// Поэтому демон лишь предупреждает при старте, оставляя старые установки
+// работоспособными на время миграции. Пофайловое число итераций требует
+// отложенного изменения рукопожатия (B1-full).
 const MinPBKDF2Iters = 600_000
 
-// Default returns the built-in defaults (docs/tz/09-go-port.md §12.1).
+// Default возвращает встроенные значения по умолчанию (docs/tz/09-go-port.md §12.1).
 func Default() Settings {
 	return Settings{
 		Server: ServerSettings{Port: 5555, ShareRoot: "./share", Workers: 0, Motd: ""},
@@ -84,12 +94,13 @@ func Default() Settings {
 	}
 }
 
-// Clone returns a deep copy (value semantics make this a plain copy).
+// Clone возвращает глубокую копию. Благодаря value-семантике Settings это
+// обычное копирование по значению — именно поэтому снапшоты так дёшевы.
 func (s Settings) Clone() Settings { return s }
 
-// Load reads config from path, overlaying it onto the defaults so a partial
-// file only overrides the keys it sets. A missing file yields the defaults and
-// is not an error. The result is validated.
+// Load читает конфиг из path, НАКЛАДЫВАЯ его поверх значений по умолчанию: частичный
+// файл переопределяет только заданные в нём ключи. Отсутствующий файл даёт
+// умолчания и не считается ошибкой. Результат валидируется.
 func Load(path string) (Settings, error) {
 	s := Default()
 	b, err := os.ReadFile(path)
@@ -108,8 +119,9 @@ func Load(path string) (Settings, error) {
 	return s, nil
 }
 
-// Validate returns a human-readable reason the settings are invalid, or "" if
-// they are valid (docs/tz/09-go-port.md §12.1).
+// Validate возвращает человекочитаемую причину, по которой настройки некорректны,
+// или "" если они валидны (docs/tz/09-go-port.md §12.1). Вызывается и при загрузке
+// файла, и перед каждой горячей подменой снапшота — плохое значение не применится.
 func (s Settings) Validate() string {
 	if s.Server.Port < 1 || s.Server.Port > 65535 {
 		return fmt.Sprintf("server.port %d out of range [1,65535]", s.Server.Port)
@@ -140,7 +152,8 @@ func (s Settings) Validate() string {
 	return ""
 }
 
-// Save atomically writes settings to path (temp + rename).
+// Save атомарно пишет настройки в path (временный файл + rename), чтобы на диске
+// никогда не оказался «полузаписанный» конфиг.
 func (s Settings) Save(path string) error {
 	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {

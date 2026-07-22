@@ -2,16 +2,18 @@ package config
 
 import "strconv"
 
-// KeyInfo is one row of the admin config view: a dotted key, its current value
-// as a string, and whether it can be changed at runtime (docs/tz/05-admin.md §2.3).
+// KeyInfo — одна строка админского вида конфига: «точечный» ключ, его текущее
+// значение строкой и можно ли менять его на лету (docs/tz/05-admin.md §2.3).
+// Именно из этих строк админ-панель (F9) рисует таблицу настроек.
 type KeyInfo struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
-	Hot   bool   `json:"hot"`
+	Key   ConfigKey   `json:"key"`   // напр. «limits.per_client_bps»
+	Value ConfigValue `json:"value"` // текущее значение строкой
+	Hot   bool        `json:"hot"`   // true — меняется на лету, false — только рестарт
 }
 
-// AdminView returns the displayable settings in a stable order, marked hot or
-// restart-only, for ADMIN_GET_CONFIG.
+// AdminView возвращает отображаемые настройки в СТАБИЛЬНОМ порядке, помеченные
+// как горячие или restart-only, для ADMIN_GET_CONFIG. Стабильный порядок нужен,
+// чтобы строки в панели не «прыгали» между запросами.
 func (s Settings) AdminView() []KeyInfo {
 	u := func(v uint64) string { return strconv.FormatUint(v, 10) }
 	i := func(v int) string { return strconv.Itoa(v) }

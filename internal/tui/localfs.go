@@ -6,8 +6,10 @@ import (
 	"strings"
 )
 
-// readLocalDir lists a local directory into panel entries. It returns the
-// cleaned absolute path and whether a parent exists.
+// readLocalDir читает локальный каталог в записи панели. Возвращает очищенный
+// абсолютный путь и есть ли родитель. Файлы «.part» скрываются как отдельные
+// записи, но помечают HasPart у своего «настоящего» файла — так в панели видно,
+// что файл можно докачать.
 func readLocalDir(dir string) (entries []Entry, abs string, hasParent bool, err error) {
 	abs, err = filepath.Abs(dir)
 	if err != nil {

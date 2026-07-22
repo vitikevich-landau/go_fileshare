@@ -2,23 +2,26 @@ package proto
 
 import "fmt"
 
-// Message is a decoded protocol message. Encoders return a full frame via
-// Encode; decoders are dispatched by Decode.
+// Message — разобранное сообщение протокола. Каждый тип сообщения умеет сказать
+// свой Msg-код и сериализовать себя в тело кадра (encode); обратное
+// преобразование делает Decode. encode неэкспортируемый: собирать кадр нужно
+// через Encode, чтобы к телу всегда добавлялся корректный заголовок.
 type Message interface {
 	Type() Msg
 	encode(w *writer)
 }
 
-// Encode marshals m into a complete wire frame.
+// Encode превращает сообщение m в готовый кадр (5-байтовый заголовок + тело).
 func Encode(m Message) []byte {
 	var w writer
 	m.encode(&w)
 	return Frame(m.Type(), w.buf)
 }
 
-// Decode parses a payload for the given message type. It enforces that the
-// payload is fully consumed (no trailing bytes), matching require_end in the
-// C++ reference (docs/tz/09-go-port.md §5.1).
+// Decode разбирает тело кадра заданного типа в сообщение. Обязательно требует,
+// чтобы тело было ИЗРАСХОДОВАНО ПОЛНОСТЬЮ (без «хвоста»): лишние байты означают
+// рассинхрон формата — это зеркалит require_end из эталона на C++
+// (docs/tz/09-go-port.md §5.1).
 func Decode(typ Msg, payload []byte) (Message, error) {
 	r := newReader(payload)
 	m, err := decodeBody(typ, r)
@@ -120,14 +123,16 @@ func boolU8(b bool) uint8 {
 
 // ---- DirEntry (shared sub-structure) ----
 
-// DirEntry describes one filesystem entry on the wire: name:str, kind:u8,
-// size:u64, mtime:u64 (unix seconds), flags:u8 (docs/tz/09-go-port.md §4.4).
+// DirEntry — одна запись каталога на проводе: имя, тип (файл/папка), размер,
+// время модификации и флаги. Формат: name:str, kind:u8, size:u64,
+// mtime:u64 (unix-секунды), flags:u8 (docs/tz/09-go-port.md §4.4). Одна и та же
+// структура переиспользуется в LIST_DIR_RESPONSE и STAT_RESPONSE.
 type DirEntry struct {
-	Name  string
-	Kind  Kind
-	Size  uint64
-	Mtime uint64
-	Flags uint8
+	Name  FileName    // имя записи без пути, напр. «report.pdf»
+	Kind  Kind        // файл или директория
+	Size  FileSize    // размер в байтах (для директории — 0)
+	Mtime UnixSeconds // время последней модификации, unix-секунды
+	Flags EntryFlags  // битовые флаги (FlagNew — «новая» с прошлого визита)
 }
 
 func (e DirEntry) encodeInto(w *writer) {
@@ -163,9 +168,14 @@ func decodeDirEntry(r *reader) (DirEntry, error) {
 
 // ---- ERROR / PING / PONG ----
 
+// Error — сообщение ERROR: код ошибки уровня приложения плюс человекочитаемое
+// пояснение. Сервер шлёт его, когда не может выполнить запрос (файл не найден,
+// нет прав, требуется аутентификация и т.п.); клиент показывает Message
+// пользователю, а по Code принимает решение (например, ErrCancelled завершает
+// передачу штатно, не как сбой).
 type Error struct {
-	Code    ErrCode
-	Message string
+	Code    ErrCode // машиночитаемый код (см. перечисление ErrCode)
+	Message string  // текст для человека
 }
 
 func (Error) Type() Msg { return MsgError }
@@ -186,11 +196,14 @@ func decodeError(r *reader) (Error, error) {
 	return m, nil
 }
 
+// Ping — heartbeat-запрос «ты жив?». Пустое тело: важен сам факт кадра. Любая
+// сторона может слать PING, чтобы вовремя заметить обрыв «молчащего» TCP.
 type Ping struct{}
 
 func (Ping) Type() Msg        { return MsgPing }
 func (Ping) encode(w *writer) {}
 
+// Pong — ответ на Ping, тоже с пустым телом.
 type Pong struct{}
 
 func (Pong) Type() Msg        { return MsgPong }
@@ -198,9 +211,12 @@ func (Pong) encode(w *writer) {}
 
 // ---- Handshake / auth ----
 
+// Hello — самое первое сообщение клиента после установки TCP: объявляет версию
+// протокола и представляется. Сервер по ProtoVer сразу решает, говорить ли
+// дальше (v2 отказывает v1 и наоборот).
 type Hello struct {
-	ProtoVer   uint16
-	ClientName string
+	ProtoVer   ProtocolVersion // версия протокола, которую предлагает клиент
+	ClientName string          // самоназвание, напр. «commander/2.0»
 }
 
 func (Hello) Type() Msg { return MsgHello }
@@ -220,12 +236,16 @@ func decodeHello(r *reader) (Hello, error) {
 	return m, nil
 }
 
+// HelloOk — ответ сервера на Hello: подтверждает версию, представляется,
+// объявляет режим аутентификации и передаёт параметры challenge–response
+// (случайный вызов и число итераций PBKDF2). По ним клиент считает
+// доказательство, не пересылая пароль по сети.
 type HelloOk struct {
-	ProtoVer    uint16
-	ServerName  string
-	AuthMode    AuthMode
-	Challenge   [ChallengeLen]byte
-	PBKDF2Iters uint32
+	ProtoVer    ProtocolVersion  // согласованная версия протокола
+	ServerName  string           // самоназвание сервера
+	AuthMode    AuthMode         // AuthNone (любой логин = admin) или AuthChallenge
+	Challenge   Challenge        // случайный вызов для этого рукопожатия
+	PBKDF2Iters PBKDF2Iterations // сколько итераций PBKDF2 применить к паролю
 }
 
 func (HelloOk) Type() Msg { return MsgHelloOk }
@@ -259,9 +279,11 @@ func decodeHelloOk(r *reader) (HelloOk, error) {
 	return m, nil
 }
 
+// AuthRequest — клиент присылает логин и доказательство знания пароля (SCRAM
+// ClientProof, см. тип Proof). Сам пароль на проводе не появляется никогда.
 type AuthRequest struct {
-	Login string
-	Proof [ProofLen]byte
+	Login string // учётная запись
+	Proof Proof  // ClientProof = ClientKey XOR HMAC(StoredKey, challenge||login)
 }
 
 func (AuthRequest) Type() Msg { return MsgAuthRequest }
@@ -281,10 +303,13 @@ func decodeAuthRequest(r *reader) (AuthRequest, error) {
 	return m, nil
 }
 
+// AuthOk — сервер принял вход: сообщает выданную роль, номер сессии и
+// приветствие (motd). После этого соединение переходит из HANDSHAKE в рабочее
+// состояние и принимает все разрешённые роли сообщения.
 type AuthOk struct {
-	Role      Role
-	SessionID uint64
-	Motd      string
+	Role      Role      // выданный уровень доступа (user/admin)
+	SessionID SessionID // номер сессии (для админского kick и списка клиентов)
+	Motd      string    // «message of the day», приветствие
 }
 
 func (AuthOk) Type() Msg { return MsgAuthOk }
@@ -309,9 +334,12 @@ func decodeAuthOk(r *reader) (AuthOk, error) {
 	return m, nil
 }
 
+// AuthFail — сервер отклонил вход: код причины (неверный пароль, учётка
+// отключена, IP забанен и т.п.) плюс текст. Провальные попытки и баны при этом
+// ещё и аудируются на сервере.
 type AuthFail struct {
-	Reason  AuthFailReason
-	Message string
+	Reason  AuthFailReason // почему отказано (см. перечисление)
+	Message string         // пояснение для человека
 }
 
 func (AuthFail) Type() Msg { return MsgAuthFail }
@@ -334,7 +362,9 @@ func decodeAuthFail(r *reader) (AuthFail, error) {
 
 // ---- Filesystem ----
 
-type ListDirRequest struct{ Path string }
+// ListDirRequest — клиент просит содержимое каталога Path (в терминах VFS,
+// от корня раздачи).
+type ListDirRequest struct{ Path Path }
 
 func (ListDirRequest) Type() Msg          { return MsgListDirRequest }
 func (m ListDirRequest) encode(w *writer) { w.str(m.Path) }
@@ -343,9 +373,12 @@ func decodeListDirRequest(r *reader) (ListDirRequest, error) {
 	return ListDirRequest{Path: p}, err
 }
 
+// ListDirResponse — ответ на LIST_DIR: путь и список его записей. Это одно из
+// немногих сообщений, которое может быть большим, поэтому у него отдельный
+// лимит на число записей (MaxListEntries).
 type ListDirResponse struct {
-	Path    string
-	Entries []DirEntry
+	Path    Path       // каталог, содержимое которого перечислено
+	Entries []DirEntry // его записи (файлы и подкаталоги)
 }
 
 func (ListDirResponse) Type() Msg { return MsgListDirResponse }
@@ -380,7 +413,8 @@ func decodeListDirResponse(r *reader) (ListDirResponse, error) {
 	return m, nil
 }
 
-type StatRequest struct{ Path string }
+// StatRequest — клиент просит метаданные одной записи (файла или каталога).
+type StatRequest struct{ Path Path }
 
 func (StatRequest) Type() Msg          { return MsgStatRequest }
 func (m StatRequest) encode(w *writer) { w.str(m.Path) }
@@ -389,9 +423,10 @@ func decodeStatRequest(r *reader) (StatRequest, error) {
 	return StatRequest{Path: p}, err
 }
 
+// StatResponse — ответ на STAT: путь и одна DirEntry с его метаданными.
 type StatResponse struct {
-	Path  string
-	Entry DirEntry
+	Path  Path     // запрошенный путь
+	Entry DirEntry // метаданные этой записи
 }
 
 func (StatResponse) Type() Msg { return MsgStatResponse }
@@ -411,7 +446,10 @@ func decodeStatResponse(r *reader) (StatResponse, error) {
 	return m, nil
 }
 
-type ChecksumRequest struct{ Path string }
+// ChecksumRequest — клиент просит контрольную сумму файла. Сервер считает её
+// ЛЕНИВО и кэширует по (path, size, mtime), поэтому первый запрос может быть
+// дороже последующих.
+type ChecksumRequest struct{ Path Path }
 
 func (ChecksumRequest) Type() Msg          { return MsgChecksumRequest }
 func (m ChecksumRequest) encode(w *writer) { w.str(m.Path) }
@@ -420,10 +458,12 @@ func decodeChecksumRequest(r *reader) (ChecksumRequest, error) {
 	return ChecksumRequest{Path: p}, err
 }
 
+// ChecksumResponse — ответ на CHECKSUM: путь, алгоритм и сама сумма. Если сумма
+// ещё считается, Algo может быть AlgoPending.
 type ChecksumResponse struct {
-	Path     string
-	Algo     Algo
-	Checksum [ChecksumLen]byte
+	Path     Path     // файл, для которого посчитана сумма
+	Algo     Algo     // алгоритм (CRC32 / SHA-256 / ещё считается)
+	Checksum Checksum // значение суммы (для CRC32 значимы первые 4 байта)
 }
 
 func (ChecksumResponse) Type() Msg { return MsgChecksumResp }
@@ -451,9 +491,11 @@ func decodeChecksumResponse(r *reader) (ChecksumResponse, error) {
 
 // ---- Transfer ----
 
+// DownloadRequest — клиент просит скачать файл, начиная с Offset. Offset > 0 —
+// это ДОКАЧКА: клиент уже имеет «<имя>.part» и хочет продолжить с места обрыва.
 type DownloadRequest struct {
-	Path   string
-	Offset uint64
+	Path   Path       // какой файл качать
+	Offset ByteOffset // с какого байта начать (0 — сначала)
 }
 
 func (DownloadRequest) Type() Msg { return MsgDownloadRequest }
@@ -473,9 +515,11 @@ func decodeDownloadRequest(r *reader) (DownloadRequest, error) {
 	return m, nil
 }
 
+// DownloadAccept — сервер согласился отдать файл: назначает номер передачи и
+// сообщает полный размер файла. Дальше идут CHUNK_DATA с этим же TransferID.
 type DownloadAccept struct {
-	TransferID uint32
-	TotalSize  uint64
+	TransferID TransferID // номер этой передачи (им же помечаются чанки и отмена)
+	TotalSize  FileSize   // полный размер файла в байтах
 }
 
 func (DownloadAccept) Type() Msg { return MsgDownloadAccept }
@@ -495,12 +539,13 @@ func decodeDownloadAccept(r *reader) (DownloadAccept, error) {
 	return m, nil
 }
 
-// ChunkData carries a raw slice of file bytes (up to ChunkSize). The payload is
-// transfer_id:u32 followed by the raw bytes with no length prefix; the frame
-// length delimits the data.
+// ChunkData несёт очередной кусок файла (до ChunkSize байт). Формат тела:
+// transfer_id:u32, за ним СЫРЫЕ байты БЕЗ префикса длины — границу данных задаёт
+// длина самого кадра. Это единственное сообщение, где полезная нагрузка не
+// самоописываема по длине внутри тела.
 type ChunkData struct {
-	TransferID uint32
-	Data       []byte
+	TransferID TransferID // к какой передаче относится кусок
+	Data       []byte     // сырые байты файла (длину задаёт кадр)
 }
 
 func (ChunkData) Type() Msg { return MsgChunkData }
@@ -521,10 +566,13 @@ func decodeChunkData(r *reader) (ChunkData, error) {
 	return m, nil
 }
 
+// DownloadDone — сервер отдал файл целиком и прислал его контрольную сумму.
+// Клиент сверяет её со своей: совпало — переименовывает «.part» в файл; нет —
+// оставляет «.part» для повторной докачки.
 type DownloadDone struct {
-	TransferID uint32
-	Algo       Algo
-	Checksum   [ChecksumLen]byte
+	TransferID TransferID // какая передача завершена
+	Algo       Algo       // алгоритм контрольной суммы
+	Checksum   Checksum   // сумма для сверки
 }
 
 func (DownloadDone) Type() Msg { return MsgDownloadDone }
@@ -550,7 +598,10 @@ func decodeDownloadDone(r *reader) (DownloadDone, error) {
 	return m, nil
 }
 
-type DownloadCancel struct{ TransferID uint32 }
+// DownloadCancel — клиент просит прервать текущую передачу. Сервер отменит её,
+// только если TransferID совпадает с активной, иначе отмена игнорируется, чтобы
+// «поздняя» отмена не убила уже следующую передачу (R3-2).
+type DownloadCancel struct{ TransferID TransferID }
 
 func (DownloadCancel) Type() Msg          { return MsgDownloadCancel }
 func (m DownloadCancel) encode(w *writer) { w.u32(m.TransferID) }
@@ -561,7 +612,10 @@ func decodeDownloadCancel(r *reader) (DownloadCancel, error) {
 
 // ---- Events ----
 
-type Subscribe struct{ Mask uint32 }
+// Subscribe — клиент подписывается на push-события. Mask — комбинация битов
+// SubFS / SubNotice / SubConfig: сервер будет слать только те события, чьи биты
+// установлены.
+type Subscribe struct{ Mask SubscriptionMask }
 
 func (Subscribe) Type() Msg          { return MsgSubscribe }
 func (m Subscribe) encode(w *writer) { w.u32(m.Mask) }
@@ -570,12 +624,15 @@ func decodeSubscribe(r *reader) (Subscribe, error) {
 	return Subscribe{Mask: mask}, err
 }
 
+// EventFs — push-уведомление об изменении в раздаче: файл появился, изменился
+// или удалён. Сервер рассылает его подписчикам (SubFS), чтобы TUI подсветил
+// новое и обновил панель без ручного обновления.
 type EventFs struct {
-	Op    FsOp
-	Kind  Kind
-	Path  string
-	Size  uint64
-	Mtime uint64
+	Op    FsOp        // что произошло: создан / изменён / удалён
+	Kind  Kind        // файл это был или директория
+	Path  Path        // путь изменившейся записи
+	Size  FileSize    // новый размер (для удаления не значим)
+	Mtime UnixSeconds // новое время модификации
 }
 
 func (EventFs) Type() Msg { return MsgEventFs }
@@ -610,9 +667,11 @@ func decodeEventFs(r *reader) (EventFs, error) {
 	return m, nil
 }
 
+// EventNotice — произвольное текстовое уведомление сервера клиенту (SubNotice):
+// например, предупреждение об скорой остановке. Severity задаёт цвет/важность.
 type EventNotice struct {
-	Severity Severity
-	Text     string
+	Severity Severity // info / warn / error
+	Text     string   // текст уведомления
 }
 
 func (EventNotice) Type() Msg { return MsgEventNotice }
@@ -633,9 +692,11 @@ func decodeEventNotice(r *reader) (EventNotice, error) {
 	return m, nil
 }
 
+// EventConfig — push-уведомление о том, что админ поменял настройку (SubConfig).
+// Клиенты узнают об изменении лимитов и т.п. без опроса.
 type EventConfig struct {
-	Key      string
-	NewValue string
+	Key      string // какой параметр изменился, напр. «limits.per_client_bps»
+	NewValue string // его новое значение (строкой)
 }
 
 func (EventConfig) Type() Msg { return MsgEventConfig }
@@ -657,13 +718,15 @@ func decodeEventConfig(r *reader) (EventConfig, error) {
 
 // ---- Admin ----
 
+// AdminGetConfig — админ запрашивает текущий эффективный конфиг. Тело пустое.
 type AdminGetConfig struct{}
 
 func (AdminGetConfig) Type() Msg        { return MsgAdminGetConfig }
 func (AdminGetConfig) encode(w *writer) {}
 
-// AdminConfig carries the effective config as JSON, prefixed with a u32 length
-// (the one message that may exceed 64 KiB — docs/tz/09-go-port.md §4.2).
+// AdminConfig несёт действующий конфиг как JSON с префиксом длины u32 —
+// единственное сообщение, которому разрешено превышать 64 КиБ
+// (docs/tz/09-go-port.md §4.2).
 type AdminConfig struct{ JSON []byte }
 
 func (AdminConfig) Type() Msg { return MsgAdminConfig }
@@ -680,9 +743,11 @@ func decodeAdminConfig(r *reader) (AdminConfig, error) {
 	return AdminConfig{JSON: b}, err
 }
 
+// AdminSet — админ меняет одну настройку на лету. Сервер валидирует, атомарно
+// подменяет снапшот настроек, пишет конфиг на диск и рассылает EventConfig.
 type AdminSet struct {
-	Key   string
-	Value string
+	Key   string // имя параметра
+	Value string // новое значение (строкой; сервер разберёт по типу параметра)
 }
 
 func (AdminSet) Type() Msg { return MsgAdminSet }
@@ -702,9 +767,11 @@ func decodeAdminSet(r *reader) (AdminSet, error) {
 	return m, nil
 }
 
+// AdminSetResult — результат ADMIN_SET: применилось ли изменение и пояснение
+// (например, почему значение отвергнуто валидацией).
 type AdminSetResult struct {
-	OK      bool
-	Message string
+	OK      bool   // применилось ли
+	Message string // пояснение
 }
 
 func (AdminSetResult) Type() Msg { return MsgAdminSetResult }
@@ -725,22 +792,26 @@ func decodeAdminSetResult(r *reader) (AdminSetResult, error) {
 	return m, nil
 }
 
+// AdminListClients — админ запрашивает список подключённых клиентов. Тело пустое;
+// ответ — AdminClients.
 type AdminListClients struct{}
 
 func (AdminListClients) Type() Msg        { return MsgAdminListClients }
 func (AdminListClients) encode(w *writer) {}
 
-// ClientInfo is one entry of ADMIN_CLIENTS.
+// ClientInfo — одна строка списка ADMIN_CLIENTS: сводка по подключённому
+// клиенту, которую видит админ в панели (F9).
 type ClientInfo struct {
-	SessionID   uint64
-	Login       string
-	IP          string
-	Role        Role
-	CurrentPath string
-	BytesSent   uint64
-	SpeedBps    uint64
+	SessionID   SessionID      // номер сессии (по нему делают kick)
+	Login       Login          // под какой учёткой вошёл
+	IP          ClientAddr     // сетевой адрес
+	Role        Role           // уровень доступа
+	CurrentPath Path           // где сейчас «находится» (последний LIST_DIR)
+	BytesSent   ByteCount      // сколько всего байт ему отдано
+	SpeedBps    BytesPerSecond // текущая измеренная скорость
 }
 
+// AdminClients — ответ на ADMIN_LIST_CLIENTS: список сводок по всем сессиям.
 type AdminClients struct{ Clients []ClientInfo }
 
 func (AdminClients) Type() Msg { return MsgAdminClients }
@@ -796,7 +867,8 @@ func decodeAdminClients(r *reader) (AdminClients, error) {
 	return m, nil
 }
 
-type AdminKick struct{ SessionID uint64 }
+// AdminKick — админ принудительно отключает сессию по её номеру.
+type AdminKick struct{ SessionID SessionID }
 
 func (AdminKick) Type() Msg          { return MsgAdminKick }
 func (m AdminKick) encode(w *writer) { w.u64(m.SessionID) }
@@ -805,9 +877,11 @@ func decodeAdminKick(r *reader) (AdminKick, error) {
 	return AdminKick{SessionID: id}, err
 }
 
+// AdminKickResult — результат ADMIN_KICK: нашлась ли такая сессия и была ли
+// отключена.
 type AdminKickResult struct {
-	OK      bool
-	Message string
+	OK      bool   // была ли сессия найдена и отключена
+	Message string // пояснение
 }
 
 func (AdminKickResult) Type() Msg { return MsgAdminKickResult }
@@ -828,21 +902,26 @@ func decodeAdminKickResult(r *reader) (AdminKickResult, error) {
 	return m, nil
 }
 
+// AdminStats — админ запрашивает сводную статистику. Тело пустое; ответ —
+// AdminStatsResponse.
 type AdminStats struct{}
 
 func (AdminStats) Type() Msg        { return MsgAdminStats }
 func (AdminStats) encode(w *writer) {}
 
+// AdminStatsResponse — сводная статистика сервера для админ-панели: время
+// работы, суммарный трафик, число завершённых передач, активные соединения и
+// закачки, сколько файлов раздаётся, текущие лимиты скорости и версия сервера.
 type AdminStatsResponse struct {
-	UptimeS         uint64
-	BytesSent       uint64
-	Completed       uint64
-	ActiveConns     uint64
-	ActiveDownloads uint64
-	SharedFiles     uint64
-	PerClientBps    uint64
-	GlobalBps       uint64
-	Version         string
+	UptimeS         DurationSeconds // время работы демона, секунды
+	BytesSent       ByteCount       // всего отдано байт с момента старта
+	Completed       Count           // сколько передач завершено успешно
+	ActiveConns     Count           // сейчас открытых сессий
+	ActiveDownloads Count           // сейчас идущих закачек
+	SharedFiles     Count           // сколько файлов в раздаче (обычных, не папок)
+	PerClientBps    BytesPerSecond  // текущий лимит на одного клиента (0 — без лимита)
+	GlobalBps       BytesPerSecond  // текущий общий лимит (0 — без лимита)
+	Version         string          // версия сервера
 }
 
 func (AdminStatsResponse) Type() Msg { return MsgAdminStatsResp }
@@ -874,7 +953,9 @@ func decodeAdminStatsResponse(r *reader) (AdminStatsResponse, error) {
 	return m, nil
 }
 
-type AdminShutdown struct{ GraceSeconds uint32 }
+// AdminShutdown — админ инициирует остановку сервера. GraceSeconds — сколько
+// дать активным передачам доиграть перед принудительным закрытием сокетов.
+type AdminShutdown struct{ GraceSeconds GracePeriodSeconds }
 
 func (AdminShutdown) Type() Msg          { return MsgAdminShutdown }
 func (m AdminShutdown) encode(w *writer) { w.u32(m.GraceSeconds) }
@@ -883,9 +964,11 @@ func decodeAdminShutdown(r *reader) (AdminShutdown, error) {
 	return AdminShutdown{GraceSeconds: g}, err
 }
 
+// AdminShutdownResult — подтверждение приёма ADMIN_SHUTDOWN: сервер начал
+// graceful-остановку.
 type AdminShutdownResult struct {
-	OK      bool
-	Message string
+	OK      bool   // принята ли команда
+	Message string // пояснение
 }
 
 func (AdminShutdownResult) Type() Msg { return MsgAdminShutdownResult }
@@ -906,14 +989,17 @@ func decodeAdminShutdownResult(r *reader) (AdminShutdownResult, error) {
 	return m, nil
 }
 
+// AdminReloadUsers — админ просит перечитать users.json без перезапуска. Сессии
+// пользователей, ставших отключёнными/удалёнными, при этом сбрасываются.
 type AdminReloadUsers struct{}
 
 func (AdminReloadUsers) Type() Msg        { return MsgAdminReloadUsers }
 func (AdminReloadUsers) encode(w *writer) {}
 
+// AdminReloadUsersResult — результат ADMIN_RELOAD_USERS.
 type AdminReloadUsersResult struct {
-	OK      bool
-	Message string
+	OK      bool   // успешно ли перечитано
+	Message string // пояснение (например, сколько учёток загружено)
 }
 
 func (AdminReloadUsersResult) Type() Msg { return MsgAdminReloadUsersRes }

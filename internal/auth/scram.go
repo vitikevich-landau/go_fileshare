@@ -1,7 +1,11 @@
-// Package auth implements the SCRAM-like challenge/response used by fileshare
-// v2. The password never crosses the wire, and theft of users.json (which holds
-// only StoredKey) does not let an attacker authenticate
-// (docs/tz/09-go-port.md §5.3, docs/tz/06-security.md §3).
+// Package auth реализует SCRAM-подобную аутентификацию challenge–response
+// fileshare v2. Пароль не пересекает сеть, а кража users.json (в нём лежит лишь
+// StoredKey) не позволяет атакующему войти (docs/tz/09-go-port.md §5.3,
+// docs/tz/06-security.md §3).
+//
+// Полная цепочка ключей (password → SaltedPassword → ClientKey → StoredKey),
+// формула ClientProof и словарь типов описаны в types.go — прочитайте его, чтобы
+// не путать одинаковые по размеру, но разные по смыслу 32-байтные значения.
 package auth
 
 import (
@@ -9,28 +13,28 @@ import (
 	"crypto/pbkdf2"
 	"crypto/sha256"
 	"crypto/subtle"
-
-	"github.com/vitikevich-landau/go_fileshare/internal/proto"
 )
 
-// DefaultIters is the default PBKDF2 iteration count for new users. The server
-// announces the effective value in HELLO_OK so the client derives with the same
-// parameter. Set to the security floor per docs/tz/06-security.md §2.
+// DefaultIters — число итераций PBKDF2 по умолчанию для новых пользователей.
+// Сервер объявляет действующее значение в HELLO_OK, чтобы клиент вывел ключ с тем
+// же параметром. Установлено на порог безопасности из docs/tz/06-security.md §2.
 const DefaultIters = 600_000
 
 const clientKeyLabel = "Client Key"
 
-// saltFor returns the deterministic per-login salt.
-func saltFor(login string) []byte {
+// saltFor возвращает детерминированную соль для логина. Соль привязана к логину,
+// поэтому одинаковый пароль у разных пользователей даёт разные ключи.
+func saltFor(login Login) []byte {
 	return []byte("fileshare-v2:" + login)
 }
 
-// saltedPassword = PBKDF2-HMAC-SHA256(password, salt, iters, dkLen=32).
-func saltedPassword(password, login string, iters int) [32]byte {
+// saltedPassword = PBKDF2-HMAC-SHA256(password, salt, iters, dkLen=32) — первое
+// звено цепочки: «растягивает» пароль, делая перебор дорогим.
+func saltedPassword(password Password, login Login, iters Iterations) ScramKey {
 	dk, err := pbkdf2.Key(sha256.New, password, saltFor(login), iters, 32)
 	if err != nil {
-		// pbkdf2.Key only errors on an out-of-range keyLength, which is fixed
-		// at 32 here, so this is unreachable.
+		// pbkdf2.Key ошибается лишь при некорректной длине ключа, а она тут
+		// зафиксирована в 32 — значит, ветка недостижима.
 		panic("auth: pbkdf2: " + err.Error())
 	}
 	var out [32]byte
@@ -38,62 +42,71 @@ func saltedPassword(password, login string, iters int) [32]byte {
 	return out
 }
 
-// ClientKey = HMAC-SHA256(SaltedPassword, "Client Key").
-func ClientKey(password, login string, iters int) [32]byte {
+// ClientKey = HMAC-SHA256(SaltedPassword, "Client Key"). Это значение и подмешивается
+// в доказательство; в базе его НЕТ.
+func ClientKey(password Password, login Login, iters Iterations) ScramKey {
 	sp := saltedPassword(password, login, iters)
 	m := hmac.New(sha256.New, sp[:])
 	m.Write([]byte(clientKeyLabel))
-	var out [32]byte
+	var out ScramKey
 	copy(out[:], m.Sum(nil))
 	return out
 }
 
-// storedKeyFrom returns SHA256(ClientKey).
-func storedKeyFrom(clientKey [32]byte) [32]byte {
+// storedKeyFrom возвращает SHA256(ClientKey) — необратимый «отпечаток» ClientKey.
+func storedKeyFrom(clientKey ScramKey) ScramKey {
 	return sha256.Sum256(clientKey[:])
 }
 
-// StoredKey = SHA256(ClientKey) — the verifier persisted in users.json.
-func StoredKey(password, login string, iters int) [32]byte {
+// StoredKey = SHA256(ClientKey) — верификатор, который хранится в users.json.
+func StoredKey(password Password, login Login, iters Iterations) ScramKey {
 	return storedKeyFrom(ClientKey(password, login, iters))
 }
 
-// authMessage = challenge || login.
-func authMessage(challenge []byte, login string) []byte {
+// authMessage = challenge || login — данные, которые обе стороны подписывают
+// StoredKey, чтобы доказательство было привязано и к вызову, и к логину.
+func authMessage(challenge []byte, login Login) []byte {
 	msg := make([]byte, 0, len(challenge)+len(login))
 	msg = append(msg, challenge...)
 	msg = append(msg, login...)
 	return msg
 }
 
-// hmacStored = HMAC-SHA256(StoredKey, AuthMessage).
-func hmacStored(storedKey [32]byte, challenge []byte, login string) [32]byte {
+// hmacStored = HMAC-SHA256(StoredKey, authMessage). Общий «замок», который умеют
+// посчитать обе стороны: клиент — чтобы спрятать ClientKey, сервер — чтобы его
+// восстановить.
+func hmacStored(storedKey ScramKey, challenge []byte, login Login) ScramKey {
 	m := hmac.New(sha256.New, storedKey[:])
 	m.Write(authMessage(challenge, login))
-	var out [32]byte
+	var out ScramKey
 	copy(out[:], m.Sum(nil))
 	return out
 }
 
-func xor32(a, b [32]byte) [32]byte {
-	var out [32]byte
+// xor32 — побайтовый XOR двух 32-байтных значений (обратимая «маскировка»:
+// a XOR b XOR b == a — на этом и держится восстановление ClientKey в Verify).
+func xor32(a, b ScramKey) ScramKey {
+	var out ScramKey
 	for i := range out {
 		out[i] = a[i] ^ b[i]
 	}
 	return out
 }
 
-// Proof computes ClientProof = ClientKey XOR HMAC-SHA256(StoredKey, challenge||login).
-// This is what the client places in AUTH_REQUEST.
-func Proof(password, login string, iters int, challenge []byte) [proto.ProofLen]byte {
+// Proof вычисляет ClientProof = ClientKey XOR HMAC-SHA256(StoredKey, challenge||login).
+// Именно это клиент кладёт в AUTH_REQUEST: ClientKey «замаскирован» замком,
+// который без StoredKey не снять.
+func Proof(password Password, login Login, iters Iterations, challenge []byte) ClientProof {
 	ck := ClientKey(password, login, iters)
 	sk := storedKeyFrom(ck)
 	return xor32(ck, hmacStored(sk, challenge, login))
 }
 
-// Verify reports whether proof authenticates against storedKey for the given
-// challenge and login. The final comparison is constant-time.
-func Verify(storedKey [proto.ChecksumLen]byte, challenge []byte, login string, proof [proto.ProofLen]byte) bool {
+// Verify сообщает, аутентифицирует ли proof владельца storedKey для данных
+// challenge и login. Идея: сняв тот же замок (XOR с hmacStored), восстанавливаем
+// кандидат в ClientKey, берём его SHA256 и сверяем с хранимым StoredKey. Финальное
+// сравнение — КОНСТАНТНОГО ВРЕМЕНИ, чтобы по длительности нельзя было подбирать байты.
+func Verify(storedKey ScramKey, challenge []byte, login Login, proof ClientProof) bool {
 	recovered := xor32(proof, hmacStored(storedKey, challenge, login))
 	check := storedKeyFrom(recovered)
 	return subtle.ConstantTimeCompare(check[:], storedKey[:]) == 1

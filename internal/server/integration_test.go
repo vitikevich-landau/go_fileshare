@@ -24,11 +24,11 @@ import (
 const testIters = 4096
 
 type env struct {
-	addr   string
-	share  string
-	hub    *config.Hub
-	users  *auth.DB
-	guard  *auth.Guard
+	addr      string
+	share     string
+	hub       *config.Hub
+	users     *auth.DB
+	guard     *auth.Guard
 	cancel    context.CancelFunc
 	done      chan struct{}
 	logs      *syncBuffer

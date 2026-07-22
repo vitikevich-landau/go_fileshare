@@ -1,7 +1,10 @@
-// Package watcher turns filesystem changes under the share root into debounced
-// protocol events. It wraps fsnotify (cross-platform) and adds the recursive
-// watching and debouncing the C++ reference did by hand
+// Package watcher превращает изменения файлов под корнем раздачи в debounced
+// (схлопнутые) события протокола. Оборачивает fsnotify (кроссплатформенно) и
+// добавляет рекурсивное слежение и debounce, которые эталон на C++ делал вручную
 // (docs/tz/09-go-port.md §5.7).
+//
+// Рекурсивное слежение, схлопывание событий и словарь путей (RealPath vs
+// VirtualPath) подробно описаны в types.go.
 package watcher
 
 import (
@@ -17,35 +20,38 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/proto"
 )
 
-// Event is a debounced change under the root, expressed with a virtual path.
+// Event — схлопнутое изменение под корнем, выраженное ВИРТУАЛЬНЫМ путём. Именно
+// из него сервер собирает proto.EventFs для рассылки подписчикам.
 type Event struct {
-	Op    proto.FsOp
-	Kind  proto.Kind
-	VPath string
-	Size  uint64
-	Mtime uint64
+	Op    proto.FsOp  // создан / изменён / удалён
+	Kind  proto.Kind  // файл или директория
+	VPath VirtualPath // путь от корня раздачи
+	Size  uint64      // размер в байтах (для удаления не значим)
+	Mtime uint64      // mtime в unix-секундах
 }
 
-// Watcher observes the share root recursively and calls onEvent for each
-// debounced change.
+// Watcher рекурсивно наблюдает за корнем раздачи и вызывает onEvent на каждое
+// схлопнутое изменение.
 type Watcher struct {
-	root     string
-	debounce time.Duration
-	onEvent  func(Event)
+	root     RealPath      // абсолютный путь корня на настоящей ФС
+	debounce time.Duration // пауза схлопывания событий
+	onEvent  func(Event)   // куда отдавать готовое событие
 
 	fsw *fsnotify.Watcher
 
-	mu      sync.Mutex
-	pending map[string]*pending // keyed by real path
+	mu      sync.Mutex          // защищает pending
+	pending map[string]*pending // ключ — RealPath; отложенные (ещё не схлопнутые) события
 }
 
+// pending — одно отложенное событие: таймер debounce плюс флаг «это было создание»
+// (чтобы после схлопывания отличить FsCreated от FsModified).
 type pending struct {
 	timer   *time.Timer
 	created bool
 }
 
-// New creates a watcher rooted at root. It does not start observing until Start.
-func New(root string, debounce time.Duration, onEvent func(Event)) (*Watcher, error) {
+// New создаёт watcher с корнем root. Наблюдение не начинается до вызова Start.
+func New(root RealPath, debounce time.Duration, onEvent func(Event)) (*Watcher, error) {
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -69,7 +75,9 @@ func New(root string, debounce time.Duration, onEvent func(Event)) (*Watcher, er
 	return w, nil
 }
 
-// Start runs the event loop until ctx is cancelled, then closes the watcher.
+// Start запускает цикл событий в отдельной горутине до отмены ctx, затем
+// закрывает watcher. Ошибки fsnotify молча дренируются: одна сбойная запись не
+// должна убивать всё слежение.
 func (w *Watcher) Start(ctx context.Context) {
 	go func() {
 		defer w.fsw.Close()
@@ -91,10 +99,10 @@ func (w *Watcher) Start(ctx context.Context) {
 	}()
 }
 
-// removeWatchTree drops the watch on dir and on every still-registered
-// descendant directory, so removing/renaming a non-empty subtree does not leak
-// the per-subdir watches that addRecursive created.
-func (w *Watcher) removeWatchTree(dir string) {
+// removeWatchTree снимает слежение с dir и со всех ещё зарегистрированных
+// поддиректорий, чтобы удаление/переименование непустого поддерева не оставляло
+// «утёкшие» подписки на подкаталоги, которые создал addRecursive.
+func (w *Watcher) removeWatchTree(dir RealPath) {
 	_ = w.fsw.Remove(dir)
 	prefix := dir + string(os.PathSeparator)
 	for _, p := range w.fsw.WatchList() {
@@ -104,11 +112,12 @@ func (w *Watcher) removeWatchTree(dir string) {
 	}
 }
 
-// addRecursive registers dir and all of its subdirectories.
-func (w *Watcher) addRecursive(dir string) error {
+// addRecursive подписывается на dir и все её поддиректории (fsnotify не
+// рекурсивен, поэтому обходим дерево сами).
+func (w *Watcher) addRecursive(dir RealPath) error {
 	return filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return nil // skip unreadable entries, keep walking
+			return nil // пропускаем нечитаемые записи, продолжаем обход
 		}
 		if d.IsDir() {
 			_ = w.fsw.Add(path)
@@ -118,18 +127,18 @@ func (w *Watcher) addRecursive(dir string) error {
 }
 
 func (w *Watcher) handle(ev fsnotify.Event) {
-	// A newly created directory must be watched too (fsnotify is not recursive),
-	// including any children created before we added it.
+	// Только что созданную директорию тоже нужно начать слушать (fsnotify не
+	// рекурсивен), включая детей, созданных до того, как мы её добавили.
 	if ev.Op&fsnotify.Create != 0 {
 		if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
 			_ = w.addRecursive(ev.Name)
 		}
 	}
 
-	// A removed or renamed-away path may have been a watched directory with
-	// watched descendants (addRecursive watches each subdir). Drop the whole
-	// subtree explicitly so the fsnotify watch set stays bounded rather than
-	// relying on backend auto-removal (§8 bug 15, remove-half).
+	// Удалённый или переименованный путь мог быть отслеживаемой директорией с
+	// отслеживаемыми потомками (addRecursive слушает каждый подкаталог). Явно
+	// снимаем всё поддерево, чтобы набор подписок fsnotify оставался ограниченным,
+	// а не полагаемся на авто-удаление в бэкенде (§8 bug 15, remove-half).
 	if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 		w.removeWatchTree(ev.Name)
 	}
@@ -153,7 +162,10 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 	w.mu.Unlock()
 }
 
-func (w *Watcher) emit(realPath string) {
+// emit вызывается таймером debounce: снимает отложенную запись, определяет тип
+// изменения (создан/изменён/удалён) по актуальному состоянию файла и отдаёт
+// готовое Event наружу. Если путь уже вне корня — событие не рождается.
+func (w *Watcher) emit(realPath RealPath) {
 	w.mu.Lock()
 	p := w.pending[realPath]
 	delete(w.pending, realPath)
@@ -169,7 +181,7 @@ func (w *Watcher) emit(realPath string) {
 
 	info, err := os.Stat(realPath)
 	if err != nil {
-		// Gone: a removal (or rename away).
+		// Пути больше нет: удаление (или переименование прочь).
 		w.onEvent(Event{Op: proto.FsRemoved, Kind: proto.KindFile, VPath: vpath})
 		return
 	}
@@ -195,9 +207,9 @@ func (w *Watcher) emit(realPath string) {
 	})
 }
 
-// vpathOf converts a real path to a virtual path (slash-separated, rooted at
-// "/"), or "" if it lies outside the root.
-func (w *Watcher) vpathOf(realPath string) string {
+// vpathOf переводит настоящий путь в виртуальный (разделитель «/», от корня «/»)
+// или "" если путь лежит вне корня. Это шаг RealPath → VirtualPath из types.go.
+func (w *Watcher) vpathOf(realPath RealPath) VirtualPath {
 	rel, err := filepath.Rel(w.root, realPath)
 	if err != nil {
 		return ""
