@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,10 +31,30 @@ type env struct {
 	guard  *auth.Guard
 	cancel context.CancelFunc
 	done   chan struct{}
+	logs   *syncBuffer
 }
 
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// syncBuffer is a goroutine-safe log sink so tests can assert on audit lines
+// while the server keeps writing from its connection goroutines.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
 }
 
 func makeFile(t *testing.T, path string, size int) []byte {
@@ -83,9 +105,11 @@ func newEnvWithConfig(t *testing.T, configPath string, configure func(*config.Se
 	}
 	guard := auth.NewGuard(3)
 
+	logs := &syncBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	srv := server.New(server.Options{
 		Hub: hub, VFS: v, Users: users, Guard: guard,
-		Logger: quietLogger(), ServerName: "test", AuthFailDelay: 0,
+		Logger: logger, ServerName: "test", AuthFailDelay: 0,
 		ConfigPath: configPath,
 	})
 	if err := srv.Listen("127.0.0.1:0"); err != nil {
@@ -102,7 +126,7 @@ func newEnvWithConfig(t *testing.T, configPath string, configure func(*config.Se
 		<-done
 		v.Close()
 	})
-	return &env{addr: srv.Addr().String(), share: share, hub: hub, users: users, guard: guard, cancel: cancel, done: done}
+	return &env{addr: srv.Addr().String(), share: share, hub: hub, users: users, guard: guard, cancel: cancel, done: done, logs: logs}
 }
 
 func dialNoAuth(t *testing.T, e *env) *client.Client {
@@ -113,6 +137,23 @@ func dialNoAuth(t *testing.T, e *env) *client.Client {
 	}
 	t.Cleanup(func() { c.Close() })
 	return c
+}
+
+func TestAuthFailureIsAudited(t *testing.T) {
+	e := newEnv(t, nil)
+	e.users.SetUser("vit", proto.RoleUser, "correct", testIters)
+
+	// A wrong password must be refused AND recorded (docs/tz/06-security.md §5).
+	if _, err := client.Dial(e.addr, client.Options{Login: "vit", Password: "wrong"}); err == nil {
+		t.Fatal("expected auth to fail with a wrong password")
+	}
+	logs := e.logs.String()
+	if !strings.Contains(logs, "authentication failed") {
+		t.Fatalf("failed authentication was not audited:\n%s", logs)
+	}
+	if !strings.Contains(logs, "login=vit") || !strings.Contains(logs, "reason=bad_credentials") {
+		t.Fatalf("audit line missing login/reason:\n%s", logs)
+	}
 }
 
 func TestNoAuthListStatChecksumDownload(t *testing.T) {
