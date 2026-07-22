@@ -105,7 +105,7 @@ func (s *Server) adminKick(sess *Session, req proto.AdminKick) {
 
 func (s *Server) adminStats(sess *Session) {
 	lim := s.hub.Current().Limits
-	files, bytes := s.vfs.ShareStats() // cached; walks in the background at most every 30s
+	files, _ := s.vfs.ShareStats() // cached; walks in the background at most every 30s
 	sess.sendMsg(proto.AdminStatsResponse{
 		UptimeS:         uint64(time.Since(s.start).Seconds()),
 		BytesSent:       s.bytesSent.Load(),
@@ -113,7 +113,6 @@ func (s *Server) adminStats(sess *Session) {
 		ActiveConns:     uint64(s.activeConns.Load()),
 		ActiveDownloads: uint64(s.activeDownloads.Load()),
 		SharedFiles:     files,
-		SharedBytes:     bytes,
 		PerClientBps:    lim.PerClientBps,
 		GlobalBps:       lim.GlobalBps,
 		Version:         s.version,
