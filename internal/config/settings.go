@@ -35,8 +35,8 @@ type ChecksumSettings struct {
 }
 
 type EventsSettings struct {
-	Enabled    bool `json:"enabled"`     // hot
-	DebounceMs int  `json:"debounce_ms"` // hot
+	Enabled    bool `json:"enabled"`     // restart (watcher built once at startup)
+	DebounceMs int  `json:"debounce_ms"` // restart (watcher built once at startup)
 }
 
 type AuthSettings struct {

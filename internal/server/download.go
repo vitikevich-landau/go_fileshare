@@ -49,9 +49,13 @@ func (s *Server) startDownload(sess *Session, req proto.DownloadRequest) {
 		ctx, ctxCancel := context.WithCancel(context.Background())
 		defer ctxCancel()
 		go func() {
+			// ctx.Done() is included so this watcher exits when the transfer
+			// finishes normally (outer defer ctxCancel), not just on cancel/
+			// teardown — otherwise it would leak one goroutine per download.
 			select {
 			case <-cancel:
 			case <-sess.done:
+			case <-ctx.Done():
 			}
 			ctxCancel()
 		}()
@@ -83,7 +87,14 @@ func (s *Server) streamFile(ctx context.Context, sess *Session, f *os.File, req 
 			return
 		default:
 		}
-		n, err := f.Read(buf)
+		// Clamp the read to the announced remaining size so a file appended to
+		// mid-transfer never makes us overshoot total_size (which the client
+		// rejects); we deliver exactly the originally-announced prefix.
+		toRead := buf
+		if rem := total - sent; rem < uint64(len(buf)) {
+			toRead = buf[:rem]
+		}
+		n, err := f.Read(toRead)
 		if n > 0 {
 			// Rate-limit against the CURRENT limits so a live config change
 			// throttles this active transfer (docs/tz/09-go-port.md §5.6).

@@ -198,6 +198,12 @@ func (v *VFS) List(vpath string) (string, []proto.DirEntry, error) {
 	entries := make([]proto.DirEntry, 0, len(dirents))
 	for _, de := range dirents {
 		name := de.Name()
+		// The wire caps a name at MaxNameLen bytes; a longer one (possible on
+		// NTFS for multi-byte unicode names) would make the peer reject the
+		// whole listing frame, so hide it rather than poison the response.
+		if len(name) > proto.MaxNameLen {
+			continue
+		}
 		var info fs.FileInfo
 		if de.Type()&fs.ModeSymlink != 0 {
 			// Resolve through the root; hide links that escape or dangle.

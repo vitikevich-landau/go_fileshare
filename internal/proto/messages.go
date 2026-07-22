@@ -511,6 +511,9 @@ func decodeChunkData(r *reader) (ChunkData, error) {
 		return m, err
 	}
 	m.Data = r.rest()
+	if len(m.Data) > ChunkSize {
+		return m, fmt.Errorf("proto: chunk data %d exceeds ChunkSize %d", len(m.Data), ChunkSize)
+	}
 	return m, nil
 }
 

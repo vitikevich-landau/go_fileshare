@@ -52,6 +52,11 @@ var restartKeys = map[string]bool{
 	"checksum.cache_file": true,
 	"auth.pbkdf2_iters":   true,
 	"auth.users_file":     true,
+	// The watcher is constructed once at startup and never re-reads its
+	// debounce, so treat it as restart-only rather than silently accepting a
+	// change that has no runtime effect.
+	"events.debounce_ms": true,
+	"events.enabled":     true,
 }
 
 // Set changes one hot key to value, validates the resulting snapshot, and swaps
@@ -144,12 +149,6 @@ func applyKey(s *Settings, key, value string) error {
 			return err
 		}
 		s.Limits.AuthFailBanS = v
-	case "events.debounce_ms":
-		v, err := nonNegInt()
-		if err != nil {
-			return err
-		}
-		s.Events.DebounceMs = v
 	case "server.motd":
 		s.Server.Motd = value
 	case "log.level":

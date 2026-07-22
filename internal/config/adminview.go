@@ -26,7 +26,7 @@ func (s Settings) AdminView() []KeyInfo {
 		{"limits.handshake_timeout_s", i(s.Limits.HandshakeTimeoutS), true},
 		{"limits.idle_timeout_s", i(s.Limits.IdleTimeoutS), true},
 		{"limits.auth_fail_ban_s", i(s.Limits.AuthFailBanS), true},
-		{"events.debounce_ms", i(s.Events.DebounceMs), true},
+		{"events.debounce_ms", i(s.Events.DebounceMs), false},
 		{"auth.pbkdf2_iters", i(s.Auth.PBKDF2Iters), false},
 		{"log.level", s.Log.Level, true},
 	}

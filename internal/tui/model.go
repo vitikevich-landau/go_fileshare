@@ -605,7 +605,13 @@ func (m *Model) startNext() {
 		var last uint64
 		err := c.Download(job.remote, job.local, func(p client.Progress) {
 			last = p.Total
-			ev <- progressMsg{name: job.name, received: p.Received, total: p.Total}
+			// Non-blocking: never stall while holding clientMu even if the UI
+			// loop is momentarily not draining (a dropped progress tick is
+			// harmless; the next one or the done message corrects it).
+			select {
+			case ev <- progressMsg{name: job.name, received: p.Received, total: p.Total}:
+			default:
+			}
 		})
 		m.clientMu.Unlock()
 		if err != nil {
@@ -618,14 +624,16 @@ func (m *Model) startNext() {
 
 func (m *Model) quit() tea.Cmd {
 	m.stopPump()
+	// m.client is only ever assigned on this (Update) goroutine, so reading it
+	// here is safe without clientMu — which matters because an in-flight
+	// download goroutine holds clientMu for its whole transfer. Closing the
+	// connection directly unblocks that download's read so it returns promptly.
 	if m.client != nil {
 		pr := m.profile
 		pr.LastSeen = time.Now().Unix()
 		m.profiles.Upsert(pr)
 		_ = m.profiles.Save()
-		m.clientMu.Lock()
 		m.client.Close()
-		m.clientMu.Unlock()
 	}
 	m.quitting = true
 	return tea.Quit
