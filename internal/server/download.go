@@ -149,11 +149,38 @@ func (s *Server) streamFile(ctx context.Context, sess *Session, f *os.File, req 
 	// The server always sends the checksum of the whole file; on a resumed
 	// download the client verifies the reassembled file against it. If the
 	// checksum cannot be computed we must NOT claim success — send an error so
-	// the client never publishes an unverifiable file.
-	_, algo, sum, cerr := s.vfs.Checksum(req.Path)
-	if cerr != nil || algo != proto.AlgoSHA256 {
+	// the client never publishes an unverifiable file. The hash is ctx-aware so a
+	// cancel that lands during a cache-miss checksum of a large file aborts it
+	// promptly instead of blocking for minutes (R4-3).
+	_, algo, sum, cerr := s.vfs.ChecksumCtx(ctx, req.Path)
+	if cerr != nil {
+		// A cancel/teardown during the checksum: on a client cancel send the
+		// terminal CANCELLED frame (keeps the connection in sync); on teardown
+		// just stop. Any other checksum failure is an internal error.
+		if ctx.Err() != nil {
+			select {
+			case <-cancel:
+				s.sendErr(sess, proto.ErrCancelled)
+			default:
+			}
+			return
+		}
 		s.sendErr(sess, proto.ErrInternal)
 		return
+	}
+	if algo != proto.AlgoSHA256 {
+		s.sendErr(sess, proto.ErrInternal)
+		return
+	}
+	// A cancel that arrived after the checksum but before DONE still wins, so a
+	// cancelled transfer never reports success (R4-3).
+	select {
+	case <-cancel:
+		s.sendErr(sess, proto.ErrCancelled)
+		return
+	case <-sess.done:
+		return
+	default:
 	}
 	if sess.sendMsg(proto.DownloadDone{TransferID: tid, Algo: algo, Checksum: sum}) {
 		s.completed.Add(1)
