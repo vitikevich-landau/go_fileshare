@@ -133,13 +133,12 @@ func (s *Server) authenticate(sess *Session, req proto.AuthRequest, cur *config.
 		return false
 	}
 
-	// Enforce the per-user session cap before admitting.
-	if cur.Limits.MaxSessionsPerUser > 0 && s.reg.countUser(req.Login) >= cur.Limits.MaxSessionsPerUser {
+	// Atomically enforce the per-user session cap and mark authenticated, so
+	// concurrent logins for one user cannot all pass the check (CR-06).
+	if !s.reg.reserveUserSlot(sess, req.Login, role, cur.Limits.MaxSessionsPerUser) {
 		sess.sendMsg(proto.AuthFail{Reason: proto.AuthFailTooManySession, Message: "too many concurrent sessions"})
 		return false
 	}
-
-	sess.setAuthed(req.Login, role)
 	s.guard.Success(sess.IP)
 	sess.sendMsg(proto.AuthOk{Role: role, SessionID: sess.ID, Motd: cur.Server.Motd})
 	return true

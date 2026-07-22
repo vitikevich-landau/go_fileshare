@@ -225,17 +225,26 @@ func (r *Registry) count() int {
 	return n
 }
 
-// countUser returns how many authenticated sessions share the given login.
-func (r *Registry) countUser(login string) int {
+// reserveUserSlot atomically enforces the per-user session cap and, if there is
+// room, marks sess authenticated — so concurrent handshakes for one user cannot
+// all slip past the check before any of them commits (CR-06). max <= 0 means no
+// limit. It returns whether the slot was granted.
+func (r *Registry) reserveUserSlot(sess *Session, login string, role proto.Role, max int) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	n := 0
-	for _, s := range r.sessions {
-		if s.Authed() && s.Login() == login {
-			n++
+	if max > 0 {
+		n := 0
+		for _, s := range r.sessions {
+			if s != sess && s.Authed() && s.Login() == login {
+				n++
+			}
+		}
+		if n >= max {
+			return false
 		}
 	}
-	return n
+	sess.setAuthed(login, role)
+	return true
 }
 
 // closeAll force-closes every session's socket (used on shutdown after grace).
