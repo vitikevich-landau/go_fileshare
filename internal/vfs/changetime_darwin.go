@@ -7,11 +7,11 @@ import (
 	"syscall"
 )
 
-// changeTimeNanos returns the inode change time (ctime) in nanoseconds and true.
-// Like the Linux path, ctime moves on any content or metadata change, so it
-// invalidates the checksum cache even when a replacement preserves the mtime
-// (RR-5, R3-5). ok is false only if the platform stat is unexpectedly
-// unavailable, in which case the caller must not trust a cache hit.
+// changeTimeNanos возвращает время изменения inode (ctime) в наносекундах и
+// true. Как и на Linux, ctime сдвигается при любом изменении содержимого или
+// метаданных, поэтому сбрасывает checksum-кэш, даже если подмена сохранила mtime
+// (RR-5, R3-5). ok == false только если stat платформы неожиданно недоступен —
+// тогда вызывающий не должен доверять попаданию в кэш.
 func changeTimeNanos(info fs.FileInfo) (int64, bool) {
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {
 		return int64(st.Ctimespec.Sec)*1_000_000_000 + int64(st.Ctimespec.Nsec), true

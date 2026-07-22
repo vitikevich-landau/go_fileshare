@@ -1,10 +1,13 @@
-// Package vfs serves a directory tree confined to a share root.
+// Package vfs раздаёт дерево каталогов, запертое внутри корня раздачи
+// (share-root).
 //
-// Path confinement is delegated to os.Root (Go 1.24+), which keeps every
-// operation beneath the root even in the presence of ".." components or
-// symlinks pointing outside — this replaces the hand-rolled openat2/realpath
-// logic of the C++ reference and closes the TOCTOU class by design
-// (docs/tz/09-go-port.md §5.2, §7).
+// Удержание в границах корня делегировано os.Root (Go 1.24+): любая операция
+// остаётся под корнем даже при «..»-компонентах или симлинках наружу. Это
+// заменяет ручную логику openat2/realpath из эталона на C++ и закрывает класс
+// уязвимостей TOCTOU по построению (docs/tz/09-go-port.md §5.2, §7).
+//
+// Словарь предметной области и, главное, ТРИ ФОРМЫ ПУТИ (virtual → cleaned →
+// OS-relative) описаны в types.go — прочитайте его прежде, чем править пути.
 package vfs
 
 import (
@@ -26,13 +29,13 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/proto"
 )
 
-// Error carries a protocol error code alongside the underlying cause, so the
-// server can translate a VFS failure into the right ERROR frame.
+// Error несёт код ошибки протокола рядом с исходной причиной, чтобы сервер
+// перевёл сбой VFS в правильный кадр ERROR (а не всегда в INTERNAL_ERROR).
 type Error struct {
-	Code proto.ErrCode
-	Op   string
-	Path string
-	Err  error
+	Code proto.ErrCode // какой ERROR-код отдать клиенту
+	Op   string        // операция: list / stat / open / checksum
+	Path string        // путь, на котором произошёл сбой
+	Err  error         // исходная ошибка ОС
 }
 
 func (e *Error) Error() string {
@@ -40,8 +43,8 @@ func (e *Error) Error() string {
 }
 func (e *Error) Unwrap() error { return e.Err }
 
-// CodeOf extracts the protocol error code from an error returned by this
-// package, defaulting to INTERNAL_ERROR.
+// CodeOf извлекает код ошибки протокола из ошибки, вернувшейся из этого пакета;
+// по умолчанию — INTERNAL_ERROR.
 func CodeOf(err error) proto.ErrCode {
 	var ve *Error
 	if errors.As(err, &ve) {
@@ -52,13 +55,14 @@ func CodeOf(err error) proto.ErrCode {
 
 var errBadPath = errors.New("malformed path")
 
-// classify maps an OS-level error to a protocol error code. Anything a confined
-// os.Root refuses that is not a plain not-found/permission case (most notably a
-// symlink or component escaping the root) is reported as ACCESS_DENIED.
+// classify переводит ошибку уровня ОС в код ошибки протокола. Всё, что
+// запертый os.Root отклонил и что НЕ является простым «не найдено»/«нет прав»
+// (в первую очередь — симлинк или компонент, убегающий за корень), считаем
+// ACCESS_DENIED.
 func classify(err error) proto.ErrCode {
-	// The ENOTDIR/EISDIR checks must precede the fs.ErrNotExist check: on
-	// Windows syscall.ENOTDIR reports itself as fs.ErrNotExist via Errno.Is,
-	// which would otherwise mislabel a "not a directory" as "file not found".
+	// Проверки ENOTDIR/EISDIR должны идти ПЕРЕД fs.ErrNotExist: на Windows
+	// syscall.ENOTDIR через Errno.Is выдаёт себя за fs.ErrNotExist, из-за чего
+	// «не каталог» иначе ошибочно пометилось бы как «файл не найден».
 	switch {
 	case errors.Is(err, errBadPath):
 		return proto.ErrBadRequest
@@ -78,40 +82,46 @@ func coded(op, p string, err error) *Error {
 	return &Error{Code: classify(err), Op: op, Path: p, Err: err}
 }
 
-// VFS is a directory tree rooted at a share directory, with a lazy checksum
-// cache. It is safe for concurrent use.
+// VFS — дерево каталогов, укоренённое в директории раздачи, с ленивым
+// checksum-кэшем. Безопасно для конкурентного использования (кэш и статистика
+// под своими мьютексами).
 type VFS struct {
-	root      *os.Root
-	rootName  string
-	cacheFile string
+	root      *os.Root // запертый корень: все операции идут только через него
+	rootName  string   // путь корня на «настоящей» ФС (для walk статистики)
+	cacheFile string   // куда сохранять checksum-кэш (пусто — не сохранять)
 
-	mu    sync.Mutex
-	cache map[string]cacheEntry
-	dirty bool
+	mu    sync.Mutex            // защищает cache и dirty
+	cache map[string]cacheEntry // ключ — CleanedPath, значение — сумма + метки
+	dirty bool                  // есть ли несохранённые изменения кэша
 
-	statsMu sync.Mutex
-	stats   shareStats
+	statsMu sync.Mutex // защищает stats
+	stats   shareStats // фоново обновляемая сводка по раздаче
 }
 
-// shareStats is a periodically-refreshed snapshot of the share's file count and
-// total size, so ADMIN_STATS need not walk a large tree on every 2s refresh.
+// shareStats — периодически обновляемый снимок числа файлов и суммарного размера
+// раздачи, чтобы ADMIN_STATS не обходил большое дерево при каждом обновлении
+// (раз в несколько секунд).
 type shareStats struct {
-	files     uint64
-	bytes     uint64
-	at        time.Time
-	computing bool
+	files     FileCount // сколько обычных файлов в раздаче
+	bytes     FileSize  // их суммарный размер в байтах
+	at        time.Time // когда снимок посчитан (для проверки на устаревание)
+	computing bool      // идёт ли прямо сейчас фоновый пересчёт
 }
 
+// cacheEntry — одна запись checksum-кэша В ПАМЯТИ. Ключ (size, mtime-nanos,
+// ctime) позволяет определить, что файл не изменился, и вернуть готовую сумму
+// без повторного чтения всего файла.
 type cacheEntry struct {
-	Size  uint64
-	Mtime uint64
-	Ctime int64 // change-time nanos where available (0 otherwise) — RR-5
-	Algo  proto.Algo
-	Sum   [proto.ChecksumLen]byte
+	Size  FileSize                // размер на момент подсчёта
+	Mtime UnixNanos               // mtime в наносекундах (гранулярность CR-09)
+	Ctime int64                   // ctime в наносекундах, где доступен (иначе 0) — RR-5
+	Algo  proto.Algo              // алгоритм суммы (сейчас SHA-256)
+	Sum   [proto.ChecksumLen]byte // сама сумма
 }
 
-// New opens shareRoot as a confined root. If cacheFile is non-empty and exists,
-// the checksum cache is loaded from it.
+// New открывает shareRoot как запертый корень. Если cacheFile непустой и
+// существует, из него подгружается checksum-кэш (битый/отсутствующий кэш не
+// фатален — стартуем с пустого).
 func New(shareRoot, cacheFile string) (*VFS, error) {
 	root, err := os.OpenRoot(shareRoot)
 	if err != nil {
@@ -132,7 +142,7 @@ func New(shareRoot, cacheFile string) (*VFS, error) {
 	return v, nil
 }
 
-// Close persists the checksum cache and releases the root handle.
+// Close сохраняет checksum-кэш и освобождает дескриптор корня.
 func (v *VFS) Close() error {
 	err := v.SaveCache()
 	if cerr := v.root.Close(); err == nil {
@@ -141,14 +151,14 @@ func (v *VFS) Close() error {
 	return err
 }
 
-// RootName returns the share root path this VFS was opened with.
+// RootName возвращает путь корня раздачи, с которым открыт этот VFS.
 func (v *VFS) RootName() string { return v.rootName }
 
-// CleanPath normalizes a virtual path to an absolute, slash-separated form with
-// no "..", "//" or trailing slash ("/" stays "/"). ".." can never climb above
-// the root because the path is cleaned as if rooted at "/". NUL bytes are
-// rejected as BAD_REQUEST.
-func CleanPath(vpath string) (string, error) {
+// CleanPath нормализует виртуальный путь в абсолютную форму с разделителем «/»,
+// без «..», «//» и хвостового слэша («/» остаётся «/»). «..» не может подняться
+// выше корня, потому что путь чистится так, будто укоренён в «/». NUL-байт
+// отвергается как BAD_REQUEST. Это шаг VirtualPath → CleanedPath из types.go.
+func CleanPath(vpath VirtualPath) (CleanedPath, error) {
 	if strings.IndexByte(vpath, 0) >= 0 {
 		return "", errBadPath
 	}
@@ -158,8 +168,10 @@ func CleanPath(vpath string) (string, error) {
 	return path.Clean("/" + vpath), nil
 }
 
-// rel converts a cleaned virtual path to an OS-relative path for os.Root.
-func rel(clean string) string {
+// rel переводит очищенный путь в OS-relative форму для os.Root (шаг CleanedPath
+// → OS-relative из types.go): убирает ведущий «/» и меняет разделитель на
+// системный; корень «/» превращается в «.».
+func rel(clean CleanedPath) string {
 	r := strings.TrimPrefix(clean, "/")
 	if r == "" {
 		return "."
@@ -167,6 +179,9 @@ func rel(clean string) string {
 	return filepath.FromSlash(r)
 }
 
+// entryFromInfo собирает проводную запись каталога из имени и os-метаданных.
+// Отрицательный mtime (файлы «из прошлого» до эпохи) приводится к 0, потому что
+// на проводе mtime — беззнаковые unix-секунды.
 func entryFromInfo(name string, info fs.FileInfo) proto.DirEntry {
 	kind := proto.KindFile
 	if info.IsDir() {
@@ -184,10 +199,11 @@ func entryFromInfo(name string, info fs.FileInfo) proto.DirEntry {
 	}
 }
 
-// List returns the entries of the directory at vpath, directories first, then
-// by name. Entries that cannot be resolved within the root (e.g. symlinks
-// escaping it, or broken links) are hidden rather than surfaced.
-func (v *VFS) List(vpath string) (string, []proto.DirEntry, error) {
+// List возвращает записи каталога vpath: сначала директории, затем по имени.
+// Записи, которые не удаётся разрешить внутри корня (симлинк наружу, битая
+// ссылка, слишком длинное имя), СКРЫВАЮТСЯ, а не отдаются наружу — иначе одна
+// плохая запись заставила бы собеседника отвергнуть весь кадр списка.
+func (v *VFS) List(vpath VirtualPath) (CleanedPath, []proto.DirEntry, error) {
 	clean, err := CleanPath(vpath)
 	if err != nil {
 		return "", nil, coded("list", vpath, err)
@@ -213,15 +229,15 @@ func (v *VFS) List(vpath string) (string, []proto.DirEntry, error) {
 	entries := make([]proto.DirEntry, 0, len(dirents))
 	for _, de := range dirents {
 		name := de.Name()
-		// The wire caps a name at MaxNameLen bytes; a longer one (possible on
-		// NTFS for multi-byte unicode names) would make the peer reject the
-		// whole listing frame, so hide it rather than poison the response.
+		// Провод ограничивает имя MaxNameLen байтами; более длинное (бывает на
+		// NTFS с многобайтными unicode-именами) заставило бы собеседника
+		// отвергнуть весь кадр списка — поэтому прячем его, а не портим ответ.
 		if len(name) > proto.MaxNameLen {
 			continue
 		}
 		var info fs.FileInfo
 		if de.Type()&fs.ModeSymlink != 0 {
-			// Resolve through the root; hide links that escape or dangle.
+			// Разрешаем через корень; ссылки наружу или битые — прячем.
 			child := path.Join(clean, name)
 			si, serr := v.root.Stat(rel(child))
 			if serr != nil {
@@ -242,15 +258,15 @@ func (v *VFS) List(vpath string) (string, []proto.DirEntry, error) {
 		di := entries[i].Kind == proto.KindDir
 		dj := entries[j].Kind == proto.KindDir
 		if di != dj {
-			return di // directories first
+			return di // директории — первыми
 		}
 		return entries[i].Name < entries[j].Name
 	})
 	return clean, entries, nil
 }
 
-// Stat returns metadata for a single entry at vpath.
-func (v *VFS) Stat(vpath string) (string, proto.DirEntry, error) {
+// Stat возвращает метаданные одной записи по пути vpath.
+func (v *VFS) Stat(vpath VirtualPath) (CleanedPath, proto.DirEntry, error) {
 	clean, err := CleanPath(vpath)
 	if err != nil {
 		return "", proto.DirEntry{}, coded("stat", vpath, err)
@@ -262,9 +278,9 @@ func (v *VFS) Stat(vpath string) (string, proto.DirEntry, error) {
 	return clean, entryFromInfo(path.Base(clean), info), nil
 }
 
-// Open opens the file at vpath for reading, confined to the root. The caller is
-// responsible for closing it. Directories are refused with IS_A_DIRECTORY.
-func (v *VFS) Open(vpath string) (*os.File, fs.FileInfo, error) {
+// Open открывает файл vpath на чтение, не выходя за корень. Закрыть файл —
+// обязанность вызывающего. Директория отклоняется с IS_A_DIRECTORY.
+func (v *VFS) Open(vpath VirtualPath) (*os.File, fs.FileInfo, error) {
 	clean, err := CleanPath(vpath)
 	if err != nil {
 		return nil, nil, coded("open", vpath, err)
@@ -285,17 +301,18 @@ func (v *VFS) Open(vpath string) (*os.File, fs.FileInfo, error) {
 	return f, info, nil
 }
 
-// Checksum returns the checksum of the file at vpath, computing it lazily and
-// caching by (path, size, mtime). The current algorithm is SHA-256.
-func (v *VFS) Checksum(vpath string) (string, proto.Algo, [proto.ChecksumLen]byte, error) {
+// Checksum возвращает контрольную сумму файла vpath, вычисляя её ЛЕНИВО и
+// кэшируя по ключу (путь, size, mtime, ctime). Текущий алгоритм — SHA-256.
+func (v *VFS) Checksum(vpath VirtualPath) (CleanedPath, proto.Algo, [proto.ChecksumLen]byte, error) {
 	return v.ChecksumCtx(context.Background(), vpath)
 }
 
-// ChecksumCtx is Checksum that aborts a cache-miss hash when ctx is cancelled,
-// so a transfer that is cancelled during its final whole-file checksum stops
-// re-reading a large file promptly instead of blocking for minutes (R4-3). It
-// returns ctx.Err() unwrapped when cancelled, so callers can detect it.
-func (v *VFS) ChecksumCtx(ctx context.Context, vpath string) (string, proto.Algo, [proto.ChecksumLen]byte, error) {
+// ChecksumCtx — это Checksum, который при промахе кэша прерывает подсчёт хеша по
+// отмене ctx: если передачу отменили во время финального подсчёта суммы по всему
+// файлу, она перестаёт заново вычитывать большой файл сразу, а не блокируется на
+// минуты (R4-3). При отмене возвращает ctx.Err() как есть, чтобы вызывающий это
+// распознал.
+func (v *VFS) ChecksumCtx(ctx context.Context, vpath VirtualPath) (CleanedPath, proto.Algo, [proto.ChecksumLen]byte, error) {
 	var zero [proto.ChecksumLen]byte
 	clean, err := CleanPath(vpath)
 	if err != nil {
@@ -308,17 +325,17 @@ func (v *VFS) ChecksumCtx(ctx context.Context, vpath string) (string, proto.Algo
 	defer f.Close()
 
 	size := uint64(info.Size())
-	// Nanosecond mtime granularity (CR-09) plus change-time (RR-5): ctime
-	// changes on any content/metadata modification even when mtime is preserved
-	// (unix), catching a same-size same-mtime replacement. This is the cache key
-	// only; the wire DirEntry.mtime stays unix seconds.
+	// Наносекундная гранулярность mtime (CR-09) плюс change-time (RR-5): ctime
+	// меняется при ЛЮБОМ изменении содержимого/метаданных, даже если mtime
+	// сохранён (unix), — это ловит подмену файла тем же размером и тем же mtime.
+	// Всё это — ТОЛЬКО ключ кэша; проводной DirEntry.mtime остаётся в секундах.
 	mtime := uint64(info.ModTime().UnixNano())
 	ctime, ctimeOK := changeTimeNanos(info)
 
-	// Only trust a cache hit when the platform gives a dependable change-time.
-	// Where it does not (e.g. Windows), (size, mtime) alone cannot prove the
-	// content is unchanged — a same-size replacement with the exact mtime
-	// restored would return a stale checksum — so recompute instead (R3-5).
+	// Доверяем попаданию в кэш, только если платформа даёт надёжный change-time.
+	// Где его нет (например, Windows), пары (size, mtime) недостаточно, чтобы
+	// доказать неизменность содержимого: подмена тем же размером с восстановленным
+	// точным mtime вернула бы устаревшую сумму — поэтому пересчитываем (R3-5).
 	v.mu.Lock()
 	if e, ok := v.cache[clean]; ok && ctimeOK && e.Size == size && e.Mtime == mtime && e.Ctime == ctime {
 		v.mu.Unlock()
@@ -329,7 +346,7 @@ func (v *VFS) ChecksumCtx(ctx context.Context, vpath string) (string, proto.Algo
 	h := sha256.New()
 	if cerr := copyCtx(ctx, h, f); cerr != nil {
 		if ctx.Err() != nil {
-			return clean, proto.AlgoPending, zero, cerr // cancelled/deadline: report raw
+			return clean, proto.AlgoPending, zero, cerr // отмена/дедлайн: отдаём как есть
 		}
 		return clean, proto.AlgoPending, zero, coded("checksum", clean, cerr)
 	}
@@ -343,9 +360,9 @@ func (v *VFS) ChecksumCtx(ctx context.Context, vpath string) (string, proto.Algo
 	return clean, proto.AlgoSHA256, sum, nil
 }
 
-// copyCtx streams src into dst, checking ctx before each block so a long hash
-// aborts promptly on cancellation. It returns ctx.Err() if cancelled, otherwise
-// the first read/write error, or nil at EOF.
+// copyCtx перекачивает src в dst, проверяя ctx перед каждым блоком, чтобы долгий
+// подсчёт хеша быстро прерывался по отмене. Возвращает ctx.Err() при отмене,
+// иначе первую ошибку чтения/записи, либо nil по достижении EOF.
 func copyCtx(ctx context.Context, dst io.Writer, src io.Reader) error {
 	buf := make([]byte, 128<<10)
 	for {
@@ -367,13 +384,14 @@ func copyCtx(ctx context.Context, dst io.Writer, src io.Reader) error {
 	}
 }
 
-// shareStatsTTL bounds how often the share is walked for ADMIN_STATS.
+// shareStatsTTL ограничивает, как часто дерево раздачи обходится ради
+// ADMIN_STATS.
 const shareStatsTTL = 30 * time.Second
 
-// ShareStats returns the cached file count and total byte size of the share.
-// The walk runs in the background at most once per shareStatsTTL, so callers
-// never block on a large tree; the first call returns zeros until the initial
-// walk completes.
+// ShareStats возвращает закэшированные число файлов и суммарный размер раздачи.
+// Обход дерева идёт в фоне не чаще раза в shareStatsTTL, поэтому вызывающий
+// никогда не блокируется на большом дереве; первый вызов вернёт нули, пока не
+// завершится первичный обход.
 func (v *VFS) ShareStats() (files, bytes uint64) {
 	v.statsMu.Lock()
 	files, bytes = v.stats.files, v.stats.bytes
@@ -394,10 +412,10 @@ func (v *VFS) refreshStats() {
 	v.statsMu.Unlock()
 }
 
-// walkStats counts regular files and sums their sizes under root. Non-regular
-// entries (symlinks, sockets, devices) are excluded from BOTH the count and the
-// size. Symlinks are not followed (WalkDir treats them as leaves), so the walk
-// cannot loop.
+// walkStats считает обычные файлы и суммирует их размеры под корнем. Необычные
+// записи (симлинки, сокеты, устройства) исключены И из счёта, И из размера.
+// Симлинки не разыменовываются (WalkDir считает их листьями), поэтому обход не
+// может зациклиться. (R6-9: считаем только обычные файлы.)
 func walkStats(root string) (files, bytes uint64) {
 	_ = filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -414,9 +432,9 @@ func walkStats(root string) (files, bytes uint64) {
 	return files, bytes
 }
 
-// InvalidateChecksum drops any cached checksum for vpath (called when the
-// watcher reports a change).
-func (v *VFS) InvalidateChecksum(vpath string) {
+// InvalidateChecksum сбрасывает закэшированную сумму для vpath (вызывается, когда
+// watcher сообщает об изменении файла).
+func (v *VFS) InvalidateChecksum(vpath VirtualPath) {
 	clean, err := CleanPath(vpath)
 	if err != nil {
 		return

@@ -9,17 +9,21 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/proto"
 )
 
-// diskCache is the on-disk JSON form of the checksum cache.
+// diskCache — форма checksum-кэша НА ДИСКЕ (JSON). Отличается от представления в
+// памяти: сумма хранится строкой hex, а не массивом байт, чтобы файл кэша был
+// человекочитаемым.
 type diskCache struct {
-	Entries map[string]diskEntry `json:"entries"`
+	Entries map[string]diskEntry `json:"entries"` // ключ — CleanedPath
 }
 
+// diskEntry — одна запись checksum-кэша на диске (см. cacheEntry — её аналог в
+// памяти).
 type diskEntry struct {
-	Size  uint64 `json:"size"`
-	Mtime uint64 `json:"mtime"`
-	Ctime int64  `json:"ctime,omitempty"`
-	Algo  uint8  `json:"algo"`
-	Sum   string `json:"sum"` // hex
+	Size  uint64 `json:"size"`            // размер на момент подсчёта
+	Mtime uint64 `json:"mtime"`           // mtime в наносекундах
+	Ctime int64  `json:"ctime,omitempty"` // ctime в наносекундах (0 — не было)
+	Algo  uint8  `json:"algo"`            // алгоритм суммы
+	Sum   string `json:"sum"`             // сама сумма в hex
 }
 
 func (v *VFS) loadCache() error {
@@ -48,8 +52,10 @@ func (v *VFS) loadCache() error {
 	return nil
 }
 
-// SaveCache atomically writes the checksum cache to disk (temp file + rename),
-// but only when there are unsaved changes. A no-op if no cache file is set.
+// SaveCache атомарно пишет checksum-кэш на диск (временный файл + rename), но
+// только если есть несохранённые изменения. Ничего не делает, если файл кэша не
+// задан. Приём «temp + rename» гарантирует, что на диске всегда лежит либо
+// старый целый файл, либо новый целый — но не обрезанный на полуслове.
 func (v *VFS) SaveCache() error {
 	if v.cacheFile == "" {
 		return nil
@@ -75,7 +81,7 @@ func (v *VFS) SaveCache() error {
 		return err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after a successful rename
+	defer os.Remove(tmpName) // после успешного rename — уже нечего удалять
 	if _, err := tmp.Write(b); err != nil {
 		tmp.Close()
 		return err
