@@ -511,6 +511,7 @@ func (m *Model) renderAdminOverview() string {
 		fmt.Sprintf("  Active dloads: %d", s.ActiveDownloads),
 		fmt.Sprintf("  Bytes sent:    %s", formatSize(s.BytesSent)),
 		fmt.Sprintf("  Completed:     %d", s.Completed),
+		fmt.Sprintf("  Share:         %s · %d files", formatSize(s.SharedBytes), s.SharedFiles),
 		fmt.Sprintf("  per-client lim: %s", limitStr(s.PerClientBps)),
 		fmt.Sprintf("  global lim:     %s", limitStr(s.GlobalBps)),
 	}

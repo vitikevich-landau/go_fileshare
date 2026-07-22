@@ -836,6 +836,7 @@ type AdminStatsResponse struct {
 	ActiveConns     uint64
 	ActiveDownloads uint64
 	SharedFiles     uint64
+	SharedBytes     uint64
 	PerClientBps    uint64
 	GlobalBps       uint64
 	Version         string
@@ -849,6 +850,7 @@ func (m AdminStatsResponse) encode(w *writer) {
 	w.u64(m.ActiveConns)
 	w.u64(m.ActiveDownloads)
 	w.u64(m.SharedFiles)
+	w.u64(m.SharedBytes)
 	w.u64(m.PerClientBps)
 	w.u64(m.GlobalBps)
 	w.str(m.Version)
@@ -858,7 +860,7 @@ func decodeAdminStatsResponse(r *reader) (AdminStatsResponse, error) {
 	var err error
 	for _, p := range []*uint64{
 		&m.UptimeS, &m.BytesSent, &m.Completed, &m.ActiveConns, &m.ActiveDownloads,
-		&m.SharedFiles, &m.PerClientBps, &m.GlobalBps,
+		&m.SharedFiles, &m.SharedBytes, &m.PerClientBps, &m.GlobalBps,
 	} {
 		if *p, err = r.u64(); err != nil {
 			return m, err
