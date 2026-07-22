@@ -43,6 +43,14 @@ const (
 // explicit "shutdown <seconds>" grace.
 const defaultShutdownGrace = 10
 
+// adminMenuItems are the F2 lifecycle actions (docs/tz/05-admin.md §2.5).
+var adminMenuItems = []string{"Graceful shutdown", "Reload users"}
+
+const (
+	adminMenuShutdown = 0
+	adminMenuReload   = 1
+)
+
 // journal appends one line to the admin Journal tab's live tail (bounded).
 func (m *Model) journal(kind lineKind, text string) {
 	m.adminJournal = append(m.adminJournal, logLine{kind: kind, text: time.Now().Format("15:04:05") + " " + text})
@@ -77,6 +85,11 @@ type adminKickResultMsg struct {
 	err error
 }
 type adminShutdownResultMsg struct {
+	ok  bool
+	msg string
+	err error
+}
+type adminReloadResultMsg struct {
 	ok  bool
 	msg string
 	err error
@@ -161,6 +174,20 @@ func (m *Model) adminKickCmd(id uint64) tea.Cmd {
 	}
 }
 
+func (m *Model) adminReloadUsersCmd() tea.Cmd {
+	return func() tea.Msg {
+		m.clientMu.Lock()
+		c := m.client
+		if c == nil {
+			m.clientMu.Unlock()
+			return adminReloadResultMsg{err: errClientClosed}
+		}
+		ok, msg, err := c.AdminReloadUsers()
+		m.clientMu.Unlock()
+		return adminReloadResultMsg{ok: ok, msg: msg, err: err}
+	}
+}
+
 func (m *Model) adminShutdownCmd(grace uint32) tea.Cmd {
 	return func() tea.Msg {
 		m.clientMu.Lock()
@@ -201,12 +228,16 @@ func (m *Model) openAdmin() tea.Cmd {
 	m.adminMsg = ""
 	m.adminDetail = nil
 	m.adminConfirm = confirmNone
+	m.adminMenu = false
 	return tea.Batch(m.adminStatsCmd(), m.adminClientsCmd(), m.adminConfigCmd())
 }
 
 func (m *Model) handleAdminKey(k tea.KeyMsg) tea.Cmd {
 	if m.adminConfirm != confirmNone {
 		return m.handleAdminConfirmKey(k)
+	}
+	if m.adminMenu {
+		return m.handleAdminMenuKey(k)
 	}
 	if m.adminDetail != nil {
 		if k.String() == "ctrl+c" {
@@ -274,10 +305,41 @@ func (m *Model) handleAdminKey(k tea.KeyMsg) tea.Cmd {
 			m.showClientDetail()
 		}
 	case "f2":
-		return m.startShutdownConfirm()
+		m.adminMenu = true
+		m.adminMenuCursor = 0
+		m.adminMsg = ""
+		return nil
 	case "f8", "k":
 		if m.adminTab == adminTabClients {
 			return m.kickSelected()
+		}
+	}
+	return nil
+}
+
+// handleAdminMenuKey drives the F2 lifecycle menu (docs/tz/05-admin.md §2.5).
+func (m *Model) handleAdminMenuKey(k tea.KeyMsg) tea.Cmd {
+	switch k.String() {
+	case "esc", "f2":
+		m.adminMenu = false
+		return nil
+	case "ctrl+c":
+		return m.quit()
+	case "up":
+		if m.adminMenuCursor > 0 {
+			m.adminMenuCursor--
+		}
+	case "down":
+		if m.adminMenuCursor < len(adminMenuItems)-1 {
+			m.adminMenuCursor++
+		}
+	case "enter":
+		m.adminMenu = false
+		switch m.adminMenuCursor {
+		case adminMenuShutdown:
+			return m.startShutdownConfirm()
+		case adminMenuReload:
+			return m.adminReloadUsersCmd()
 		}
 	}
 	return nil
@@ -457,6 +519,9 @@ func (m *Model) viewAdmin() string {
 	if m.adminEditing {
 		b.WriteString("\n  set " + m.adminEditKey + " = " + m.adminInput.View() + "   [Enter apply · Esc cancel]\n")
 	}
+	if m.adminMenu {
+		b.WriteString("\n" + m.renderAdminMenu())
+	}
 	if m.adminDetail != nil {
 		b.WriteString("\n" + m.renderClientDetail())
 	}
@@ -467,7 +532,23 @@ func (m *Model) viewAdmin() string {
 	case confirmKick:
 		b.WriteString("\n  " + styErr.Render(fmt.Sprintf("Kick session %d?", m.adminConfirmArg)) + "   [y confirm · any other key cancel]\n")
 	}
-	b.WriteString("\n" + styFbar.Render(fit("Tab/1-4 switch · ↑↓ move · Enter edit · F8/k kick · F2 shutdown · Ctrl+R refresh · Esc back", m.width)))
+	b.WriteString("\n" + styFbar.Render(fit("Tab/1-4 switch · ↑↓ move · Enter edit · F8/k kick · F2 menu · Ctrl+R refresh · Esc back", m.width)))
+	return b.String()
+}
+
+// renderAdminMenu draws the F2 lifecycle menu (shutdown / reload users).
+func (m *Model) renderAdminMenu() string {
+	var b strings.Builder
+	b.WriteString(styActiveTitle.Render(" Lifecycle ") + "\n")
+	for i, item := range adminMenuItems {
+		line := fit("  "+item, 30)
+		if i == m.adminMenuCursor {
+			b.WriteString(styCursor.Render(line) + "\n")
+		} else {
+			b.WriteString(line + "\n")
+		}
+	}
+	b.WriteString(styDim.Render("  ↑↓ move · Enter select · Esc close") + "\n")
 	return b.String()
 }
 

@@ -96,10 +96,15 @@ func TestAdminShutdownConfirmFlow(t *testing.T) {
 	m.role = proto.RoleAdmin
 	m.admin = true
 
-	// F2 opens the shutdown confirmation modal.
+	// F2 opens the lifecycle menu; Enter on the first item (Graceful shutdown)
+	// opens the typed-word confirmation modal.
 	m.handleAdminKey(tea.KeyMsg{Type: tea.KeyF2})
+	if !m.adminMenu {
+		t.Fatal("F2 should open the lifecycle menu")
+	}
+	m.handleAdminKey(tea.KeyMsg{Type: tea.KeyEnter})
 	if m.adminConfirm != confirmShutdown {
-		t.Fatalf("F2 should open the shutdown confirm modal, got %d", m.adminConfirm)
+		t.Fatalf("selecting Graceful shutdown should open the confirm modal, got %d", m.adminConfirm)
 	}
 
 	// A wrong confirmation word is rejected and keeps the modal open.
@@ -120,13 +125,41 @@ func TestAdminShutdownConfirmFlow(t *testing.T) {
 		t.Fatal("modal must close after confirming")
 	}
 
-	// Esc from a fresh modal cancels without a command.
+	// Re-open via the menu, then Esc from a fresh confirm modal cancels it.
 	m.handleAdminKey(tea.KeyMsg{Type: tea.KeyF2})
+	m.handleAdminKey(tea.KeyMsg{Type: tea.KeyEnter}) // select Graceful shutdown
+	if m.adminConfirm != confirmShutdown {
+		t.Fatal("menu should re-open the shutdown confirm")
+	}
 	if cmd := m.handleAdminConfirmKey(tea.KeyMsg{Type: tea.KeyEsc}); cmd != nil {
 		t.Fatal("Esc must cancel the shutdown modal")
 	}
 	if m.adminConfirm != confirmNone {
 		t.Fatal("Esc should close the modal")
+	}
+}
+
+func TestAdminMenuReloadUsers(t *testing.T) {
+	m := New(Profile{})
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.role = proto.RoleAdmin
+	m.admin = true
+
+	// F2 opens the menu; item 1 is Reload users.
+	m.handleAdminKey(tea.KeyMsg{Type: tea.KeyF2})
+	if !m.adminMenu {
+		t.Fatal("F2 should open the lifecycle menu")
+	}
+	m.handleAdminKey(tea.KeyMsg{Type: tea.KeyDown}) // move to "Reload users"
+	if m.adminMenuCursor != adminMenuReload {
+		t.Fatalf("cursor = %d, want %d", m.adminMenuCursor, adminMenuReload)
+	}
+	cmd := m.handleAdminKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("selecting Reload users should return a command")
+	}
+	if m.adminMenu {
+		t.Fatal("menu should close after selecting an item")
 	}
 }
 

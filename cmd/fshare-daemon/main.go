@@ -124,8 +124,14 @@ func run(cfg config.Settings, configPath string) error {
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
 		for range hup {
+			// Always hot-reload users.json (its path is independent of --config)
+			// and drop sessions of any now-disabled user (§3.3).
+			if dropped, err := srv.ReloadUsers(); err != nil {
+				logger.Error("SIGHUP user reload failed", "err", err)
+			} else {
+				logger.Info("users reloaded (SIGHUP)", "dropped_sessions", dropped)
+			}
 			if configPath == "" {
-				logger.Warn("SIGHUP ignored: no --config file")
 				continue
 			}
 			nc, err := config.Load(configPath)

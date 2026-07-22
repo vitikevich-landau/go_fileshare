@@ -29,9 +29,10 @@ type env struct {
 	hub    *config.Hub
 	users  *auth.DB
 	guard  *auth.Guard
-	cancel context.CancelFunc
-	done   chan struct{}
-	logs   *syncBuffer
+	cancel    context.CancelFunc
+	done      chan struct{}
+	logs      *syncBuffer
+	usersPath string
 }
 
 func quietLogger() *slog.Logger {
@@ -99,7 +100,8 @@ func newEnvWithConfig(t *testing.T, configPath string, configure func(*config.Se
 	if err != nil {
 		t.Fatal(err)
 	}
-	users, err := auth.Load(filepath.Join(t.TempDir(), "users.json"))
+	usersPath := filepath.Join(t.TempDir(), "users.json")
+	users, err := auth.Load(usersPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +128,7 @@ func newEnvWithConfig(t *testing.T, configPath string, configure func(*config.Se
 		<-done
 		v.Close()
 	})
-	return &env{addr: srv.Addr().String(), share: share, hub: hub, users: users, guard: guard, cancel: cancel, done: done, logs: logs}
+	return &env{addr: srv.Addr().String(), share: share, hub: hub, users: users, guard: guard, cancel: cancel, done: done, logs: logs, usersPath: usersPath}
 }
 
 func dialNoAuth(t *testing.T, e *env) *client.Client {
@@ -137,6 +139,61 @@ func dialNoAuth(t *testing.T, e *env) *client.Client {
 	}
 	t.Cleanup(func() { c.Close() })
 	return c
+}
+
+func TestAdminReloadUsersDropsDisabled(t *testing.T) {
+	e := newEnv(t, nil)
+	// Seed root(admin) + vit(user) into the users file.
+	e.users.SetUser("root", proto.RoleAdmin, "rootpw", testIters)
+	e.users.SetUser("vit", proto.RoleUser, "vitpw", testIters)
+	if err := e.users.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	// vit connects and works.
+	cv, err := client.Dial(e.addr, client.Options{Login: "vit", Password: "vitpw"})
+	if err != nil {
+		t.Fatalf("vit dial: %v", err)
+	}
+	defer cv.Close()
+	if _, _, err := cv.ListDir("/"); err != nil {
+		t.Fatalf("vit list before disable: %v", err)
+	}
+
+	// Disable vit in the FILE ONLY (a second handle), leaving the live DB alone,
+	// so the drop can only happen via the reload re-reading the file.
+	fileDB, err := auth.Load(e.usersPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fileDB.SetEnabled("vit", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := fileDB.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	// An admin triggers the reload over the network.
+	ca, err := client.Dial(e.addr, client.Options{Login: "root", Password: "rootpw"})
+	if err != nil {
+		t.Fatalf("root dial: %v", err)
+	}
+	defer ca.Close()
+	if ok, msg, err := ca.AdminReloadUsers(); err != nil || !ok {
+		t.Fatalf("reload users: ok=%v msg=%q err=%v", ok, msg, err)
+	}
+
+	// vit's session must be dropped: its next request fails.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, _, err := cv.ListDir("/"); err != nil {
+			break // dropped as expected
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("vit's session was not dropped after the user was disabled + reloaded")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func TestAuthFailureIsAudited(t *testing.T) {

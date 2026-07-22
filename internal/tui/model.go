@@ -83,8 +83,10 @@ type Model struct {
 	// admin confirmation modal (F2 shutdown / kick)
 	adminConfirm      confirmKind
 	adminConfirmArg   uint64          // e.g. session id for a kick confirm
-	adminConfirmInput textinput.Model // typed-word confirm (shutdown)
+	adminConfirmInput textinput.Model   // typed-word confirm (shutdown)
 	adminDetail       *proto.ClientInfo // Enter on Clients tab: session detail box
+	adminMenu         bool              // F2 lifecycle menu is open
+	adminMenuCursor   int
 
 	clientMu   sync.Mutex // serializes all client I/O across goroutines
 	client     *client.Client
@@ -264,6 +266,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.adminMsg = msg.msg
 			cmd = m.adminClientsCmd()
+		}
+	case adminReloadResultMsg:
+		if msg.err != nil {
+			cmd = m.adminErr(msg.err)
+		} else {
+			m.adminMsg = "reload users: " + msg.msg
 		}
 	case adminShutdownResultMsg:
 		if msg.err != nil {

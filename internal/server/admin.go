@@ -25,9 +25,22 @@ func (s *Server) handleAdmin(sess *Session, m proto.Message) {
 		s.adminStats(sess)
 	case proto.AdminShutdown:
 		s.adminShutdown(sess, req)
+	case proto.AdminReloadUsers:
+		s.adminReloadUsers(sess)
 	default:
 		sess.sendMsg(proto.Error{Code: proto.ErrBadRequest, Message: "unknown admin message"})
 	}
+}
+
+func (s *Server) adminReloadUsers(sess *Session) {
+	dropped, err := s.ReloadUsers()
+	if err != nil {
+		sess.sendMsg(proto.AdminReloadUsersResult{OK: false, Message: err.Error()})
+		return
+	}
+	s.log.Info("admin reload users", "admin", sess.Login(), "dropped_sessions", dropped)
+	s.BroadcastNotice(proto.SevInfo, fmt.Sprintf("%s reloaded users (%d session(s) dropped)", sess.Login(), dropped))
+	sess.sendMsg(proto.AdminReloadUsersResult{OK: true, Message: fmt.Sprintf("reloaded; %d session(s) dropped", dropped)})
 }
 
 func (s *Server) adminGetConfig(sess *Session) {

@@ -219,7 +219,7 @@ func (s *Server) dispatch(sess *Session, m proto.Message) {
 	case proto.DownloadCancel:
 		sess.cancelDownload(req.TransferID)
 	case proto.AdminGetConfig, proto.AdminSet, proto.AdminListClients,
-		proto.AdminKick, proto.AdminStats, proto.AdminShutdown:
+		proto.AdminKick, proto.AdminStats, proto.AdminShutdown, proto.AdminReloadUsers:
 		s.handleAdmin(sess, m)
 	default:
 		// Anything else from a client is a protocol violation.

@@ -60,6 +60,22 @@ func Load(path string) (*DB, error) {
 	return db, nil
 }
 
+// Reload re-reads the users file from disk, replacing the in-memory set. It is
+// used for hot user management (SIGHUP / admin reload) so disabling or adding a
+// user takes effect without a restart (docs/tz/03-server-daemon.md §3.3). On a
+// read/parse error the current set is left unchanged.
+func (db *DB) Reload() error {
+	fresh, err := Load(db.path)
+	if err != nil {
+		return err
+	}
+	db.mu.Lock()
+	db.byLogin = fresh.byLogin
+	db.order = fresh.order
+	db.mu.Unlock()
+	return nil
+}
+
 // Empty reports whether the DB has no users (no-auth bootstrap).
 func (db *DB) Empty() bool {
 	db.mu.RLock()
