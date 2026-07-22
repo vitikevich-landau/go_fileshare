@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/vitikevich-landau/go_fileshare/internal/proto"
 )
@@ -87,6 +88,18 @@ type VFS struct {
 	mu    sync.Mutex
 	cache map[string]cacheEntry
 	dirty bool
+
+	statsMu sync.Mutex
+	stats   shareStats
+}
+
+// shareStats is a periodically-refreshed snapshot of the share's file count and
+// total size, so ADMIN_STATS need not walk a large tree on every 2s refresh.
+type shareStats struct {
+	files     uint64
+	bytes     uint64
+	at        time.Time
+	computing bool
 }
 
 type cacheEntry struct {
@@ -352,6 +365,53 @@ func copyCtx(ctx context.Context, dst io.Writer, src io.Reader) error {
 			return rerr
 		}
 	}
+}
+
+// shareStatsTTL bounds how often the share is walked for ADMIN_STATS.
+const shareStatsTTL = 30 * time.Second
+
+// ShareStats returns the cached file count and total byte size of the share.
+// The walk runs in the background at most once per shareStatsTTL, so callers
+// never block on a large tree; the first call returns zeros until the initial
+// walk completes.
+func (v *VFS) ShareStats() (files, bytes uint64) {
+	v.statsMu.Lock()
+	files, bytes = v.stats.files, v.stats.bytes
+	stale := time.Since(v.stats.at) >= shareStatsTTL
+	if stale && !v.stats.computing {
+		v.stats.computing = true
+		go v.refreshStats()
+	}
+	v.statsMu.Unlock()
+	return files, bytes
+}
+
+func (v *VFS) refreshStats() {
+	files, bytes := walkStats(v.rootName)
+	v.statsMu.Lock()
+	v.stats.files, v.stats.bytes, v.stats.at = files, bytes, time.Now()
+	v.stats.computing = false
+	v.statsMu.Unlock()
+}
+
+// walkStats counts regular files and sums their sizes under root. Non-regular
+// entries (symlinks, sockets, devices) are excluded from BOTH the count and the
+// size. Symlinks are not followed (WalkDir treats them as leaves), so the walk
+// cannot loop.
+func walkStats(root string) (files, bytes uint64) {
+	_ = filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		info, e := d.Info()
+		if e != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		files++
+		bytes += uint64(info.Size())
+		return nil
+	})
+	return files, bytes
 }
 
 // InvalidateChecksum drops any cached checksum for vpath (called when the

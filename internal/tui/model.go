@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -27,12 +28,13 @@ const (
 	screenCommander
 )
 
-const helpText = "Tab switch · ↑↓/PgUp/PgDn/Home/End move · Enter cd · Space mark · F5 download · Ctrl+R refresh · Ctrl+N mark seen · F10 quit"
+const helpText = "Tab switch · ↑↓/PgUp/PgDn/Home/End move · Enter cd · Space mark · F5 download · Ctrl+R refresh · Ctrl+N mark seen · : command · F10 quit"
 
 type transferState struct {
-	name     string
-	received uint64
-	total    uint64
+	name      string
+	received  uint64
+	total     uint64
+	startedAt time.Time
 }
 
 type downloadJob struct {
@@ -53,6 +55,8 @@ type Model struct {
 	profiles      *Profiles
 	profileCursor int
 	connecting    bool
+	connectGen    int // bumps per dial attempt; a result from a stale gen is ignored
+	spinner       spinner.Model
 	status        string
 	connectErr    string
 
@@ -78,6 +82,15 @@ type Model struct {
 	adminInput   textinput.Model
 	adminEditKey string
 	adminMsg     string
+	adminJournal []logLine // live tail of EVENT_NOTICE/EVENT_CONFIG (Journal tab)
+
+	// admin confirmation modal (F2 shutdown / kick)
+	adminConfirm      confirmKind
+	adminConfirmArg   uint64          // e.g. session id for a kick confirm
+	adminConfirmInput textinput.Model   // typed-word confirm (shutdown)
+	adminDetail       *proto.ClientInfo // Enter on Clients tab: session detail box
+	adminMenu         bool              // F2 lifecycle menu is open
+	adminMenuCursor   int
 
 	clientMu   sync.Mutex // serializes all client I/O across goroutines
 	client     *client.Client
@@ -93,6 +106,15 @@ type Model struct {
 	backoff          time.Duration
 	pumpStop         chan struct{}
 	remoteKeepCursor int // >=0 restores the cursor after a live remote refresh
+
+	// command line (":" opens it)
+	cmdMode  bool
+	cmdInput textinput.Model
+
+	// hotkey overlays
+	fullLog         bool     // Ctrl+O: fullscreen op-log
+	infoBox         []string // F3/F4: entry info/checksum box (nil = closed)
+	dlCancelConfirm bool     // Esc during a transfer asks before cancelling
 
 	events   chan tea.Msg
 	quitting bool
@@ -122,11 +144,15 @@ func New(prefill Profile) *Model {
 	pw.EchoCharacter = '*'
 	pw.Width = 20
 
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+
 	m := &Model{
 		screen:           screenConnect,
 		fields:           []textinput.Model{host, port, login, pw},
 		profiles:         LoadProfiles(),
 		prog:             progress.New(progress.WithDefaultGradient()),
+		spinner:          sp,
 		events:           make(chan tea.Msg, 64),
 		link:             linkDown,
 		backoff:          time.Second,
@@ -178,8 +204,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case connectedMsg:
 		cmd = m.onConnected(msg)
 	case connectErrMsg:
-		m.connecting = false
-		m.connectErr = msg.err.Error()
+		if msg.gen == m.connectGen { // ignore a stale/cancelled attempt's error
+			m.connecting = false
+			m.connectErr = msg.err.Error()
+		}
+	case spinner.TickMsg:
+		if m.connecting {
+			var c tea.Cmd
+			m.spinner, c = m.spinner.Update(msg)
+			cmd = c
+		}
 	case remoteListingMsg:
 		m.onRemoteListing(msg)
 		cmd = m.afterRemoteOp()
@@ -212,6 +246,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			m.log(lineErr, fmt.Sprintf("download %s failed: %v", msg.name, msg.err))
 			cmd = m.afterRemoteOp()
+		}
+	case checksumMsg:
+		var line string
+		if msg.err != nil {
+			line = "checksum error: " + msg.err.Error()
+		} else {
+			line = fmt.Sprintf("%s: %x", algoName(msg.algo), msg.sum[:])
+		}
+		m.log(lineInfo, msg.name+" "+line)
+		if m.infoBox != nil {
+			m.infoBox = append(m.infoBox, line)
 		}
 	case eventMsg:
 		cmd = m.onEvent(msg.m)
@@ -258,6 +303,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.adminMsg = msg.msg
 			cmd = m.adminClientsCmd()
 		}
+	case adminReloadResultMsg:
+		if msg.err != nil {
+			cmd = m.adminErr(msg.err)
+		} else {
+			m.adminMsg = "reload users: " + msg.msg
+		}
+	case adminShutdownResultMsg:
+		if msg.err != nil {
+			cmd = m.adminErr(msg.err)
+		} else {
+			m.adminMsg = "shutdown: " + msg.msg
+		}
 	}
 
 	if fromChannel(msg) {
@@ -273,6 +330,9 @@ func (m *Model) handleKey(k tea.KeyMsg) tea.Cmd {
 	if m.admin {
 		return m.handleAdminKey(k)
 	}
+	if m.cmdMode {
+		return m.handleCmdKey(k)
+	}
 	return m.handleCommanderKey(k)
 }
 
@@ -283,6 +343,21 @@ func (m *Model) profilesFocus() int { return len(m.fields) }
 func (m *Model) hasProfiles() bool { return len(m.profiles.Profiles) > 0 }
 
 func (m *Model) handleConnectKey(k tea.KeyMsg) tea.Cmd {
+	// While a connect is in flight, only Esc (cancel) and Ctrl+C (quit) act.
+	if m.connecting {
+		switch k.String() {
+		case "esc":
+			m.connecting = false
+			m.connectGen++ // invalidate the in-flight attempt; its late result is ignored
+			m.status = ""
+			m.connectErr = "connection cancelled"
+			return nil
+		case "ctrl+c", "f10":
+			m.quitting = true
+			return tea.Quit
+		}
+		return nil
+	}
 	switch k.String() {
 	case "ctrl+c", "f10", "esc":
 		m.quitting = true
@@ -369,6 +444,7 @@ func (m *Model) doConnect() tea.Cmd {
 	}
 	m.connectErr = ""
 	m.connecting = true
+	m.connectGen++ // this dial's generation; late results from older gens are dropped
 	m.status = "connecting to " + host + "…"
 
 	name := m.profile.Name
@@ -381,12 +457,18 @@ func (m *Model) doConnect() tea.Cmd {
 	prof := Profile{Name: name, Host: host, Port: port, Login: login, LastSeen: m.profile.LastSeen, DownloadsDir: m.profile.DownloadsDir}
 	addr := fmt.Sprintf("%s:%d", host, port)
 	opts := client.Options{Login: login, Password: pw, ClientName: "fshare-commander", EventHandler: m.eventForwarder()}
-	return dialCmd(addr, opts, prof)
+	return tea.Batch(dialCmd(addr, opts, prof, m.connectGen), m.spinner.Tick)
 }
 
 // ---- commander ----
 
 func (m *Model) onConnected(msg connectedMsg) tea.Cmd {
+	if msg.gen != m.connectGen {
+		// A stale attempt (e.g. cancelled by Esc, or superseded by a newer dial):
+		// drop the late connection instead of adopting it.
+		msg.client.Close()
+		return nil
+	}
 	m.client = msg.client
 	m.role = msg.role
 	m.serverName = msg.serverName
@@ -411,6 +493,12 @@ func (m *Model) onConnected(msg connectedMsg) tea.Cmd {
 	}
 	m.log(lineOK, "connected to "+m.serverName+" as "+m.role.String())
 
+	// Remember the connection (host/login/name only — never the password).
+	remembered := m.profile
+	remembered.Secret = ""
+	m.profiles.Upsert(remembered)
+	_ = m.profiles.Save()
+
 	m.subscribeFS()
 	m.startPump()
 	m.busy = true
@@ -418,6 +506,23 @@ func (m *Model) onConnected(msg connectedMsg) tea.Cmd {
 }
 
 func (m *Model) handleCommanderKey(k tea.KeyMsg) tea.Cmd {
+	// An open info box (F3/F4) is dismissed by any key except Ctrl+C.
+	if m.infoBox != nil {
+		if k.String() == "ctrl+c" {
+			return m.quit()
+		}
+		m.infoBox = nil
+		return nil
+	}
+	// A pending "cancel download?" confirmation: 'y' confirms, anything else aborts.
+	if m.dlCancelConfirm {
+		m.dlCancelConfirm = false
+		if k.String() == "y" && m.transfer != nil && m.dlCancel != nil {
+			m.dlCancel()
+			m.log(lineInfo, "cancelling "+m.transfer.name+"…")
+		}
+		return nil
+	}
 	switch k.String() {
 	case "ctrl+c":
 		return m.quit()
@@ -446,6 +551,16 @@ func (m *Model) handleCommanderKey(k tea.KeyMsg) tea.Cmd {
 	case " ", "insert":
 		m.activePanel().ToggleSelect()
 		m.activePanel().Move(1, m.panelRows)
+	case "*":
+		m.activePanel().InvertSelect()
+	case "f2":
+		m.cyclePanelSort()
+	case "f3":
+		m.showEntryInfo()
+	case "f4":
+		return m.checksumEntry()
+	case "ctrl+o":
+		m.fullLog = !m.fullLog
 	case "f5":
 		return m.download()
 	case "ctrl+r":
@@ -457,9 +572,11 @@ func (m *Model) handleCommanderKey(k tea.KeyMsg) tea.Cmd {
 		return m.openAdmin()
 	case "esc":
 		if m.transfer != nil && m.dlCancel != nil {
-			m.dlCancel()
-			m.log(lineInfo, "cancelling "+m.transfer.name+"…")
+			m.dlCancelConfirm = true // confirm before cancelling (spec §7)
 		}
+	case ":":
+		m.enterCmdMode()
+		return textinput.Blink
 	case "f1":
 		m.log(lineInfo, helpText)
 	}
@@ -606,7 +723,7 @@ func (m *Model) startNext() {
 	job := m.queue[0]
 	m.queue = m.queue[1:]
 	m.busy = true
-	m.transfer = &transferState{name: job.name}
+	m.transfer = &transferState{name: job.name, startedAt: time.Now()}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.dlCancel = cancel
 	m.log(lineInfo, "downloading "+job.name+"…")

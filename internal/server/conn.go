@@ -98,6 +98,7 @@ func (s *Server) handshake(sess *Session) bool {
 func (s *Server) authenticate(sess *Session, req proto.AuthRequest, cur *config.Settings) bool {
 	now := time.Now()
 	if s.guard.Banned(sess.IP, now) {
+		s.log.Warn("authentication rejected: banned", "ip", sess.IP, "login", req.Login)
 		sess.sendMsg(proto.AuthFail{Reason: proto.AuthFailBanned, Message: "too many attempts, temporarily banned"})
 		return false
 	}
@@ -121,10 +122,13 @@ func (s *Server) authenticate(sess *Session, req proto.AuthRequest, cur *config.
 			time.Sleep(s.authFailDelay)
 		}
 		reason := proto.AuthFailBadCredentials
+		reasonText := "bad_credentials"
 		if ok && !enabled {
 			reason = proto.AuthFailUserDisabled
+			reasonText = "user_disabled"
 		}
 		banned := s.guard.Fail(sess.IP, now, time.Duration(cur.Limits.AuthFailBanS)*time.Second)
+		s.log.Warn("authentication failed", "ip", sess.IP, "login", req.Login, "reason", reasonText, "banned", banned)
 		msg := "authentication failed"
 		if banned {
 			msg = "authentication failed; too many attempts, temporarily banned"
@@ -136,6 +140,7 @@ func (s *Server) authenticate(sess *Session, req proto.AuthRequest, cur *config.
 	// Atomically enforce the per-user session cap and mark authenticated, so
 	// concurrent logins for one user cannot all pass the check (CR-06).
 	if !s.reg.reserveUserSlot(sess, req.Login, role, cur.Limits.MaxSessionsPerUser) {
+		s.log.Warn("authentication rejected: too many sessions", "ip", sess.IP, "login", req.Login)
 		sess.sendMsg(proto.AuthFail{Reason: proto.AuthFailTooManySession, Message: "too many concurrent sessions"})
 		return false
 	}
@@ -214,7 +219,7 @@ func (s *Server) dispatch(sess *Session, m proto.Message) {
 	case proto.DownloadCancel:
 		sess.cancelDownload(req.TransferID)
 	case proto.AdminGetConfig, proto.AdminSet, proto.AdminListClients,
-		proto.AdminKick, proto.AdminStats, proto.AdminShutdown:
+		proto.AdminKick, proto.AdminStats, proto.AdminShutdown, proto.AdminReloadUsers:
 		s.handleAdmin(sess, m)
 	default:
 		// Anything else from a client is a protocol violation.

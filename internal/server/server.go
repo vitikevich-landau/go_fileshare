@@ -170,6 +170,7 @@ func (s *Server) Serve(ctx context.Context, grace time.Duration) error {
 	s.serveCancel = cancel
 
 	s.startWatcher(ctx)
+	s.startRateLimitReaper(ctx)
 	go func() {
 		<-ctx.Done()
 		s.ln.Close()
@@ -204,6 +205,32 @@ func (s *Server) Serve(ctx context.Context, grace time.Duration) error {
 		grace = time.Duration(g) * time.Second
 	}
 	return s.drain(grace)
+}
+
+// Rate-limit bucket reaper: drop per-client buckets idle longer than
+// rateReapTTL, checked every rateReapInterval, so the limiter's map stays
+// bounded for a churning user set (§8 bug 11 follow-up).
+const (
+	rateReapInterval = time.Minute
+	rateReapTTL      = 10 * time.Minute
+)
+
+// startRateLimitReaper launches the idle-bucket reaper, which stops on ctx.
+func (s *Server) startRateLimitReaper(ctx context.Context) {
+	go s.reapRateBuckets(ctx, rateReapInterval, rateReapTTL)
+}
+
+func (s *Server) reapRateBuckets(ctx context.Context, interval, ttl time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.limiter.Cleanup(ttl)
+		}
+	}
 }
 
 // requestShutdown triggers a graceful shutdown with the given grace period

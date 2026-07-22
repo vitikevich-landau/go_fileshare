@@ -38,9 +38,13 @@ type connectedMsg struct {
 	motd       string
 	role       proto.Role
 	profile    Profile
+	gen        int // the dial attempt this result belongs to
 }
 
-type connectErrMsg struct{ err error }
+type connectErrMsg struct {
+	err error
+	gen int
+}
 
 type remoteListingMsg struct {
 	path    string
@@ -67,6 +71,14 @@ type downloadErrMsg struct {
 	err  error
 }
 
+// checksumMsg carries the result of an F4 checksum request.
+type checksumMsg struct {
+	name string
+	algo proto.Algo
+	sum  [proto.ChecksumLen]byte
+	err  error
+}
+
 // eventMsg carries an async EVENT_*/PONG frame from the connection pump.
 type eventMsg struct{ m proto.Message }
 
@@ -82,7 +94,7 @@ type reconnectFailedMsg struct{ err error }
 // requires re-arming the listener.
 func fromChannel(msg tea.Msg) bool {
 	switch msg.(type) {
-	case progressMsg, downloadDoneMsg, downloadErrMsg, eventMsg, connLostMsg:
+	case progressMsg, downloadDoneMsg, downloadErrMsg, eventMsg, connLostMsg, checksumMsg:
 		return true
 	}
 	return false

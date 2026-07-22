@@ -58,6 +58,16 @@ type Settings struct {
 	Log      LogSettings      `json:"log"`
 }
 
+// MinPBKDF2Iters is the recommended PBKDF2 iteration count (the security floor
+// from docs/tz/06-security.md §2). It is ADVISORY, not enforced at load: because
+// the daemon announces this value in HELLO_OK *before* it learns the login
+// (challenge/response), it is a deployment-wide constant, so raising it would
+// invalidate every existing hash. Rejecting a below-floor config at load would
+// also block --reset-password (the very tool used to migrate). The daemon
+// therefore warns at startup instead, leaving old installs runnable while they
+// migrate. A per-user count needs the deferred B1-full handshake change.
+const MinPBKDF2Iters = 600_000
+
 // Default returns the built-in defaults (docs/tz/09-go-port.md §12.1).
 func Default() Settings {
 	return Settings{
@@ -69,7 +79,7 @@ func Default() Settings {
 		},
 		Checksum: ChecksumSettings{CacheFile: "checksums.cache"},
 		Events:   EventsSettings{Enabled: true, DebounceMs: 500},
-		Auth:     AuthSettings{UsersFile: "users.json", PBKDF2Iters: 200000},
+		Auth:     AuthSettings{UsersFile: "users.json", PBKDF2Iters: MinPBKDF2Iters},
 		Log:      LogSettings{Level: "info"},
 	}
 }

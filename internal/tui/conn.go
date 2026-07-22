@@ -118,8 +118,10 @@ func (m *Model) onEvent(pm proto.Message) tea.Cmd {
 		}
 	case proto.EventNotice:
 		m.log(lineInfo, "notice: "+e.Text)
+		m.journal(lineEvent, "notice: "+e.Text)
 	case proto.EventConfig:
 		m.log(lineInfo, fmt.Sprintf("config: %s = %s", e.Key, e.NewValue))
+		m.journal(lineInfo, fmt.Sprintf("config: %s = %s", e.Key, e.NewValue))
 		m.onAdminConfigEvent(e) // live-update the settings tab if open
 	}
 	return nil
@@ -137,6 +139,12 @@ func (m *Model) remotePanel() *Panel {
 // beginReconnect tears down the dropped connection and schedules a reconnect
 // attempt. It is idempotent while a reconnect is already in progress.
 func (m *Model) beginReconnect(cause error) tea.Cmd {
+	// Ignore a late conn-loss event from a session we already left (e.g. after an
+	// explicit `disconnect`): otherwise a stale connLostMsg/remoteErrMsg would
+	// silently turn a disconnect back into a background reconnect.
+	if m.screen != screenCommander {
+		return nil
+	}
 	if m.reconnecting {
 		return nil
 	}
@@ -177,6 +185,14 @@ func (m *Model) reconnectCmd() tea.Cmd {
 }
 
 func (m *Model) onReconnected(msg reconnectedMsg) tea.Cmd {
+	if !m.reconnecting || m.screen != screenCommander {
+		// We disconnected (or reset) while this reconnect was in flight: drop the
+		// late connection rather than adopting it invisibly.
+		if msg.client != nil {
+			msg.client.Close()
+		}
+		return nil
+	}
 	m.clientMu.Lock()
 	m.client = msg.client
 	m.clientMu.Unlock()
@@ -199,6 +215,9 @@ func (m *Model) onReconnected(msg reconnectedMsg) tea.Cmd {
 }
 
 func (m *Model) onReconnectFailed(msg reconnectFailedMsg) tea.Cmd {
+	if !m.reconnecting {
+		return nil // disconnected meanwhile: stop retrying
+	}
 	m.backoff *= 2
 	if m.backoff > maxBackoff {
 		m.backoff = maxBackoff

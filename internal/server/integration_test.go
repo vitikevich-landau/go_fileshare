@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,12 +29,33 @@ type env struct {
 	hub    *config.Hub
 	users  *auth.DB
 	guard  *auth.Guard
-	cancel context.CancelFunc
-	done   chan struct{}
+	cancel    context.CancelFunc
+	done      chan struct{}
+	logs      *syncBuffer
+	usersPath string
 }
 
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// syncBuffer is a goroutine-safe log sink so tests can assert on audit lines
+// while the server keeps writing from its connection goroutines.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
 }
 
 func makeFile(t *testing.T, path string, size int) []byte {
@@ -77,15 +100,18 @@ func newEnvWithConfig(t *testing.T, configPath string, configure func(*config.Se
 	if err != nil {
 		t.Fatal(err)
 	}
-	users, err := auth.Load(filepath.Join(t.TempDir(), "users.json"))
+	usersPath := filepath.Join(t.TempDir(), "users.json")
+	users, err := auth.Load(usersPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	guard := auth.NewGuard(3)
 
+	logs := &syncBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	srv := server.New(server.Options{
 		Hub: hub, VFS: v, Users: users, Guard: guard,
-		Logger: quietLogger(), ServerName: "test", AuthFailDelay: 0,
+		Logger: logger, ServerName: "test", AuthFailDelay: 0,
 		ConfigPath: configPath,
 	})
 	if err := srv.Listen("127.0.0.1:0"); err != nil {
@@ -102,7 +128,7 @@ func newEnvWithConfig(t *testing.T, configPath string, configure func(*config.Se
 		<-done
 		v.Close()
 	})
-	return &env{addr: srv.Addr().String(), share: share, hub: hub, users: users, guard: guard, cancel: cancel, done: done}
+	return &env{addr: srv.Addr().String(), share: share, hub: hub, users: users, guard: guard, cancel: cancel, done: done, logs: logs, usersPath: usersPath}
 }
 
 func dialNoAuth(t *testing.T, e *env) *client.Client {
@@ -113,6 +139,78 @@ func dialNoAuth(t *testing.T, e *env) *client.Client {
 	}
 	t.Cleanup(func() { c.Close() })
 	return c
+}
+
+func TestAdminReloadUsersDropsDisabled(t *testing.T) {
+	e := newEnv(t, nil)
+	// Seed root(admin) + vit(user) into the users file.
+	e.users.SetUser("root", proto.RoleAdmin, "rootpw", testIters)
+	e.users.SetUser("vit", proto.RoleUser, "vitpw", testIters)
+	if err := e.users.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	// vit connects and works.
+	cv, err := client.Dial(e.addr, client.Options{Login: "vit", Password: "vitpw"})
+	if err != nil {
+		t.Fatalf("vit dial: %v", err)
+	}
+	defer cv.Close()
+	if _, _, err := cv.ListDir("/"); err != nil {
+		t.Fatalf("vit list before disable: %v", err)
+	}
+
+	// Disable vit in the FILE ONLY (a second handle), leaving the live DB alone,
+	// so the drop can only happen via the reload re-reading the file.
+	fileDB, err := auth.Load(e.usersPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fileDB.SetEnabled("vit", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := fileDB.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	// An admin triggers the reload over the network.
+	ca, err := client.Dial(e.addr, client.Options{Login: "root", Password: "rootpw"})
+	if err != nil {
+		t.Fatalf("root dial: %v", err)
+	}
+	defer ca.Close()
+	if ok, msg, err := ca.AdminReloadUsers(); err != nil || !ok {
+		t.Fatalf("reload users: ok=%v msg=%q err=%v", ok, msg, err)
+	}
+
+	// vit's session must be dropped: its next request fails.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, _, err := cv.ListDir("/"); err != nil {
+			break // dropped as expected
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("vit's session was not dropped after the user was disabled + reloaded")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestAuthFailureIsAudited(t *testing.T) {
+	e := newEnv(t, nil)
+	e.users.SetUser("vit", proto.RoleUser, "correct", testIters)
+
+	// A wrong password must be refused AND recorded (docs/tz/06-security.md §5).
+	if _, err := client.Dial(e.addr, client.Options{Login: "vit", Password: "wrong"}); err == nil {
+		t.Fatal("expected auth to fail with a wrong password")
+	}
+	logs := e.logs.String()
+	if !strings.Contains(logs, "authentication failed") {
+		t.Fatalf("failed authentication was not audited:\n%s", logs)
+	}
+	if !strings.Contains(logs, "login=vit") || !strings.Contains(logs, "reason=bad_credentials") {
+		t.Fatalf("audit line missing login/reason:\n%s", logs)
+	}
 }
 
 func TestNoAuthListStatChecksumDownload(t *testing.T) {

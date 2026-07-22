@@ -656,6 +656,20 @@ func (c *Client) AdminShutdown(graceSeconds uint32) (bool, string, error) {
 	return r.OK, r.Message, nil
 }
 
+// AdminReloadUsers asks the server to re-read users.json and drop the sessions
+// of any now-disabled/removed user.
+func (c *Client) AdminReloadUsers() (bool, string, error) {
+	if err := c.writeMsg(proto.AdminReloadUsers{}); err != nil {
+		return false, "", err
+	}
+	m, err := c.recvExpect(proto.MsgAdminReloadUsersRes)
+	if err != nil {
+		return false, "", err
+	}
+	r := m.(proto.AdminReloadUsersResult)
+	return r.OK, r.Message, nil
+}
+
 // Interrupt unblocks a read in progress from another goroutine (e.g. to quit
 // the TUI mid-download) by setting an immediate read deadline.
 func (c *Client) Interrupt() {

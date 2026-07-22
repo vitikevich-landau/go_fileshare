@@ -65,6 +65,8 @@ const (
 	MsgAdminStatsResp      Msg = 0x59
 	MsgAdminShutdown       Msg = 0x5A
 	MsgAdminShutdownResult Msg = 0x5B
+	MsgAdminReloadUsers    Msg = 0x5C
+	MsgAdminReloadUsersRes Msg = 0x5D
 )
 
 // Known reports whether m is a message type defined by the protocol. Framing
@@ -79,7 +81,8 @@ func (m Msg) Known() bool {
 		MsgSubscribe, MsgEventFs, MsgEventNotice, MsgEventConfig,
 		MsgAdminGetConfig, MsgAdminConfig, MsgAdminSet, MsgAdminSetResult,
 		MsgAdminListClients, MsgAdminClients, MsgAdminKick, MsgAdminKickResult,
-		MsgAdminStats, MsgAdminStatsResp, MsgAdminShutdown, MsgAdminShutdownResult:
+		MsgAdminStats, MsgAdminStatsResp, MsgAdminShutdown, MsgAdminShutdownResult,
+		MsgAdminReloadUsers, MsgAdminReloadUsersRes:
 		return true
 	}
 	return false
@@ -108,6 +111,7 @@ var msgNames = map[Msg]string{
 	MsgAdminKick: "ADMIN_KICK", MsgAdminKickResult: "ADMIN_KICK_RESULT",
 	MsgAdminStats: "ADMIN_STATS", MsgAdminStatsResp: "ADMIN_STATS_RESPONSE",
 	MsgAdminShutdown: "ADMIN_SHUTDOWN", MsgAdminShutdownResult: "ADMIN_SHUTDOWN_RESULT",
+	MsgAdminReloadUsers: "ADMIN_RELOAD_USERS", MsgAdminReloadUsersRes: "ADMIN_RELOAD_USERS_RESULT",
 }
 
 // AuthMode is the server's authentication requirement, announced in HELLO_OK.

@@ -9,12 +9,13 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/client"
 )
 
-// dialCmd connects and authenticates in the background.
-func dialCmd(addr string, opts client.Options, prof Profile) tea.Cmd {
+// dialCmd connects and authenticates in the background. gen tags the result so
+// a stale attempt (e.g. one the user cancelled with Esc) can be ignored.
+func dialCmd(addr string, opts client.Options, prof Profile, gen int) tea.Cmd {
 	return func() tea.Msg {
 		c, err := client.Dial(addr, opts)
 		if err != nil {
-			return connectErrMsg{err: err}
+			return connectErrMsg{err: err, gen: gen}
 		}
 		return connectedMsg{
 			client:     c,
@@ -22,6 +23,7 @@ func dialCmd(addr string, opts client.Options, prof Profile) tea.Cmd {
 			motd:       c.Motd(),
 			role:       c.Role(),
 			profile:    prof,
+			gen:        gen,
 		}
 	}
 }

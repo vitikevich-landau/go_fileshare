@@ -47,7 +47,8 @@ func (m *Model) viewConnect() string {
 	}
 	b.WriteString(styDim.Render("  [Enter] connect   [Tab] next field   [Esc] quit") + "\n")
 	if m.connecting {
-		b.WriteString("\n  " + m.status + "\n")
+		b.WriteString("\n  " + m.spinner.View() + " " + m.status + "\n")
+		b.WriteString(styDim.Render("  TCP → handshake → auth → loading    [Esc to cancel]") + "\n")
 	}
 	if m.connectErr != "" {
 		b.WriteString("\n  " + styErr.Render("error: "+m.connectErr) + "\n")
@@ -56,6 +57,9 @@ func (m *Model) viewConnect() string {
 }
 
 func (m *Model) viewCommander() string {
+	if m.fullLog {
+		return m.viewFullLog()
+	}
 	colW := (m.width - 3) / 2
 	if colW < 12 {
 		colW = 12
@@ -72,10 +76,43 @@ func (m *Model) viewCommander() string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString(m.renderOpLog(4))
+	if m.infoBox != nil {
+		b.WriteString(m.renderInfoBox())
+	} else {
+		b.WriteString(m.renderOpLog(4))
+	}
+	b.WriteString(m.renderTransfer() + "\n")
+	if m.dlCancelConfirm {
+		b.WriteString(styErr.Render(fit("Cancel current download? [y] yes · any other key no", m.width)) + "\n")
+	} else {
+		b.WriteString(m.renderPrompt() + "\n")
+	}
+	b.WriteString(m.renderFbar())
+	return b.String()
+}
+
+// viewFullLog renders the fullscreen operation log (Ctrl+O).
+func (m *Model) viewFullLog() string {
+	var b strings.Builder
+	b.WriteString(styActiveTitle.Render(fit(" Operation log · Ctrl+O to close", m.width)) + "\n")
+	rows := m.panelRows + 2
+	if rows < 4 {
+		rows = 4
+	}
+	b.WriteString(m.renderOpLog(rows))
 	b.WriteString(m.renderTransfer() + "\n")
 	b.WriteString(m.renderPrompt() + "\n")
 	b.WriteString(m.renderFbar())
+	return b.String()
+}
+
+// renderInfoBox renders the F3/F4 info/checksum box in the op-log slot.
+func (m *Model) renderInfoBox() string {
+	var b strings.Builder
+	b.WriteString(styActiveTitle.Render(fit(" info · any key to close", m.width)) + "\n")
+	for _, line := range m.infoBox {
+		b.WriteString(fit("  "+line, m.width) + "\n")
+	}
 	return b.String()
 }
 
@@ -84,22 +121,26 @@ func (m *Model) renderPanelLines(idx, colW int) []string {
 	p := m.panels[idx]
 	active := idx == m.active
 
-	titleText := p.Label
-	if p.Remote {
-		link := "○"
-		switch m.link {
-		case linkUp:
-			link = "●"
-		case linkReconnect:
-			link = "◐"
-		}
-		titleText = fmt.Sprintf("%s %s", link, p.Label)
-	}
 	titleStyle := styInactiveTitle
 	if active {
 		titleStyle = styActiveTitle
 	}
-	lines := []string{titleStyle.Render(fit(titleText, colW-2))}
+	var title string
+	if p.Remote {
+		// The connection symbol is colour-coded (green/yellow/red) and sits
+		// outside the title bar so it keeps its own colour.
+		sym := "○"
+		switch m.link {
+		case linkUp:
+			sym = "●"
+		case linkReconnect:
+			sym = "◐"
+		}
+		title = linkColor(m.link).Render(sym) + " " + titleStyle.Render(fit(p.Label, colW-4))
+	} else {
+		title = titleStyle.Render(fit(p.Label, colW-2))
+	}
+	lines := []string{title}
 
 	for row := 0; row < m.panelRows; row++ {
 		idxE := p.Top + row
@@ -118,6 +159,14 @@ func (m *Model) renderPanelLines(idx, colW int) []string {
 		status += fmt.Sprintf(" · new: %d", n)
 	}
 	lines = append(lines, styDim.Render(fit(status, colW)))
+
+	// While reconnecting, drop a red plaque across the remote panel.
+	if p.Remote && m.link == linkReconnect {
+		mid := 1 + m.panelRows/2 // below the title
+		if mid > 0 && mid < len(lines)-1 {
+			lines[mid] = styPlaque.Render(fit("  ⚠ CONNECTION LOST — reconnecting…", colW))
+		}
+	}
 	return lines
 }
 
@@ -199,15 +248,47 @@ func (m *Model) renderOpLog(n int) string {
 
 func (m *Model) renderTransfer() string {
 	if m.transfer == nil {
-		return strings.Repeat(" ", 0)
+		if n := len(m.queue); n > 0 {
+			return styDim.Render(fmt.Sprintf("%d queued", n))
+		}
+		return ""
 	}
+	t := m.transfer
 	pct := 0.0
-	if m.transfer.total > 0 {
-		pct = float64(m.transfer.received) / float64(m.transfer.total)
+	if t.total > 0 {
+		pct = float64(t.received) / float64(t.total)
 	}
 	bar := m.prog.ViewAs(pct)
-	return fmt.Sprintf("%s %s %s/%s", bar, m.transfer.name,
-		formatSize(m.transfer.received), formatSize(m.transfer.total))
+	speed, eta := transferRate(t)
+	line := fmt.Sprintf("%s %s %s/%s  %s  ETA %s", bar, t.name,
+		formatSize(t.received), formatSize(t.total), speed, eta)
+	if n := len(m.queue); n > 0 {
+		line += fmt.Sprintf("  (+%d queued)", n)
+	}
+	return line
+}
+
+// transferRate returns the average speed and estimated time remaining for an
+// in-flight transfer, as display strings.
+func transferRate(t *transferState) (speed, eta string) {
+	elapsed := time.Since(t.startedAt).Seconds()
+	if elapsed <= 0 || t.received == 0 {
+		return "--/s", "--"
+	}
+	bps := float64(t.received) / elapsed
+	speed = formatSize(uint64(bps)) + "/s"
+	if t.total > t.received && bps > 0 {
+		return speed, formatDuration(float64(t.total-t.received) / bps)
+	}
+	return speed, "0s"
+}
+
+// formatDuration renders a second count as a rounded Go duration ("1m23s").
+func formatDuration(seconds float64) string {
+	if seconds < 0 || seconds > 99*3600 {
+		return "--"
+	}
+	return time.Duration(seconds * float64(time.Second)).Round(time.Second).String()
 }
 
 func (m *Model) renderPrompt() string {
@@ -216,7 +297,11 @@ func (m *Model) renderPrompt() string {
 	if login == "" {
 		login = "anon"
 	}
-	return styPrompt.Render(fmt.Sprintf("%s@%s:%s$", login, m.serverName, path))
+	base := styPrompt.Render(fmt.Sprintf("%s@%s:%s$", login, m.serverName, path))
+	if m.cmdMode {
+		return base + " " + m.cmdInput.View()
+	}
+	return base
 }
 
 func (m *Model) renderFbar() string {

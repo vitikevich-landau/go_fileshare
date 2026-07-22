@@ -25,9 +25,22 @@ func (s *Server) handleAdmin(sess *Session, m proto.Message) {
 		s.adminStats(sess)
 	case proto.AdminShutdown:
 		s.adminShutdown(sess, req)
+	case proto.AdminReloadUsers:
+		s.adminReloadUsers(sess)
 	default:
 		sess.sendMsg(proto.Error{Code: proto.ErrBadRequest, Message: "unknown admin message"})
 	}
+}
+
+func (s *Server) adminReloadUsers(sess *Session) {
+	dropped, err := s.ReloadUsers()
+	if err != nil {
+		sess.sendMsg(proto.AdminReloadUsersResult{OK: false, Message: err.Error()})
+		return
+	}
+	s.log.Info("admin reload users", "admin", sess.Login(), "dropped_sessions", dropped)
+	s.BroadcastNotice(proto.SevInfo, fmt.Sprintf("%s reloaded users (%d session(s) dropped)", sess.Login(), dropped))
+	sess.sendMsg(proto.AdminReloadUsersResult{OK: true, Message: fmt.Sprintf("reloaded; %d session(s) dropped", dropped)})
 }
 
 func (s *Server) adminGetConfig(sess *Session) {
@@ -85,19 +98,21 @@ func (s *Server) adminKick(sess *Session, req proto.AdminKick) {
 		return
 	}
 	s.log.Info("admin kick", "admin", sess.Login(), "target_session", req.SessionID, "target_login", target.Login())
+	s.BroadcastNotice(proto.SevWarn, fmt.Sprintf("%s kicked session %d (%s)", sess.Login(), req.SessionID, target.Login()))
 	target.conn.Close() // unblocks its reader/writer; the handler tears down
 	sess.sendMsg(proto.AdminKickResult{OK: true, Message: fmt.Sprintf("kicked session %d", req.SessionID)})
 }
 
 func (s *Server) adminStats(sess *Session) {
 	lim := s.hub.Current().Limits
+	files, _ := s.vfs.ShareStats() // cached; walks in the background at most every 30s
 	sess.sendMsg(proto.AdminStatsResponse{
 		UptimeS:         uint64(time.Since(s.start).Seconds()),
 		BytesSent:       s.bytesSent.Load(),
 		Completed:       s.completed.Load(),
 		ActiveConns:     uint64(s.activeConns.Load()),
 		ActiveDownloads: uint64(s.activeDownloads.Load()),
-		SharedFiles:     0, // not counted (avoids walking large trees)
+		SharedFiles:     files,
 		PerClientBps:    lim.PerClientBps,
 		GlobalBps:       lim.GlobalBps,
 		Version:         s.version,

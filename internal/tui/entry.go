@@ -20,11 +20,46 @@ type Entry struct {
 	IsUp    bool // the synthetic ".." parent entry
 }
 
-// sortEntries orders directories before files, then by name.
-func sortEntries(es []Entry) {
+// sortMode selects the panel ordering (F2 cycles through these).
+type sortMode int
+
+const (
+	sortByName sortMode = iota
+	sortBySize
+	sortByDate
+	sortModeCount
+)
+
+func (s sortMode) String() string {
+	switch s {
+	case sortBySize:
+		return "size"
+	case sortByDate:
+		return "date"
+	default:
+		return "name"
+	}
+}
+
+// sortEntries orders directories before files, then by name (default order).
+func sortEntries(es []Entry) { sortEntriesBy(es, sortByName) }
+
+// sortEntriesBy orders directories before files, then by the chosen key. Size
+// and date sort largest/newest first; ties fall back to name.
+func sortEntriesBy(es []Entry, mode sortMode) {
 	sort.SliceStable(es, func(i, j int) bool {
 		if es[i].IsDir != es[j].IsDir {
 			return es[i].IsDir
+		}
+		switch mode {
+		case sortBySize:
+			if es[i].Size != es[j].Size {
+				return es[i].Size > es[j].Size
+			}
+		case sortByDate:
+			if es[i].Mtime != es[j].Mtime {
+				return es[i].Mtime > es[j].Mtime
+			}
 		}
 		return es[i].Name < es[j].Name
 	})

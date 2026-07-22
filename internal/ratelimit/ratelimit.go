@@ -28,6 +28,7 @@ type clientLim struct {
 	lim      *rate.Limiter
 	bps      uint64
 	lastUsed time.Time
+	active   int // in-flight WaitN calls; a bucket with active > 0 is never reaped
 }
 
 // New returns a limiter that starts unlimited.
@@ -47,12 +48,12 @@ func (l *Limiter) Wait(ctx context.Context, clientKey string, perClientBps, glob
 			return err
 		}
 	}
-	if c := l.clientLimiter(clientKey, perClientBps); c != nil {
-		if err := c.WaitN(ctx, n); err != nil {
-			return err
-		}
+	cl := l.acquireClient(clientKey, perClientBps)
+	if cl == nil {
+		return nil // unlimited per-client
 	}
-	return nil
+	defer l.releaseClient(clientKey)
+	return cl.lim.WaitN(ctx, n)
 }
 
 func (l *Limiter) globalLimiter(bps uint64) *rate.Limiter {
@@ -68,7 +69,10 @@ func (l *Limiter) globalLimiter(bps uint64) *rate.Limiter {
 	return l.global
 }
 
-func (l *Limiter) clientLimiter(key string, bps uint64) *rate.Limiter {
+// acquireClient returns the per-client bucket (creating/retuning it) and marks
+// one in-flight reservation, so the reaper cannot drop it mid-wait. The caller
+// must pair every non-nil return with releaseClient.
+func (l *Limiter) acquireClient(key string, bps uint64) *clientLim {
 	if bps == 0 {
 		return nil // unlimited
 	}
@@ -82,8 +86,22 @@ func (l *Limiter) clientLimiter(key string, bps uint64) *rate.Limiter {
 		cl.lim.SetLimit(rate.Limit(bps))
 		cl.bps = bps
 	}
+	cl.active++
 	cl.lastUsed = time.Now()
-	return cl.lim
+	return cl
+}
+
+// releaseClient ends one reservation and refreshes lastUsed, so a bucket that
+// spent a long time in WaitN is dated from when the wait finished, not started.
+func (l *Limiter) releaseClient(key string) {
+	l.mu.Lock()
+	if cl := l.clients[key]; cl != nil {
+		if cl.active > 0 {
+			cl.active--
+		}
+		cl.lastUsed = time.Now()
+	}
+	l.mu.Unlock()
 }
 
 // Cleanup drops per-client buckets unused for longer than ttl, bounding memory
@@ -92,9 +110,17 @@ func (l *Limiter) Cleanup(ttl time.Duration) {
 	cutoff := time.Now().Add(-ttl)
 	l.mu.Lock()
 	for k, cl := range l.clients {
-		if cl.lastUsed.Before(cutoff) {
+		if cl.active == 0 && cl.lastUsed.Before(cutoff) {
 			delete(l.clients, k)
 		}
 	}
 	l.mu.Unlock()
+}
+
+// ClientCount returns the number of live per-client buckets. Used by the
+// bucket-reaper test and any future metrics.
+func (l *Limiter) ClientCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.clients)
 }

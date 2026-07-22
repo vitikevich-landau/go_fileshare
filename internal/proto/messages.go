@@ -103,6 +103,10 @@ func decodeBody(typ Msg, r *reader) (Message, error) {
 		return decodeAdminShutdown(r)
 	case MsgAdminShutdownResult:
 		return decodeAdminShutdownResult(r)
+	case MsgAdminReloadUsers:
+		return AdminReloadUsers{}, nil
+	case MsgAdminReloadUsersRes:
+		return decodeAdminReloadUsersResult(r)
 	}
 	return nil, fmt.Errorf("proto: cannot decode msg type 0x%02x", byte(typ))
 }
@@ -891,6 +895,34 @@ func (m AdminShutdownResult) encode(w *writer) {
 }
 func decodeAdminShutdownResult(r *reader) (AdminShutdownResult, error) {
 	var m AdminShutdownResult
+	ok, err := r.u8()
+	if err != nil {
+		return m, err
+	}
+	m.OK = ok != 0
+	if m.Message, err = r.str(MaxStringLen); err != nil {
+		return m, err
+	}
+	return m, nil
+}
+
+type AdminReloadUsers struct{}
+
+func (AdminReloadUsers) Type() Msg        { return MsgAdminReloadUsers }
+func (AdminReloadUsers) encode(w *writer) {}
+
+type AdminReloadUsersResult struct {
+	OK      bool
+	Message string
+}
+
+func (AdminReloadUsersResult) Type() Msg { return MsgAdminReloadUsersRes }
+func (m AdminReloadUsersResult) encode(w *writer) {
+	w.u8(boolU8(m.OK))
+	w.str(m.Message)
+}
+func decodeAdminReloadUsersResult(r *reader) (AdminReloadUsersResult, error) {
+	var m AdminReloadUsersResult
 	ok, err := r.u8()
 	if err != nil {
 		return m, err

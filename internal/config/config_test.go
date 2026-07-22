@@ -63,6 +63,27 @@ func TestValidateErrors(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsLegacyPBKDF2(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	s := Default()
+	s.Auth.PBKDF2Iters = 200000 // below the recommended floor
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	// A below-floor value is advisory: it must still load (so old installs run
+	// and --reset-password works), preserving the legacy value.
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("legacy below-floor config must still load: %v", err)
+	}
+	if loaded.Auth.PBKDF2Iters != 200000 {
+		t.Fatalf("legacy iters not preserved: got %d", loaded.Auth.PBKDF2Iters)
+	}
+	if loaded.Auth.PBKDF2Iters >= MinPBKDF2Iters {
+		t.Fatal("test precondition: value should be below the floor")
+	}
+}
+
 func TestSaveReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	s := Default()

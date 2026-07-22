@@ -30,6 +30,7 @@ var (
 
 	styFbar   = lipgloss.NewStyle().Foreground(colBlack).Background(colCyan)
 	styPrompt = lipgloss.NewStyle().Foreground(colGreen)
+	styPlaque = lipgloss.NewStyle().Bold(true).Foreground(colWhite).Background(colRed)
 )
 
 func linkColor(l linkState) lipgloss.Style {

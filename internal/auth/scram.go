@@ -13,9 +13,10 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/proto"
 )
 
-// DefaultIters is the default PBKDF2 iteration count. The server announces the
-// effective value in HELLO_OK so the client derives with the same parameter.
-const DefaultIters = 200000
+// DefaultIters is the default PBKDF2 iteration count for new users. The server
+// announces the effective value in HELLO_OK so the client derives with the same
+// parameter. Set to the security floor per docs/tz/06-security.md §2.
+const DefaultIters = 600_000
 
 const clientKeyLabel = "Client Key"
 

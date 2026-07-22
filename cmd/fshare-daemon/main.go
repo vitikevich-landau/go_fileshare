@@ -82,6 +82,11 @@ func main() {
 func run(cfg config.Settings, configPath string) error {
 	logger, levelVar := newLogger(cfg.Log.Level)
 
+	if cfg.Auth.PBKDF2Iters < config.MinPBKDF2Iters {
+		logger.Warn("auth.pbkdf2_iters is below the recommended floor; raise it and re-create users with --reset-password",
+			"pbkdf2_iters", cfg.Auth.PBKDF2Iters, "recommended", config.MinPBKDF2Iters)
+	}
+
 	v, err := vfs.New(cfg.Server.ShareRoot, cfg.Checksum.CacheFile)
 	if err != nil {
 		return err
@@ -124,8 +129,14 @@ func run(cfg config.Settings, configPath string) error {
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
 		for range hup {
+			// Always hot-reload users.json (its path is independent of --config)
+			// and drop sessions of any now-disabled user (§3.3).
+			if dropped, err := srv.ReloadUsers(); err != nil {
+				logger.Error("SIGHUP user reload failed", "err", err)
+			} else {
+				logger.Info("users reloaded (SIGHUP)", "dropped_sessions", dropped)
+			}
 			if configPath == "" {
-				logger.Warn("SIGHUP ignored: no --config file")
 				continue
 			}
 			nc, err := config.Load(configPath)
