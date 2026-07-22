@@ -518,12 +518,21 @@ func (c *Client) downloadOnce(ctx context.Context, remotePath, localPath string,
 			// Verify against whichever checksum the server used. SHA-256 fills
 			// the whole 32-byte field; CRC-32 uses the first 4 bytes (big-endian,
 			// the protocol's integer convention), the rest zero. This keeps
-			// interop with a CRC32-configured C++ server (RR-2).
-			if bad, herr := checksumMismatch(partPath, v.Algo, v.Checksum); herr != nil {
+			// interop with a CRC32-configured C++ server (RR-2). The verify is
+			// ctx-aware, so a cancel while hashing a large .part aborts promptly and
+			// (via the deferred normalizer) returns ctx.Err() (R5-1); the DONE is
+			// already fully read, so the connection stays in sync.
+			if bad, herr := checksumMismatch(ctx, partPath, v.Algo, v.Checksum); herr != nil {
 				return herr
 			} else if bad {
 				os.Remove(partPath)
 				return errors.New("checksum mismatch after download")
+			}
+			// A cancel that lands at 100% (after DONE, during/after verify) must
+			// not publish the file and report success. Keep the verified .part for
+			// a later resume and report the cancellation (R5-1).
+			if err := ctx.Err(); err != nil {
+				return err
 			}
 			if err := os.Rename(partPath, localPath); err != nil {
 				return err // bug #3: only report success if the file is in place
@@ -657,17 +666,19 @@ func (c *Client) Interrupt() {
 func (c *Client) Close() error { return c.conn.Close() }
 
 // checksumMismatch reports whether the file's checksum differs from want, using
-// the algorithm the server declared. An unsupported/absent algorithm is an error.
-func checksumMismatch(path string, algo proto.Algo, want [proto.ChecksumLen]byte) (bool, error) {
+// the algorithm the server declared. An unsupported/absent algorithm is an
+// error. It is ctx-aware: verifying a large .part re-reads the whole file, so a
+// cancel during it aborts promptly and returns ctx.Err() (R5-1).
+func checksumMismatch(ctx context.Context, path string, algo proto.Algo, want [proto.ChecksumLen]byte) (bool, error) {
 	switch algo {
 	case proto.AlgoSHA256:
-		got, err := sha256File(path)
+		got, err := sha256File(ctx, path)
 		if err != nil {
 			return false, err
 		}
 		return got != want, nil
 	case proto.AlgoCRC32:
-		got, err := crc32File(path)
+		got, err := crc32File(ctx, path)
 		if err != nil {
 			return false, err
 		}
@@ -677,20 +688,20 @@ func checksumMismatch(path string, algo proto.Algo, want [proto.ChecksumLen]byte
 	}
 }
 
-func crc32File(path string) (uint32, error) {
+func crc32File(ctx context.Context, path string) (uint32, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, err
 	}
 	defer f.Close()
 	h := crc32.NewIEEE()
-	if _, err := io.Copy(h, f); err != nil {
+	if err := copyCtx(ctx, h, f); err != nil {
 		return 0, err
 	}
 	return h.Sum32(), nil
 }
 
-func sha256File(path string) ([proto.ChecksumLen]byte, error) {
+func sha256File(ctx context.Context, path string) ([proto.ChecksumLen]byte, error) {
 	var out [proto.ChecksumLen]byte
 	f, err := os.Open(path)
 	if err != nil {
@@ -698,9 +709,32 @@ func sha256File(path string) ([proto.ChecksumLen]byte, error) {
 	}
 	defer f.Close()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	if err := copyCtx(ctx, h, f); err != nil {
 		return out, err
 	}
 	copy(out[:], h.Sum(nil))
 	return out, nil
+}
+
+// copyCtx streams src into dst, checking ctx before each block so a long local
+// hash aborts promptly on cancellation, returning ctx.Err() (R5-1).
+func copyCtx(ctx context.Context, dst io.Writer, src io.Reader) error {
+	buf := make([]byte, 128<<10)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return werr
+			}
+		}
+		if rerr == io.EOF {
+			return nil
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
 }
