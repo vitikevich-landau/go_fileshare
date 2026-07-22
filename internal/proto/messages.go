@@ -279,11 +279,11 @@ func decodeHelloOk(r *reader) (HelloOk, error) {
 	return m, nil
 }
 
-// AuthRequest — клиент присылает логин и доказательство знания пароля
-// (HMAC от challenge). Сам пароль на проводе не появляется никогда.
+// AuthRequest — клиент присылает логин и доказательство знания пароля (SCRAM
+// ClientProof, см. тип Proof). Сам пароль на проводе не появляется никогда.
 type AuthRequest struct {
 	Login string // учётная запись
-	Proof Proof  // доказательство: HMAC(challenge, ключ-из-пароля)
+	Proof Proof  // ClientProof = ClientKey XOR HMAC(StoredKey, challenge||login)
 }
 
 func (AuthRequest) Type() Msg { return MsgAuthRequest }

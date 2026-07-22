@@ -113,8 +113,10 @@ type PBKDF2Iterations = uint32
 type Challenge = [ChallengeLen]byte
 
 // Proof — доказательство знания пароля, которое клиент присылает в
-// AUTH_REQUEST: HMAC от challenge на ключе, выведенном из пароля. Длина
-// фиксирована: ProofLen байт.
+// AUTH_REQUEST. Это SCRAM-значение ClientProof = ClientKey XOR
+// HMAC(StoredKey, challenge||login); сервер по нему восстанавливает ClientKey и
+// сверяет. Полная схема и вывод ключей — в пакете auth (auth.Proof/Verify).
+// Длина фиксирована: ProofLen байт.
 type Proof = [ProofLen]byte
 
 // ─── Файловая система и передачи ─────────────────────────────────────────────
