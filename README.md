@@ -1,5 +1,9 @@
 # go_fileshare — FShare Commander (Go)
 
+[![ci](https://github.com/vitikevich-landau/go_fileshare/actions/workflows/ci.yml/badge.svg)](https://github.com/vitikevich-landau/go_fileshare/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)](go.mod)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A from-scratch Go rewrite of the **fileshare v2** system ("FShare Commander"): a
 directory-tree file server with a custom binary protocol and a full-screen
 Midnight-Commander-style TUI client.
