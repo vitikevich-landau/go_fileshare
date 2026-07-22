@@ -156,21 +156,28 @@ func (m *Model) cmdInfo(names []string) tea.Cmd {
 }
 
 // doDisconnect closes the connection and returns to the connect screen. It must
-// not wait on clientMu (an active download holds it for the whole transfer), so
-// it cancels the transfer and any pending reconnect first, then closes the
-// socket directly — which unblocks the download's read. m.client is only ever
-// assigned on this (Update) goroutine, so reading it here without the lock is
-// safe (same rationale as quit()).
+// not wait on clientMu while HOLDING it (an active download holds it for the
+// whole transfer), so it cancels the transfer and any pending reconnect first,
+// then closes the socket OUTSIDE the lock — which unblocks the download's read.
+// The m.client pointer is cleared UNDER clientMu, because background readers
+// (pump/commands) read it under that lock; a single writer does not remove the
+// read/write data race. Reading the pointer once on this (Update) goroutine to
+// close it is safe: all writes to m.client happen on this goroutine.
 func (m *Model) doDisconnect() tea.Cmd {
 	m.stopPump()
 	if m.dlCancel != nil {
 		m.dlCancel() // cancel the active transfer's context
 	}
 	m.reconnecting = false // invalidate any pending reconnect (guarded in onReconnected)
-	if m.client != nil {
-		m.client.Close()
-		m.client = nil
+
+	c := m.client
+	if c != nil {
+		c.Close() // outside the lock: unblocks a download blocked in Read
 	}
+	m.clientMu.Lock()
+	m.client = nil // under the lock: no data race with concurrent locked readers
+	m.clientMu.Unlock()
+
 	m.transfer = nil
 	m.dlCancel = nil
 	m.queue = nil

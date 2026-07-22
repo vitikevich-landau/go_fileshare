@@ -139,6 +139,12 @@ func (m *Model) remotePanel() *Panel {
 // beginReconnect tears down the dropped connection and schedules a reconnect
 // attempt. It is idempotent while a reconnect is already in progress.
 func (m *Model) beginReconnect(cause error) tea.Cmd {
+	// Ignore a late conn-loss event from a session we already left (e.g. after an
+	// explicit `disconnect`): otherwise a stale connLostMsg/remoteErrMsg would
+	// silently turn a disconnect back into a background reconnect.
+	if m.screen != screenCommander {
+		return nil
+	}
 	if m.reconnecting {
 		return nil
 	}
