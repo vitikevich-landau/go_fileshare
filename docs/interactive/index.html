@@ -221,10 +221,11 @@ button:focus-visible,summary:focus-visible,.by:focus-visible{outline:2px solid v
 <h2>Слои зависимостей</h2>
 <pre>основа (только stdlib):     proto ·   config ·   ratelimit
 домен над протоколом:       vfs → proto ·  auth → proto ·  watcher → proto
-транспорт:                  client → auth, proto
-демон (собирает всё):       server → auth · client · config · proto · ratelimit · vfs · watcher
-UI:                         tui → auth · client · config · proto · server · vfs
-точки входа:                cmd/fshare-daemon · cmd/fshare-commander</pre>
+транспорт:                  client → auth · proto
+демон (собирает всё):       server → auth · config · proto · ratelimit · vfs · watcher
+UI:                         tui → client · proto
+точки входа:                cmd/fshare-daemon → auth·config·server·vfs
+                            cmd/fshare-commander → client·proto·tui</pre>
 <p class="note">В каждом пакете есть файл <code>types.go</code> — «словарь предметной области»: доменные величины сделаны <b>псевдонимами</b> базовых типов (<code>type SessionID = uint64</code>), поэтому сигнатуры читаются как утверждения о протоколе, а переименование поля не меняет ни одного байта на проводе.</p>
 </section>
 
@@ -475,17 +476,18 @@ themeBtn.addEventListener("click",function(){
   document.documentElement.setAttribute("data-theme",cur==="dark"?"light":"dark")});
 
 /* ─────────── карта пакетов ─────────── */
+/* dep — только PRODUCTION-импорты (go list .Imports, без *_test.go). */
 var pk=[
- {n:"proto",c:"cyan",dep:"— (только stdlib)",d:"Чистый проводной протокол: доменные типы, перечисления, кадрирование и big-endian кодек с проверкой границ. Импортируется всеми, не зависит ни от кого. Именно он гарантирует байт-в-байт совместимость с эталонным C++-узлом."},
- {n:"config",c:"cyan",dep:"— (только stdlib)",d:"Плоские Settings + Hub горячей перезагрузки. Читатели берут atomic-снимок без блокировок; писатели валидируют и атомарно подменяют. Делит ключи на hot и restart."},
- {n:"ratelimit",c:"cyan",dep:"x/time/rate",d:"Двухуровневый token bucket: глобальное ведро + ведро на логин. Лимит читается на каждом чанке — смена конфига перенастраивает идущую передачу. Reaper выселяет простаивающие вёдра."},
- {n:"vfs",c:"green",dep:"proto",d:"Дерево, запертое в share-root через os.Root. Три формы пути, ленивый checksum-кэш по (path,size,mtime-нс,ctime), фоновая статистика раздачи. Заключение путей — в одной точке."},
- {n:"auth",c:"green",dep:"proto",d:"SCRAM-подобный вход: цепочка ключей, StoredKey в users.json (пароль в базе не хранится), гард бана IP от перебора. Verify — константного времени."},
- {n:"watcher",c:"green",dep:"proto",d:"fsnotify → EVENT_FS: рекурсивная подписка на поддерево + debounce (одно сохранение = одно событие). Наружу отдаёт VirtualPath от корня раздачи."},
- {n:"client",c:"amber",dep:"auth · proto",d:"Блокирующий транспорт для TUI и --batch: рукопожатие, запросы, докачка с проверкой суммы, прозрачная пересылка асинхронных EVENT_*/PONG во время ожидания ответа."},
- {n:"server",c:"mag",dep:"auth·client·config·proto·ratelimit·vfs·watcher",d:"Ядро демона: цикл приёма, машина состояний на соединение (единственный писатель), авторизация каждого кадра по роли, обработчики FS/передачи/админа, корректная остановка."},
- {n:"tui",c:"amber",dep:"auth·client·config·proto·server·vfs",d:"fshare-commander на Bubble Tea (Elm): всё состояние в Model, меняется только в Update, рисуется в View. Сеть — в фоновых горутинах, мост в UI — один канал событий."},
- {n:"cmd",c:"dim",dep:"daemon + commander",d:"Точки входа: fshare-daemon собирает Hub/VFS/Users/Guard/Server и крутит Serve; fshare-commander запускает TUI (или --batch). Разбор флагов, --add-user, --check-config, сигналы."}
+ {n:"proto",c:"cyan",path:"internal/proto",dep:"— (только stdlib)",d:"Чистый проводной протокол: доменные типы, перечисления, кадрирование и big-endian кодек с проверкой границ. Импортируется всеми, не зависит ни от кого. Именно он гарантирует байт-в-байт совместимость с эталонным C++-узлом."},
+ {n:"config",c:"cyan",path:"internal/config",dep:"— (только stdlib)",d:"Плоские Settings + Hub горячей перезагрузки. Читатели берут atomic-снимок без блокировок; писатели валидируют и атомарно подменяют. Делит ключи на hot и restart."},
+ {n:"ratelimit",c:"cyan",path:"internal/ratelimit",dep:"x/time/rate (внешний)",d:"Двухуровневый token bucket: глобальное ведро + ведро на логин. Лимит читается на каждом чанке — смена конфига перенастраивает идущую передачу. Reaper выселяет простаивающие вёдра."},
+ {n:"vfs",c:"green",path:"internal/vfs",dep:"proto",d:"Дерево, запертое в share-root через os.Root. Три формы пути, ленивый checksum-кэш по (path,size,mtime-нс,ctime), фоновая статистика раздачи. Заключение путей — в одной точке."},
+ {n:"auth",c:"green",path:"internal/auth",dep:"proto",d:"SCRAM-подобный вход: цепочка ключей, StoredKey в users.json (пароль в базе не хранится), гард бана IP от перебора. Verify — константного времени."},
+ {n:"watcher",c:"green",path:"internal/watcher",dep:"proto",d:"fsnotify → EVENT_FS: рекурсивная подписка на поддерево + debounce (одно сохранение = одно событие). Наружу отдаёт VirtualPath от корня раздачи."},
+ {n:"client",c:"amber",path:"internal/client",dep:"auth · proto",d:"Блокирующий транспорт для TUI и --batch: рукопожатие, запросы, докачка с проверкой суммы, прозрачная пересылка асинхронных EVENT_*/PONG во время ожидания ответа."},
+ {n:"server",c:"mag",path:"internal/server",dep:"auth · config · proto · ratelimit · vfs · watcher",d:"Ядро демона: цикл приёма, машина состояний на соединение (единственный писатель), авторизация каждого кадра по роли, обработчики FS/передачи/админа, корректная остановка."},
+ {n:"tui",c:"amber",path:"internal/tui",dep:"client · proto",d:"fshare-commander на Bubble Tea (Elm): всё состояние в Model, меняется только в Update, рисуется в View. Сеть — в фоновых горутинах, мост в UI — один канал событий."},
+ {n:"cmd",c:"dim",path:"cmd/fshare-daemon · cmd/fshare-commander",dep:"точки входа",d:"Точки входа: fshare-daemon собирает Hub/VFS/Users/Guard/Server и крутит Serve (импортирует auth·config·server·vfs); fshare-commander запускает TUI/--batch (импортирует client·proto·tui). Разбор флагов, --add-user, --check-config, сигналы."}
 ];
 var pl=document.getElementById("pkgs"),pi=document.getElementById("pkginfo");
 pk.forEach(function(p){var b=document.createElement("button");
@@ -493,7 +495,7 @@ pk.forEach(function(p){var b=document.createElement("button");
   b.addEventListener("click",function(){
     pl.querySelectorAll("button").forEach(function(x){x.classList.remove("on")});
     b.classList.add("on");
-    pi.innerHTML="<b class='mono'>internal/"+p.n+"</b> <span class='dep'>← "+p.dep+"</span><br>"+p.d});
+    pi.innerHTML="<b class='mono'>"+p.path+"</b> <span class='dep'>← "+p.dep+"</span><br>"+p.d});
   pl.appendChild(b)});
 
 /* ─────────── карта байтов кадра ─────────── */
