@@ -1,0 +1,764 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>◈ go_fileshare — как устроен FShare Commander</title>
+<style>
+/* ────────────────────────────────────────────────────────────────
+   Токены. Палитра — «терминал + провод»: тёмный сланец, а роли
+   протокола раскрашены по семействам сообщений, чтобы один и тот же
+   цвет означал одно и то же на карте байтов, в карте сообщений и в
+   легенде: cyan — рукопожатие, green — файловая система, amber —
+   передача, blue — события, mag — админ, dim — служебные.
+   ──────────────────────────────────────────────────────────────── */
+:root{
+  --bg:#0d1117;--panel:#141b24;--panel2:#1b2430;--line:#26313f;
+  --ink:#d5dde6;--dim:#7d8a99;--amber:#e8b765;--cyan:#5ec8e5;--green:#8fce7a;
+  --red:#e06c6c;--mag:#c78ce0;--blue:#6ea8fe;--sel:#22303f;--good:#8fce7a;
+}
+@media (prefers-color-scheme: light){:root{
+  --bg:#f3f4ee;--panel:#fbfbf5;--panel2:#eceadf;--line:#d7d5c7;
+  --ink:#1f2733;--dim:#66707c;--amber:#9a6a12;--cyan:#0f6f97;--green:#3f7a24;
+  --red:#b13a3a;--mag:#8a3fa8;--blue:#255fd0;--sel:#e2e0d2;--good:#3f7a24;
+}}
+:root[data-theme="dark"]{
+  --bg:#0d1117;--panel:#141b24;--panel2:#1b2430;--line:#26313f;
+  --ink:#d5dde6;--dim:#7d8a99;--amber:#e8b765;--cyan:#5ec8e5;--green:#8fce7a;
+  --red:#e06c6c;--mag:#c78ce0;--blue:#6ea8fe;--sel:#22303f;--good:#8fce7a;
+}
+:root[data-theme="light"]{
+  --bg:#f3f4ee;--panel:#fbfbf5;--panel2:#eceadf;--line:#d7d5c7;
+  --ink:#1f2733;--dim:#66707c;--amber:#9a6a12;--cyan:#0f6f97;--green:#3f7a24;
+  --red:#b13a3a;--mag:#8a3fa8;--blue:#255fd0;--sel:#e2e0d2;--good:#3f7a24;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.65 -apple-system,"Segoe UI",Roboto,sans-serif}
+code,pre,.mono{font-family:ui-monospace,"Cascadia Code",Consolas,Menlo,monospace}
+a{color:var(--cyan)}
+.bar{display:flex;gap:.6em;align-items:baseline;padding:.55em 1em;
+  border-bottom:1px solid var(--line);background:var(--panel);
+  font-family:ui-monospace,Consolas,monospace;flex-wrap:wrap;position:sticky;top:0;z-index:5}
+.bar .eye{color:var(--amber);font-weight:700}
+.bar .crumb{color:var(--dim);font-size:.85em}
+.bar .theme{margin-left:auto;background:none;border:1px solid var(--line);color:var(--dim);
+  border-radius:4px;padding:.1em .6em;cursor:pointer;font:inherit;font-size:.8em}
+.bar .theme:hover{border-color:var(--amber);color:var(--amber)}
+.wrap{display:flex;min-height:calc(100vh - 84px)}
+nav{width:264px;flex:none;border-right:1px solid var(--line);background:var(--panel);
+  padding:.8em 0;font-family:ui-monospace,Consolas,monospace;font-size:.88em;
+  position:sticky;top:47px;height:calc(100vh - 47px);overflow-y:auto}
+nav .ztab{margin:.2em .8em .7em;color:var(--bg);background:var(--amber);
+  padding:.05em .5em;font-weight:700;display:inline-block}
+nav button{display:block;width:100%;text-align:left;background:none;border:0;
+  color:var(--ink);padding:.4em 1em;cursor:pointer;font:inherit;line-height:1.4}
+nav button:hover{background:var(--sel)}
+nav button.on{background:var(--sel);color:var(--amber)}
+nav button .k{color:var(--dim);margin-right:.55em;display:inline-block;width:1.1em}
+main{flex:1;min-width:0;padding:1.6em 2.2em 5em;max-width:940px}
+section{display:none}section.on{display:block}
+h1{font-family:ui-monospace,Consolas,monospace;font-size:1.5em;color:var(--amber);
+  text-wrap:balance;margin:.2em 0 .5em}
+h2{font-family:ui-monospace,Consolas,monospace;font-size:1.06em;color:var(--amber);
+  margin:1.7em 0 .5em;border-bottom:1px solid var(--line);padding-bottom:.25em}
+h3{font-family:ui-monospace,Consolas,monospace;font-size:.96em;color:var(--cyan);margin:1.2em 0 .3em}
+p,li{max-width:70ch}
+.lead{color:var(--ink);font-size:1.02em}
+.note{color:var(--dim);font-size:.92em}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+  padding:.85em 1.1em;margin:.8em 0}
+pre{background:var(--panel2);border:1px solid var(--line);border-radius:6px;
+  padding:.8em 1em;overflow-x:auto;font-size:.85em;line-height:1.5}
+kbd{background:var(--panel2);border:1px solid var(--line);border-radius:3px;
+  padding:0 .35em;font-family:ui-monospace,monospace;font-size:.85em}
+.status{position:fixed;left:0;right:0;bottom:0;background:var(--panel);
+  border-top:1px solid var(--line);color:var(--dim);padding:.35em 1em;
+  font:12px ui-monospace,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;z-index:5}
+.status b{color:var(--good);font-weight:400}
+details{border:1px solid var(--line);border-radius:6px;margin:.5em 0;background:var(--panel)}
+summary{cursor:pointer;padding:.55em .9em;font-family:ui-monospace,monospace;color:var(--cyan)}
+summary:hover{background:var(--sel)}
+details[open] summary{border-bottom:1px solid var(--line);color:var(--amber)}
+details .in{padding:.7em 1em}
+details .in p:first-child{margin-top:0}
+table{border-collapse:collapse;font-size:.88em;margin:.6em 0;width:100%}
+td,th{border:1px solid var(--line);padding:.34em .6em;text-align:left;vertical-align:top}
+th{background:var(--panel2);font-weight:600}
+.pill{display:inline-block;border:1px solid var(--line);border-radius:20px;
+  padding:.02em .6em;font-family:ui-monospace,monospace;font-size:.8em}
+.legend{display:flex;gap:1.1em;flex-wrap:wrap;font-size:.83em;color:var(--dim);margin:.6em 0}
+.legend i{display:inline-block;width:.85em;height:.85em;border-radius:2px;
+  vertical-align:-.05em;margin-right:.35em}
+/* ── карта пакетов ── */
+.pkgs{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.5em;
+  font-family:ui-monospace,monospace;font-size:.86em}
+.pkgs button{background:var(--panel2);border:1px solid var(--line);border-radius:6px;
+  color:var(--cyan);padding:.5em .6em;cursor:pointer;font:inherit;text-align:left;line-height:1.3}
+.pkgs button:hover,.pkgs button.on{border-color:var(--amber);color:var(--amber)}
+.pkgs button small{color:var(--dim);display:block;font-size:.82em;margin-top:.15em}
+#pkginfo b{color:var(--amber)}
+#pkginfo .dep{color:var(--dim);font-size:.85em}
+/* ── карта байтов кадра ── */
+.frametabs,.modes{display:flex;gap:.5em;margin:.7em 0 .3em;flex-wrap:wrap}
+.frametabs button,.modes button{background:var(--panel2);border:1px solid var(--line);border-radius:5px;
+  color:var(--ink);padding:.35em .8em;cursor:pointer;font:inherit;font-size:.86em}
+.frametabs button.on{border-color:var(--cyan);color:var(--cyan)}
+.modes button.on{border-color:var(--mag);color:var(--mag)}
+.bytes{display:flex;flex-wrap:wrap;gap:3px;font-family:ui-monospace,monospace;font-size:.82em;margin:.5em 0}
+.by{width:2.5em;height:2.1em;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  border-radius:3px;cursor:pointer;border:1px solid transparent;line-height:1}
+.by .ix{font-size:.62em;color:var(--dim);margin-bottom:1px}
+.by:hover,.by.hot{border-color:var(--amber);filter:brightness(1.3)}
+#byexp{min-height:5em}
+#byexp b{color:var(--amber)}
+.k-hdr{background:color-mix(in srgb,var(--dim) 26%,var(--panel2));color:var(--dim)}
+.k-num{background:color-mix(in srgb,var(--cyan) 26%,var(--panel2));color:var(--cyan)}
+.k-len{background:color-mix(in srgb,var(--amber) 26%,var(--panel2));color:var(--amber)}
+.k-str{background:color-mix(in srgb,var(--green) 26%,var(--panel2));color:var(--green)}
+.k-fix{background:color-mix(in srgb,var(--mag) 26%,var(--panel2));color:var(--mag)}
+.k-raw{background:color-mix(in srgb,var(--blue) 26%,var(--panel2));color:var(--blue)}
+.k-enum{background:color-mix(in srgb,var(--red) 26%,var(--panel2));color:var(--red)}
+/* ── карта сообщений ── */
+.grouptabs{display:flex;gap:.4em;margin:.6em 0;flex-wrap:wrap}
+.grouptabs button{background:var(--panel2);border:1px solid var(--line);border-radius:5px;
+  color:var(--ink);padding:.3em .7em;cursor:pointer;font:inherit;font-size:.82em;font-family:ui-monospace,monospace}
+.grouptabs button.on{border-color:currentColor}
+.msgrow td:first-child{white-space:nowrap;font-family:ui-monospace,monospace;color:var(--cyan)}
+.dir{font-family:ui-monospace,monospace;font-size:.82em;color:var(--dim);white-space:nowrap}
+.code{font-family:ui-monospace,monospace;color:var(--amber)}
+/* ── SCRAM ── */
+.chain{display:flex;flex-direction:column;gap:.35em;font-family:ui-monospace,monospace;font-size:.85em;margin:.6em 0}
+.node{border:1px solid var(--line);border-radius:6px;padding:.5em .8em;background:var(--panel2);
+  transition:border-color .15s,background .15s}
+.node .t{color:var(--amber);font-weight:700}
+.node .d{color:var(--dim);font-size:.92em;margin-top:.2em}
+.node.on{border-color:var(--mag);background:color-mix(in srgb,var(--mag) 12%,var(--panel2))}
+.node.stored{border-color:var(--red)}
+.arrow{color:var(--dim);text-align:center;font-size:.9em}
+/* ── сценарии ── */
+.flowtabs{display:flex;gap:.4em;margin:.6em 0;flex-wrap:wrap}
+.flowtabs button{background:var(--panel2);border:1px solid var(--line);border-radius:5px;
+  color:var(--ink);padding:.3em .7em;cursor:pointer;font:inherit;font-size:.82em}
+.flowtabs button.on{border-color:var(--amber);color:var(--amber)}
+.flow .step{display:grid;grid-template-columns:8.5em 1fr;gap:.6em;padding:.5em 0;border-top:1px solid var(--line)}
+.flow .step:first-child{border-top:0}
+.flow .actor{font-family:ui-monospace,monospace;font-size:.82em;color:var(--cyan);padding-top:.1em}
+.flow .act{font-size:.92em}
+.flow .wire{display:inline-block;margin-top:.35em;font-family:ui-monospace,monospace;font-size:.78em;
+  background:color-mix(in srgb,var(--amber) 14%,var(--panel2));color:var(--amber);
+  border:1px solid color-mix(in srgb,var(--amber) 40%,var(--line));border-radius:4px;padding:.05em .5em}
+.flow .wire.rx{background:color-mix(in srgb,var(--green) 12%,var(--panel2));color:var(--green);
+  border-color:color-mix(in srgb,var(--green) 40%,var(--line))}
+.flowsum{color:var(--dim);font-size:.9em;margin:.3em 0 .5em}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:.7em}
+@media (max-width:720px){.grid2{grid-template-columns:1fr}}
+.roadmap td .st{font-family:ui-monospace,monospace;font-size:.8em}
+.st.done{color:var(--good)}.st.future{color:var(--dim)}
+.diff{color:var(--mag)}
+button:focus-visible,summary:focus-visible,.by:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+@media (max-width:820px){.wrap{flex-direction:column}
+  nav{width:auto;position:static;height:auto;display:flex;overflow-x:auto;border-right:0;border-bottom:1px solid var(--line)}
+  nav .ztab{display:none}nav button{width:auto;white-space:nowrap}
+  main{padding:1.2em 1.1em 5em}}
+@media (prefers-reduced-motion:no-preference){section.on{animation:f .18s ease}
+  @keyframes f{from{opacity:.45}to{opacity:1}}}
+</style>
+
+<div class="bar"><span class="eye">◈ FShare Commander</span>
+<span class="crumb">go_fileshare — как устроен файловый сервер со своим протоколом и TUI-клиентом</span>
+<button class="theme" id="themeBtn" title="сменить тему">◑ тема</button></div>
+
+<div class="wrap">
+<nav aria-label="разделы"><span class="ztab">▌ ДЕРЕВО ▐</span>
+<button data-s="s1" class="on"><span class="k">1</span>▸ обзор системы</button>
+<button data-s="s2"><span class="k">2</span>▸ карта пакетов</button>
+<button data-s="s3"><span class="k">3</span>▸ кадр по байтам</button>
+<button data-s="s4"><span class="k">4</span>▸ карта сообщений</button>
+<button data-s="s5"><span class="k">5</span>▸ вход: SCRAM</button>
+<button data-s="s6"><span class="k">6</span>▸ сценарии вживую</button>
+<button data-s="s7"><span class="k">7</span>▸ структуры данных</button>
+<button data-s="s8"><span class="k">8</span>▸ конкурентность</button>
+<button data-s="s9"><span class="k">9</span>▸ безопасность</button>
+<button data-s="s10"><span class="k">0</span>▸ роадмап · с нуля</button>
+</nav>
+<main>
+
+<!-- ─────────────────────────── 1 ─────────────────────────── -->
+<section id="s1" class="on">
+<h1>Что такое FShare Commander — за 90 секунд</h1>
+<p class="lead"><b>go_fileshare</b> — клиент-серверная файлораздача на Go со <b>своим бинарным протоколом</b>. Два бинаря: демон, который раздаёт дерево каталогов по TCP, и полноэкранный TUI-клиент в стиле Midnight Commander. Это переписанный «с нуля» на Go порт C++-проекта <code>fileshare v2</code>; провод воспроизведён <b>байт-в-байт</b>, поэтому Go-сервер обслуживает эталонного C++-клиента и наоборот.</p>
+
+<div class="grid2">
+<div class="card"><b style="color:var(--cyan)">fshare-daemon</b> — сервер<br>
+<span class="note">Неинтерактивный демон: раздаёт дерево <code>share-root</code> через VFS, аутентификация challenge–response, push-события об изменениях файлов, живой конфиг (лимиты скорости) без перезапуска, корректная остановка, перезагрузка по <code>SIGHUP</code>.</span></div>
+<div class="card"><b style="color:var(--amber)">fshare-commander</b> — клиент<br>
+<span class="note">Две панели, горячие клавиши, докачка с прогрессом/скоростью/ETA, подсветка нового, индикатор связи + авто-реконнект, админ-панель по <kbd>F9</kbd>. Тот же бинарь работает и как <code>--batch</code> для скриптов.</span></div>
+</div>
+
+<h2>Конвейер данных</h2>
+<pre>[ TUI: Model–Update–View ]         [ Демон: горутина на соединение ]
+   панели · очередь · лог             ┌ writeLoop  единственный писатель в сокет
+        │  tea.Cmd (сеть вне UI)       ┤ serveRequests  читатель + авторизация
+        ▼                             └ idleWatchdog · streamFile (закачка)
+[ client: блокирующий транспорт ] ──TCP, кадры v2──▶ [ dispatch → Vfs / Transfer / Admin ]
+   Dial · List · Download · Ping                        │
+        ▲   EVENT_* приходят вне очереди                ▼
+        └──────────────────────────  [ Hub снапшоты · Registry · Watcher · RateLimiter ]</pre>
+
+<h2>Три идеи, на которых всё держится</h2>
+<div class="card"><b style="color:var(--cyan)">1. Session — центральная сущность.</b> До успешного <code>AUTH</code> соединение в состоянии <code>HANDSHAKE</code> и принимает только <code>HELLO/AUTH_*/PING</code>; таймаут рукопожатия (10 с) выкашивает полуоткрытые «слоу-лорис». После входа <b>диспетчер — единственная точка авторизации</b>: у каждого типа сообщения объявлена минимальная роль (anonymous/user/admin), и захваченная, но не-админская сессия отвергается сервером независимо от того, что нарисовал UI.</div>
+<div class="card"><b style="color:var(--amber)">2. Горячий конфиг через снапшоты.</b> <code>Hub</code> хранит <b>указатель на неизменяемый снимок</b> настроек в <code>atomic.Pointer</code>. Горячий путь (каждый чанк, каждый accept) делает <b>одну атомарную загрузку без блокировок</b>. Писатель строит новый снимок, валидирует и атомарно подменяет — гонок нет по построению, и смена лимита скорости тормозит уже идущую закачку без разрыва.</div>
+<div class="card"><b style="color:var(--green)">3. Сеть строго вне UI-потока.</b> В клиенте вся сеть живёт в фоновых горутинах, а с UI общается через <b>один канал событий</b>; в сервере <b>единственный writeLoop</b> на сессию делает кадры на проводе атомарными, а рассылки шлются неблокирующе и отбрасываются, если очередь клиента переполнена, чтобы один тормоз не задержал остальных.</div>
+
+<p class="note">Разделы 2–4 — про то, <i>из чего</i> система собрана (пакеты, байты кадра, карта сообщений). Разделы 5–6 — <i>как</i> она работает (вход и сквозные сценарии). Разделы 7–10 — <i>почему</i> так (структуры, конкурентность, безопасность, план). Прыгать по разделам можно клавишами <kbd>1</kbd>…<kbd>0</kbd>.</p>
+</section>
+
+<!-- ─────────────────────────── 2 ─────────────────────────── -->
+<section id="s2">
+<h1>Карта пакетов</h1>
+<p class="note">Клик по пакету — его роль, поля и связи. Стрелки внизу = «кто кого импортирует» (по реальным import'ам).</p>
+<div class="pkgs" id="pkgs"></div>
+<div class="card" id="pkginfo">Выбери пакет, чтобы увидеть его роль и зависимости.</div>
+
+<h2>Слои зависимостей</h2>
+<pre>основа (без внутр. импортов): proto ·  config ·  ratelimit (+ x/time/rate)
+домен над протоколом:       vfs → proto ·  auth → proto ·  watcher → proto
+транспорт:                  client → auth · proto
+демон (собирает всё):       server → auth · config · proto · ratelimit · vfs · watcher
+UI:                         tui → client · proto
+точки входа:                cmd/fshare-daemon → auth·config·server·vfs
+                            cmd/fshare-commander → client·proto·tui</pre>
+<p class="note">В каждом пакете есть файл <code>types.go</code> — «словарь предметной области»: доменные величины сделаны <b>псевдонимами</b> базовых типов (<code>type SessionID = uint64</code>), поэтому сигнатуры читаются как утверждения о протоколе, а переименование поля не меняет ни одного байта на проводе.</p>
+</section>
+
+<!-- ─────────────────────────── 3 ─────────────────────────── -->
+<section id="s3">
+<h1>Кадр по байтам</h1>
+<p>Всё общение идёт <b>кадрами</b>: 5-байтовый заголовок (тип + длина тела) и тело. Все числа — <b>big-endian</b>. Выбери сообщение и наведи (или тапни) на байт — каждый знает, что он кодирует.</p>
+<pre>┌────────────┬───────────────────────┬──────────────────────┐
+│ msg_type   │ payload_length        │ payload              │
+│ 1 байт u8  │ 4 байта u32, big-endian│ payload_length байт  │
+└────────────┴───────────────────────┴──────────────────────┘</pre>
+<div class="frametabs" id="frametabs"></div>
+<div class="legend">
+<span><i class="k-hdr"></i>заголовок</span>
+<span><i class="k-num"></i>число</span>
+<span><i class="k-len"></i>длина строки</span>
+<span><i class="k-str"></i>строка (UTF-8)</span>
+<span><i class="k-enum"></i>перечисление</span>
+<span><i class="k-fix"></i>фикс. байты</span>
+<span><i class="k-raw"></i>сырые данные</span>
+</div>
+<div class="bytes" id="bytes"></div>
+<div class="card" id="byexp"><b>Наведи на байт.</b><br><span class="note">Каждый байт знает свою роль: заголовок, число big-endian, префикс длины строки, сама строка, фиксированное поле (challenge/proof/checksum) или сырой хвост.</span></div>
+
+<h2>Правила и пределы (как в коде)</h2>
+<ul>
+<li><b>Строка</b> = длина <code>u16</code> + UTF-8 байты. Два исключения: <code>ADMIN_CONFIG</code> использует <code>u32</code>-префикс (JSON конфига), а <code>CHUNK_DATA</code> несёт сырые байты <b>без</b> префикса — их длину задаёт длина кадра (<code>payload_length − 4</code>).</li>
+<li><b>Строгий разбор</b>: после тела курсор обязан быть ровно в конце (<code>require_end</code>) — лишний байт означает рассинхрон и рвёт <i>только это</i> соединение. Каждый доступ к буферу проверяет границы и возвращает ошибку вместо паники: битый кадр не роняет процесс.</li>
+<li><b>Потолки до аллокации</b>: неизвестный тип отвергается ещё до чтения тела; счётчик записей проверяется против <code>MaxListEntries=1&lt;&lt;20</code> <i>перед</i> выделением; тело большого сообщения (листинг/конфиг) ограничено <code>4&nbsp;МиБ</code>, чанк — <code>64&nbsp;КиБ</code>, а <b>дорукопожатные</b> кадры — жёстким малым лимитом (~64 КиБ), чтобы аноним не заставил сервер что-то выделять.</li>
+</ul>
+</section>
+
+<!-- ─────────────────────────── 4 ─────────────────────────── -->
+<section id="s4">
+<h1>Карта сообщений</h1>
+<p>Семейство сообщения читается по старшему полубайту кода. Выбери группу — коды, направление, тело и минимальная роль. Это единый словарь запросов и ответов.</p>
+<div class="grouptabs" id="grouptabs"></div>
+<div id="msgtable"></div>
+
+<h2>Состояния соединения</h2>
+<pre>CONNECTED ──HELLO──▶ HELLO_RECEIVED ──AUTH_REQUEST──▶ AUTHED(role)
+    │                     │                              │
+ только HELLO/PING     только AUTH/PING             всё по роли (MinRole)
+    │  всё под одним дедлайном рукопожатия (10 с)        │  дедлайн снят: блокирующее
+    ▼  чужой первый байт → ERROR(UNSUPPORTED_VERSION)    ▼  чтение без пофреймового таймаута (RR-1)</pre>
+<p class="note">Диспетчер сверяет роль сессии с <code>MinRole(тип)</code>: <code>HELLO/AUTH_REQUEST/PING/PONG/ERROR</code> — anonymous; <code>LIST/STAT/CHECKSUM/DOWNLOAD_REQUEST/DOWNLOAD_CANCEL/SUBSCRIBE</code> — user; всё остальное (включая любой ответ/событие сервера и весь админ-канал) по умолчанию требует admin, а серверные коды от клиента вдобавок отвергаются как <code>BAD_REQUEST</code>. Роль ниже нужной → <code>ERROR(ACCESS_DENIED)</code>, но соединение живёт.</p>
+</section>
+
+<!-- ─────────────────────────── 5 ─────────────────────────── -->
+<section id="s5">
+<h1>Вход: SCRAM challenge–response</h1>
+<p>Два свойства объясняют всю конструкцию: <b>пароль никогда не пересекает сеть</b> (ни текстом, ни хешем), и <b>кража <code>users.json</code> не даёт войти</b> — в базе лежит лишь необратимый верификатор <code>StoredKey</code>. Выбери шаг — подсветятся значения, которые считает клиент, и то единственное, что хранит сервер.</p>
+<div class="modes" id="scrammodes">
+<button data-m="0" class="on">① вывод ключа</button>
+<button data-m="1">② доказательство</button>
+<button data-m="2">③ проверка на сервере</button>
+</div>
+<div class="chain" id="scramchain"></div>
+<div class="card" id="scramexp"></div>
+
+<h2>Почему кража базы бесполезна</h2>
+<p>В <code>users.json</code> хранится только <code>StoredKey = SHA256(ClientKey)</code>. Чтобы подделать <code>ClientProof</code>, нужен <code>ClientKey</code> — а он выводится из пароля и в базе его нет. Из <code>StoredKey</code> нельзя восстановить ни пароль, ни <code>ClientKey</code>. Одноразовый <code>challenge</code> (16 байт, крипто-random) делает и перехваченное доказательство бесполезным: его нельзя переиграть на новый вызов.</p>
+<div class="card note">
+<b>Детали, важные на практике.</b> Растяжение пароля — <b>PBKDF2-HMAC-SHA256</b> (порог <b>600 000</b> итераций; ниже — конфиг предупреждает при старте). Финальное сравнение в <code>Verify</code> — <b>константного времени</b> (<code>subtle.ConstantTimeCompare</code>), чтобы по длительности нельзя было подбирать байты. Число итераций сервер объявляет в <code>HELLO_OK</code>; клиент зажимает его в <code>[1, 10&nbsp;000&nbsp;000]</code>, чтобы враждебный сервер не сжёг ему CPU (CR-04). Гард банит IP после N неудач + пауза 1 с на каждый отказ; входы и баны — в аудит.
+</div>
+<p class="note">Порт сознательно взял PBKDF2 вместо Argon2id из ТЗ — чтобы стандартная сборка аутентифицировала «из коробки», без libsodium. TLS шифрования трафика на этом этапе ещё нет (см. раздел «безопасность»): v2.0 защищает <i>учётные данные</i>, а не содержимое.</p>
+</section>
+
+<!-- ─────────────────────────── 6 ─────────────────────────── -->
+<section id="s6">
+<h1>Сценарии вживую</h1>
+<p>Семь сквозных путей по реальному коду — от нажатия клавиши до байтов на проводе. Выбери сценарий; <span class="wire">жёлтым</span> помечены исходящие сообщения, <span class="wire rx">зелёным</span> — входящие/ответы.</p>
+<div class="flowtabs" id="flowtabs"></div>
+<div class="flowsum" id="flowsum"></div>
+<div class="flow" id="flowsteps"></div>
+</section>
+
+<!-- ─────────────────────────── 7 ─────────────────────────── -->
+<section id="s7">
+<h1>Структуры данных</h1>
+<p class="note">Не таблицы полей ради таблиц, а роль каждой структуры, её ключевые поля и <b>дисциплина доступа</b> (что чем защищено). Полные словари — в <code>types.go</code> каждого пакета.</p>
+
+<details open><summary>server.Session — один подключённый клиент</summary><div class="in">
+<p>Центральная сущность демона. Исходящие кадры идут через канал <code>out</code>, который вычитывает <b>единственная</b> горутина-писатель — поэтому кадры атомарны, а медленный клиент тормозит только свои передачи.</p>
+<p><b>Под мьютексом <code>mu</code></b> (редкие изменения): <code>login</code>, <code>role</code>, <code>authed</code>, <code>cancelDL</code>/<code>cancelTID</code> (канал отмены и id его передачи — R3-2).<br>
+<b>Атомарные</b> (горячий путь, без блокировок): <code>subMask</code> (подписка), <code>bytes</code> (отдано), <code>curPath</code> (где клиент), <code>downloading</code>, <code>inFlight</code> (идёт ли обработчик — R3-6), <code>lastActivity</code> (для сторожа простоя).<br>
+<b>Каналы</b>: <code>out</code> (глубина 64, backpressure), <code>done</code> (закрывается при teardown — сигнал всем горутинам сессии).</p>
+<p class="note"><code>send</code> блокируется для backpressure; <code>trySend</code> — неблокирующая (рассылки). Отмена срабатывает только если <code>TransferID</code> совпал с активной передачей — «поздний» <code>DOWNLOAD_CANCEL</code> не убьёт следующую закачку.</p>
+</div></details>
+
+<details><summary>server.Registry — реестр живых сессий</summary><div class="in">
+<p>Карта <code>SessionID → *Session</code> под своим мьютексом. К ней обращаются из разных горутин: диспетчер, рассылки, админ-kick, сторож. Ключевой метод <code>reserveUserSlot</code> <b>атомарно</b> проверяет лимит сессий на пользователя и помечает сессию аутентифицированной — так параллельные рукопожатия одного логина не проскочат проверку все разом (CR-06). <code>broadcast</code> шлёт кадр каждой подписанной сессии <b>неблокирующе</b> (drop-on-full).</p>
+</div></details>
+
+<details><summary>config.Hub + Settings — снапшоты горячего конфига</summary><div class="in">
+<p><code>Settings</code> — <b>плоская value-структура</b> (без указателей/срезов/карт), поэтому её снимок — дешёвая копия по значению. <code>Hub</code> держит <code>atomic.Pointer[Settings]</code>: <code>Current()</code> — одна атомарная загрузка, никогда не блокирует. Писатели сериализованы мьютексом <code>wmu</code>: копируют снимок, применяют ключ, <b>валидируют</b>, атомарно подменяют указатель и под тем же локом зовут <code>onChange</code> (сохранить на диск + разослать <code>EVENT_CONFIG</code>) — чтобы файл и рассылка отражали один снимок.</p>
+<p class="note">Ключи делятся на <b>hot</b> (лимиты, тайм-ауты, motd, уровень лога) и <b>restart</b> (порт, share_root, воркеры, users_file, pbkdf2_iters, параметры watcher). Попытку сменить restart-ключ на лету <code>Set</code> отвергает понятной ошибкой, а не молча принимает бесполезное изменение.</p>
+</div></details>
+
+<details><summary>vfs.VFS — дерево раздачи + ленивый кэш сумм</summary><div class="in">
+<p>Раздаёт дерево, <b>запертое внутри одного share-root через <code>os.Root</code></b> (Go 1.24+): даже «..» или симлинк наружу не выведут операцию за корень — класс уязвимостей TOCTOU закрыт по построению. Путь живёт в трёх формах: <code>VirtualPath</code> (как прислал клиент) → <code>CleanedPath</code> (нормализован, уходит в протокол) → OS-relative (для <code>os.Root</code>).</p>
+<p><b>Два независимых мьютекса:</b> <code>mu</code> стережёт <code>cache</code> (checksum-кэш по ключу <code>path,size,mtime-нс,ctime</code>) и флаг <code>dirty</code>; <code>statsMu</code> — фоновый снимок статистики раздачи. Хеширование идёт <b>вне лока</b>: два параллельных промаха могут оба пересчитать — это безобидно (побеждает последний). Сумма считается <b>лениво</b> и с учётом отмены контекста (R4-3).</p>
+</div></details>
+
+<details><summary>ratelimit.Limiter — двухуровневый token bucket</summary><div class="in">
+<p>Ограничение скорости на двух уровнях сразу: одно <b>глобальное</b> ведро на весь сервер и по ведру <b>на логин</b> (не на сокет!) — поэтому N параллельных закачек одного пользователя делят один бюджет (§8 bug 11). Лимиты читаются на каждом чанке, поэтому смена конфига перенастраивает уже идущую передачу через <code>SetLimit</code> без разрыва.</p>
+<p class="note">Единственный мьютекс держится только на короткие секции (создать/перенастроить/пометить активным); блокирующий <code>WaitN</code> идёт вне лока. Счётчик <code>active</code> не даёт сборщику удалить ведро, пока в нём кто-то ждёт; фоновый reaper выселяет вёдра, простаивавшие &gt;10 мин — чтобы карта не росла без границ.</p>
+</div></details>
+
+<details><summary>watcher.Watcher — файловые события</summary><div class="in">
+<p>Превращает изменения под корнем в <code>EVENT_FS</code>, оборачивая <code>fsnotify</code> и добавляя две вещи: <b>рекурсию</b> (fsnotify следит за одной папкой — watcher подписывается на каждую поддиректорию и на вновь созданные, снимая подписки при удалении, чтобы их набор не рос — §8 bug 15) и <b>debounce</b> (одно сохранение файла = пачка событий; watcher откладывает выдачу и шлёт одно итоговое). Наружу уходит только <code>VirtualPath</code>; путь вне корня события не рождает.</p>
+</div></details>
+
+<details><summary>tui.Model — единственный источник правды UI</summary><div class="in">
+<p>Архитектура Bubble Tea (паттерн Elm): <b>всё</b> состояние UI в одной <code>Model</code>, меняется <b>только</b> в <code>Update(msg)</code>, рисуется <b>только</b> в <code>View</code> (чистая функция). Глобальных переменных нет — логика панелей тестируется без терминала. <code>Panel</code> — чистые переходы состояния (курсор, прокрутка, выделение по имени, сортировка).</p>
+<p><b>Один мьютекс <code>clientMu</code></b> сериализует весь ввод-вывод к блокирующему транспорту (насос, закачка, листинг, checksum, админ). <b>Один канал <code>events</code></b> (буфер 64) — единственный мост из фоновых горутин в <code>Update</code>. Хитрость: <code>Close()</code> клиента зовётся <i>вне</i> лока (закачка держит <code>clientMu</code> весь трансфер), чтобы разблокировать зависшее чтение — и лишь потом <code>client=nil</code> под локом.</p>
+</div></details>
+
+<details><summary>client.Client — блокирующий транспорт</summary><div class="in">
+<p>Им пользуются и TUI, и <code>--batch</code>. Проводит рукопожатие, шлёт запросы и качает файлы, <b>прозрачно переправляя</b> асинхронные <code>EVENT_*/PONG</code> в обработчик событий, пока ждёт конкретный ответ — даже посреди закачки, не портя поток. Запросные методы нельзя звать конкурентно (по очереди пишут/читают один сокет), а <code>Ping/Interrupt/Close</code> — можно из другой горутины (heartbeat и отмена).</p>
+</div></details>
+</section>
+
+<!-- ─────────────────────────── 8 ─────────────────────────── -->
+<section id="s8">
+<h1>Модель конкурентности</h1>
+<p>Одна картинка на сервере: <b>несколько горутин на соединение с чётким разделением ролей</b>, чтобы медленный клиент тормозил только себя.</p>
+<pre>handleConn (владелец соединения)
+  ├─ writeLoop      ЕДИНСТВЕННЫЙ писатель в сокет ← канал out (кадры атомарны)
+  ├─ serveRequests  ЕДИНСТВЕННЫЙ читатель: разбор кадра → проверка роли → обработчик
+  ├─ idleWatchdog   закрывает молчащее соединение (но не во время закачки/обработки)
+  └─ streamFile     (на время закачки) отдаёт файл чанками — читатель свободен для PING/CANCEL</pre>
+
+<h3>Правила, действующие по всей системе</h3>
+<ul>
+<li><b>Горячий конфиг — снапшоты.</b> Два источника сходятся в один писатель под общим локом. <code>ADMIN_SET</code> по сети: валидировать → атомарно подменить → сохранить на диск → разослать <code>EVENT_CONFIG</code> подписанным админам. <code>SIGHUP</code>: перечитать файл → валидировать → атомарно подменить, сохранив restart-ключи и применив живой <code>log.level</code> (через <code>ApplyWith</code>, без записи и без рассылки). Читатели горячего пути — одна атомарная загрузка, без локов.</li>
+<li><b>Сеть вне UI-потока.</b> Клиент общается с UI только через потокобезопасный канал; лаг сети не морозит интерфейс.</li>
+<li><b>Единственный писатель / читатель на сокет.</b> На сервере — <code>writeLoop</code>; в клиенте — сериализация через <code>clientMu</code>. Рассылки неблокирующие: тормоз одного не задержит остальных.</li>
+<li><b>Ограниченный рост.</b> Reaper выселяет простаивающие вёдра rate-limit (TTL 10 мин); watcher снимает подписки на удалённые каталоги — два бывших источника неограниченного роста закрыты.</li>
+<li><b>Единая точка авторизации.</b> Таблица <code>тип → минимальная роль</code> в диспетчере — проверки прав не размазаны по обработчикам.</li>
+<li><b>Один плохой пир не вредит другим.</b> Malformed/oversize рвёт <b>ровно одно</b> соединение; таймаут рукопожатия закрывает полуоткрытые.</li>
+<li><b>Проверено инструментом.</b> Каждый пакет гоняется под <code>go test -race</code>; TSan нашёл и починил две гонки на M10, а «конкурентное применение конфига» — отдельный тест.</li>
+</ul>
+
+<h3>Тонкие места, помеченные в коде маркерами</h3>
+<table>
+<tr><th>маркер</th><th>что защищает</th></tr>
+<tr><td class="mono">R3-2</td><td>«поздний» <code>DOWNLOAD_CANCEL</code> отменяет закачку только если <code>TransferID</code> совпал с активной — иначе задел бы следующую.</td></tr>
+<tr><td class="mono">R3-6</td><td>флаг <code>inFlight</code>: сторож простоя не обрывает соединение, пока выполняется обработчик медленного запроса.</td></tr>
+<tr><td class="mono">CR-06</td><td><code>reserveUserSlot</code> атомарно проверяет лимит сессий и метит сессию — параллельные входы одного логина не проскочат все.</td></tr>
+<tr><td class="mono">CR-05</td><td>дорукопожатные кадры ограничены малым потолком — аноним не заставит выделять мегабайты.</td></tr>
+<tr><td class="mono">CR-10</td><td>листинг, который превысил бы потолок кадра, заворачивается как <code>ERROR(INTERNAL)</code>, а не шлётся oversize-кадром.</td></tr>
+<tr><td class="mono">CR-09 · RR-5</td><td>ключ checksum-кэша включает mtime в <b>наносекундах</b> и ctime — подмена файла тем же размером с восстановленным mtime не даст устаревшую сумму.</td></tr>
+<tr><td class="mono">R4-3</td><td><code>ChecksumCtx</code> прерывает хеширование большого файла при отмене — закачку можно отменить, не досчитывая сумму минуту.</td></tr>
+<tr><td class="mono">RR-1</td><td>в рабочем цикле нет пофреймового дедлайна — таймаут никогда не «приземлится» посреди кадра и не рассинхронит поток.</td></tr>
+</table>
+</section>
+
+<!-- ─────────────────────────── 9 ─────────────────────────── -->
+<section id="s9">
+<h1>Безопасность: честная модель угроз</h1>
+<div class="card"><b>Что защищает v2.0, а что — нет.</b> Challenge–response защищает <b>учётные данные</b>: пароль и его хеш не пересекают сеть, кража <code>users.json</code> не даёт войти. Но <b>содержимое трафика ещё не зашифровано</b> — прослушивание байтов файла и MITM закрываются <b>только TLS на этапе M14</b>. Формат кадра уже готов к этому: TLS просто оборачивает TCP, кадры не меняются.</p></div>
+
+<h3>Что уже сделано</h3>
+<ul>
+<li><b>SCRAM-подобный вход</b> (раздел 5): одноразовый 16-байтный challenge, доказательство <code>HMAC-SHA256</code>, сервер хранит только <code>StoredKey</code>, сравнение константного времени.</li>
+<li><b>Растяжение пароля</b> — PBKDF2-HMAC-SHA256, порог 600k итераций; тип хеша помечен в строке для прозрачной миграции.</li>
+<li><b>Гард от перебора</b> — временный бан IP после N неудач + пауза 1 с на каждый отказ; входы и баны аудируются.</li>
+<li><b>Заключение путей</b> в одной точке через <code>os.Root</code> — «..» и симлинки наружу не выведут за share-root (TOCTOU закрыт по построению на Linux-демоне).</li>
+<li><b>Жёсткий админ-канал</b>: <code>ADMIN_SET</code> берёт только <b>белый список</b> известных hot-ключей (никогда произвольный JSON), валидирует до применения (при ошибке ничего не меняется) и запрещает менять restart-ключи (порт, share_root) по сети — захваченная админ-сессия не перенаправит сервер в другой каталог. Само-kick запрещён.</li>
+<li><b>Авторизация — на сервере</b>: диспетчер отвергает <code>ADMIN_*</code> от не-админа как <code>ACCESS_DENIED</code> независимо от того, что нарисовал UI. Ограничения интерфейса — удобство, не защита.</li>
+<li><b>Профили не хранят пароль вовсе.</b> <code>profiles.json</code> (файл <code>0600</code>) держит только метаданные подключения (хост/порт/логин/last-seen/каталог загрузок); поле <code>Profile.Secret</code> зарезервировано и <b>всегда обнуляется перед записью</b> — утечка файла профилей не раскроет пароль.</li>
+</ul>
+
+<h3>Сознательные ограничения v2.0</h3>
+<ul>
+<li><b>Нет upload</b> (клиент → сервер) — появится с квотами на M13.</li>
+<li><b>Нет TLS</b> — трафик открытый; это осознанно отложено на M14.</li>
+<li><b>Один сервер = один share-root</b>; личные каталоги пользователей — M12+.</li>
+<li><code>users.json</code> — плоский JSON, пока пользователей единицы; SQLite приходит с квотами.</li>
+<li><b>«Запомнить пароль»</b> (хранение производного ключа + opt-in галка) — ещё <b>не реализовано</b>: поле <code>Secret</code> зарезервировано под эту будущую функцию, сейчас пароль на диск не попадает никогда.</li>
+<li><b>Крайний случай (найдено ревью):</b> при переименовании каталога fsnotify-подписки не переносятся на новый путь автоматически — watcher снимает всё старое поддерево (<code>removeWatchTree</code>) и заново подписывается на новое (<code>addRecursive</code>), но в узком окне до переподписки события могут кратко нести старый путь, пока панель не перечитают. Записано, чтобы не забыть.</li>
+</ul>
+</section>
+
+<!-- ─────────────────────────── 10 ─────────────────────────── -->
+<section id="s10">
+<h1>Роадмап и «написать с нуля»</h1>
+<p>Этапы — вертикальные срезы: каждый заканчивается работающей системой. Порядок такой, чтобы яркий TUI появился как можно раньше, но не раньше, чем будет сервер, с которым он говорит. <b>M7–M11 реализованы</b>; M12–M14 — перспектива, под которую оставлены заделы в данных.</p>
+<table class="roadmap">
+<tr><th>этап</th><th>что даёт</th><th>статус</th></tr>
+<tr><td class="mono">M7</td><td>Протокол v2 + VFS: байт-точный кадр, каталоги, докачка по offset, заключение путей.</td><td><span class="st done">✓ готово</span></td></tr>
+<tr><td class="mono">M8</td><td>Аутентификация и сессии: SCRAM, StoredKey, лимит сессий, гард IP, --add-user/--check-config.</td><td><span class="st done">✓ готово</span></td></tr>
+<tr><td class="mono">M9</td><td>TUI-клиент: две панели, <kbd>F5</kbd> закачка с прогрессом/докачкой/очередью, <code>--batch</code>, профили.</td><td><span class="st done">✓ готово</span></td></tr>
+<tr><td class="mono">M10</td><td>Живость: рекурсивный debounce-watcher → <code>EVENT_FS</code>, разбор внеочередных кадров, авто-реконнект, heartbeat.</td><td><span class="st done">✓ готово</span></td></tr>
+<tr><td class="mono">M11</td><td>Админ на лету: снапшоты Hub + двухуровневый rate-limit + <code>ADMIN_SET</code>-белый список + <code>SIGHUP</code> + панель <kbd>F9</kbd>.</td><td><span class="st done">✓ готово</span></td></tr>
+<tr><td class="mono">M12</td><td>Пользователи как система: SQLite, <code>ADMIN_USER_*</code>, виртуальные корни (изоляция home).</td><td><span class="st future">○ перспектива</span></td></tr>
+<tr><td class="mono">M13</td><td>Upload и квоты: <code>UPLOAD_*</code>, <code>.upart</code>+rename, квоты до передачи.</td><td><span class="st future">○ перспектива</span></td></tr>
+<tr><td class="mono">M14</td><td>TLS: <code>TlsConnection</code> в машину состояний, TOFU-пиннинг сертификата в профиле.</td><td><span class="st future">○ перспектива</span></td></tr>
+</table>
+
+<h2>Чем Go-порт отличается от исходного ТЗ</h2>
+<ul>
+<li><span class="diff">Заключение путей</span> — <code>os.Root</code> (Go 1.24+) вместо <code>openat2(RESOLVE_BENEATH)</code>: заключение делегировано рантайму, а не написано руками.</li>
+<li><span class="diff">Транспорт</span> — горутина-на-соединение вместо epoll-реактора + пул потоков; лимит скорости тормозит через сон отправителя, а не backpressure EPOLLOUT (ядро оставлено готовым к epoll-порту).</li>
+<li><span class="diff">Хеш пароля</span> — PBKDF2-HMAC-SHA256 (порог 600k) вместо Argon2id/libsodium: стандартная сборка работает «из коробки».</li>
+<li><span class="diff">TUI</span> — Bubble Tea вместо FTXUI; <span class="diff">наблюдение</span> — fsnotify вместо inotify.</li>
+</ul>
+
+<h2>Дорожная карта «собрать такое самому»</h2>
+<ol>
+<li><b>Кадр и кодек.</b> 5-байтовый заголовок, big-endian, строгий <code>require_end</code>, проверка границ на каждом чтении. Юнит-тесты round-trip + отказ на битом вводе.</li>
+<li><b>VFS над одним корнем.</b> <code>os.Root</code>, три формы пути, ленивый checksum-кэш по <code>(path,size,mtime,ctime)</code>.</li>
+<li><b>Сессия и диспетчер.</b> Машина состояний рукопожатия, таблица <code>MinRole</code>, единственный writeLoop, сторож простоя.</li>
+<li><b>SCRAM.</b> Цепочка <code>password → SaltedPassword → ClientKey → StoredKey</code>, <code>Proof</code>/<code>Verify</code> константного времени.</li>
+<li><b>Передача.</b> Отдельная горутина-стример, докачка по offset, checksum в конце, отмена по <code>TransferID</code>.</li>
+<li><b>Горячий конфиг.</b> Плоские <code>Settings</code>, <code>atomic.Pointer</code>-снимок, валидация перед подменой, hot/restart-ключи.</li>
+<li><b>События.</b> fsnotify + рекурсия + debounce → broadcast подписчикам неблокирующе.</li>
+<li><b>Клиент и TUI.</b> Блокирующий транспорт с прозрачной пересылкой <code>EVENT_*</code>, Bubble Tea (Model–Update–View), сеть вне UI-потока, авто-реконнект.</li>
+</ol>
+<p class="note">Параллельно стоит читать: пакеты <code>encoding/binary</code>, <code>os</code> (<code>os.Root</code>), <code>crypto/pbkdf2</code>/<code>hmac</code>/<code>subtle</code>, <code>golang.org/x/time/rate</code>, <code>fsnotify</code>, фреймворк <code>bubbletea</code>; и подробную спецификацию порта в <code>docs/tz/09-go-port.md</code>.</p>
+</section>
+
+</main></div>
+<div class="status" id="st"><b>1..0</b> — разделы · страница-двойник системы: слева дерево, справа разбор · исходники и подробности: <span class="mono">docs/tz/*.md</span> в репозитории</div>
+
+<script>
+(function(){
+"use strict";
+
+/* ── навигация по разделам ── */
+var secs=document.querySelectorAll("main section"),
+    btns=document.querySelectorAll("nav button");
+function go(id){secs.forEach(function(s){s.classList.toggle("on",s.id===id)});
+  btns.forEach(function(b){b.classList.toggle("on",b.dataset.s===id)});
+  window.scrollTo(0,0)}
+btns.forEach(function(b){b.addEventListener("click",function(){go(b.dataset.s)})});
+document.addEventListener("keydown",function(e){
+  if(e.target.tagName==="INPUT"||e.target.tagName==="TEXTAREA")return;
+  if(e.key==="0"){go("s10");return}
+  var n=+e.key;if(n>=1&&n<=9)go("s"+n)});
+
+/* ── тема ── */
+var themeBtn=document.getElementById("themeBtn");
+themeBtn.addEventListener("click",function(){
+  var cur=document.documentElement.getAttribute("data-theme");
+  if(!cur){cur=matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"}
+  document.documentElement.setAttribute("data-theme",cur==="dark"?"light":"dark")});
+
+/* ─────────── карта пакетов ─────────── */
+/* dep — только PRODUCTION-импорты (go list .Imports, без *_test.go). */
+var pk=[
+ {n:"proto",c:"cyan",path:"internal/proto",dep:"— (только stdlib)",d:"Чистый проводной протокол: доменные типы, перечисления, кадрирование и big-endian кодек с проверкой границ. Импортируется всеми, не зависит ни от кого. Именно он гарантирует байт-в-байт совместимость с эталонным C++-узлом."},
+ {n:"config",c:"cyan",path:"internal/config",dep:"— (только stdlib)",d:"Плоские Settings + Hub горячей перезагрузки. Читатели берут atomic-снимок без блокировок; писатели валидируют и атомарно подменяют. Делит ключи на hot и restart."},
+ {n:"ratelimit",c:"cyan",path:"internal/ratelimit",dep:"x/time/rate (внешний)",d:"Двухуровневый token bucket: глобальное ведро + ведро на логин. Лимит читается на каждом чанке — смена конфига перенастраивает идущую передачу. Reaper выселяет простаивающие вёдра."},
+ {n:"vfs",c:"green",path:"internal/vfs",dep:"proto",d:"Дерево, запертое в share-root через os.Root. Три формы пути, ленивый checksum-кэш по (path,size,mtime-нс,ctime), фоновая статистика раздачи. Заключение путей — в одной точке."},
+ {n:"auth",c:"green",path:"internal/auth",dep:"proto",d:"SCRAM-подобный вход: цепочка ключей, StoredKey в users.json (пароль в базе не хранится), гард бана IP от перебора. Verify — константного времени."},
+ {n:"watcher",c:"green",path:"internal/watcher",dep:"proto",d:"fsnotify → EVENT_FS: рекурсивная подписка на поддерево + debounce (одно сохранение = одно событие). Наружу отдаёт VirtualPath от корня раздачи."},
+ {n:"client",c:"amber",path:"internal/client",dep:"auth · proto",d:"Блокирующий транспорт для TUI и --batch: рукопожатие, запросы, докачка с проверкой суммы, прозрачная пересылка асинхронных EVENT_*/PONG во время ожидания ответа."},
+ {n:"server",c:"mag",path:"internal/server",dep:"auth · config · proto · ratelimit · vfs · watcher",d:"Ядро демона: цикл приёма, машина состояний на соединение (единственный писатель), авторизация каждого кадра по роли, обработчики FS/передачи/админа, корректная остановка."},
+ {n:"tui",c:"amber",path:"internal/tui",dep:"client · proto",d:"fshare-commander на Bubble Tea (Elm): всё состояние в Model, меняется только в Update, рисуется в View. Сеть — в фоновых горутинах, мост в UI — один канал событий."},
+ {n:"cmd",c:"dim",path:"cmd/fshare-daemon · cmd/fshare-commander",dep:"точки входа",d:"Точки входа: fshare-daemon собирает Hub/VFS/Users/Guard/Server и крутит Serve (импортирует auth·config·server·vfs); fshare-commander запускает TUI/--batch (импортирует client·proto·tui). Разбор флагов, --add-user, --check-config, сигналы."}
+];
+var pl=document.getElementById("pkgs"),pi=document.getElementById("pkginfo");
+pk.forEach(function(p){var b=document.createElement("button");
+  b.innerHTML=p.n+"<small>"+p.dep+"</small>";b.style.color="var(--"+p.c+")";
+  b.addEventListener("click",function(){
+    pl.querySelectorAll("button").forEach(function(x){x.classList.remove("on")});
+    b.classList.add("on");
+    pi.innerHTML="<b class='mono'>"+p.path+"</b> <span class='dep'>← "+p.dep+"</span><br>"+p.d});
+  pl.appendChild(b)});
+
+/* ─────────── карта байтов кадра ─────────── */
+/* каждый регион: {lo,hi,kind,label,detail}. kind → css-класс k-*. */
+var frames=[
+ {name:"DOWNLOAD_ACCEPT · 0x31",
+  hex:["31","00","00","00","0C","00","00","00","01","00","00","00","00","00","A0","00","00"],
+  regs:[
+   {lo:0,hi:0,kind:"hdr",label:"msg_type = 0x31",detail:"Код сообщения DOWNLOAD_ACCEPT. Старший полубайт 0x3x = семейство «передача». Слой кадрирования отвергает неизвестный тип ещё до чтения тела."},
+   {lo:1,hi:4,kind:"len",label:"payload_length = 12",detail:"Длина ТЕЛА (без заголовка), u32 big-endian: 00 00 00 0C = 12 байт. Дальше ровно 12 байт тела — transfer_id(4) + total_size(8)."},
+   {lo:5,hi:8,kind:"num",label:"transfer_id = 1",detail:"u32: номер этой передачи. Им же будут помечены CHUNK_DATA и встречный DOWNLOAD_CANCEL — чтобы отменить именно эту закачку, а не соседнюю (R3-2)."},
+   {lo:9,hi:16,kind:"num",label:"total_size = 10 485 760",detail:"u64 = 0x0000000000A00000 = 10 МиБ. Клиент заранее знает полный размер для прогресс-бара; дальше пойдут CHUNK_DATA."}
+  ]},
+ {name:"HELLO_OK · 0x11",
+  hex:["11","00","00","00","20","00","02","00","07","66","73","68","61","72","65","64","01",
+       "3F","A1","7C","05","E2","9B","44","D0","11","8A","6E","F3","2C","57","B9","08","00","09","27","C0"],
+  regs:[
+   {lo:0,hi:0,kind:"hdr",label:"msg_type = 0x11",detail:"HELLO_OK — ответ сервера на HELLO. Семейство 0x1x = рукопожатие/аутентификация (роль anonymous)."},
+   {lo:1,hi:4,kind:"len",label:"payload_length = 32",detail:"u32 big-endian: тело 32 байта."},
+   {lo:5,hi:6,kind:"num",label:"proto_ver = 2",detail:"u16: согласованная версия протокола. Единственная поддерживаемая — 2; иначе ERROR(UNSUPPORTED_VERSION)."},
+   {lo:7,hi:8,kind:"len",label:"len(server_name) = 7",detail:"u16-префикс длины строки. Строки на проводе = длина u16 + UTF-8 байты."},
+   {lo:9,hi:15,kind:"str",label:"server_name = «fshared»",detail:"7 UTF-8 байт: 66 73 68 61 72 65 64 = «fshared». Самоназвание сервера."},
+   {lo:16,hi:16,kind:"enum",label:"auth_mode = 1 (challenge)",detail:"u8-перечисление: 0 = none (bootstrap: любой логин станет admin), 1 = challenge (обычный вход по доказательству)."},
+   {lo:17,hi:32,kind:"fix",label:"challenge (16 байт)",detail:"Фиксированное поле: случайный одноразовый вызов (crypto/rand). Клиент подмешает его в доказательство, поэтому перехваченный proof нельзя переиграть на новый challenge."},
+   {lo:33,hi:36,kind:"num",label:"pbkdf2_iters = 600 000",detail:"u32 = 0x000927C0. Сколько итераций PBKDF2 применить к паролю — сервер объявляет параметр заранее, клиент считает ключ теми же параметрами (и зажимает сверху против враждебного сервера, CR-04)."}
+  ]},
+ {name:"CHUNK_DATA · 0x32",
+  hex:["32","00","00","00","0C","00","00","00","01","47","4F","20","46","49","4C","45","0A"],
+  regs:[
+   {lo:0,hi:0,kind:"hdr",label:"msg_type = 0x32",detail:"CHUNK_DATA — очередной кусок файла. Семейство 0x3x = передача."},
+   {lo:1,hi:4,kind:"len",label:"payload_length = 12",detail:"u32: тело 12 байт = transfer_id(4) + 8 байт данных. Именно длина кадра задаёт, сколько сырых байт данных дальше."},
+   {lo:5,hi:8,kind:"num",label:"transfer_id = 1",detail:"u32: к какой передаче относится кусок."},
+   {lo:9,hi:16,kind:"raw",label:"сырые байты файла (8)",detail:"47 4F 20 46 49 4C 45 0A = «GO FILE\\n». ЕДИНСТВЕННОЕ сообщение без префикса длины: длина данных = payload_length − 4. До 64 КиБ (ChunkSize) на кадр."}
+  ]},
+];
+var frtabs=document.getElementById("frametabs"),
+    bytesEl=document.getElementById("bytes"),
+    byexp=document.getElementById("byexp");
+function regOf(fr,i){for(var k=0;k<fr.regs.length;k++){var r=fr.regs[k];if(i>=r.lo&&i<=r.hi)return r}return null}
+function drawFrame(fi){
+  var fr=frames[fi];
+  frtabs.querySelectorAll("button").forEach(function(b,j){b.classList.toggle("on",j===fi)});
+  bytesEl.innerHTML="";
+  fr.hex.forEach(function(hx,i){
+    (function(i){
+      var r=regOf(fr,i),cell=document.createElement("div");
+      cell.className="by k-"+(r?r.kind:"hdr");cell.tabIndex=0;
+      cell.innerHTML="<span class='ix'>"+i+"</span>"+hx;
+      function show(){
+        bytesEl.querySelectorAll(".by").forEach(function(x,j){
+          x.classList.toggle("hot",regOf(fr,j)===r)});
+        byexp.innerHTML="<b>"+(r?r.label:"?")+"</b><br><span class='note'>"+(r?r.detail:"")+"</span>";
+      }
+      cell.addEventListener("mouseenter",show);
+      cell.addEventListener("focus",show);
+      cell.addEventListener("click",show);
+      bytesEl.appendChild(cell);
+    })(i);
+  });
+  byexp.innerHTML="<b>"+fr.name+"</b><br><span class='note'>Наведи на байт — он расскажет, что кодирует. Заголовок серый, числа cyan, строки green, фиксированные поля magenta, сырой хвост blue.</span>";
+}
+frames.forEach(function(fr,i){var b=document.createElement("button");b.textContent=fr.name;
+  b.addEventListener("click",function(){drawFrame(i)});frtabs.appendChild(b)});
+drawFrame(0);
+
+/* ─────────── карта сообщений ─────────── */
+var groups=[
+ {g:"Служебные · 0x06–0x08",col:"dim",role:"anonymous",msgs:[
+   ["ERROR","0x06","↔","code:u16 (ErrCode), message:str","код ошибки приложения; соединение живо"],
+   ["PING","0x07","C→S","—","heartbeat; в ответ PONG"],
+   ["PONG","0x08","S→C","—","ответ на PING; от клиента → BAD_REQUEST"]]},
+ {g:"Рукопожатие · 0x10–0x14",col:"cyan",role:"anonymous",msgs:[
+   ["HELLO","0x10","C→S","proto_ver:u16, client_name:str","первый кадр клиента"],
+   ["HELLO_OK","0x11","S→C","proto_ver:u16, server_name:str, auth_mode:u8, challenge[16], pbkdf2_iters:u32","вызов + параметры входа"],
+   ["AUTH_REQUEST","0x12","C→S","login:str, proof[32]","доказательство (пароль не шлётся)"],
+   ["AUTH_OK","0x13","S→C","role:u8, session_id:u64, motd:str","вход принят → рабочее состояние"],
+   ["AUTH_FAIL","0x14","S→C","reason:u16, message:str","после N неудач — бан IP"]]},
+ {g:"Файловая система · 0x20–0x25",col:"green",role:"user",msgs:[
+   ["LIST_DIR_REQUEST","0x20","C→S","path:str","содержимое каталога"],
+   ["LIST_DIR_RESPONSE","0x21","S→C","path:str, count:u32, count×DirEntry","count ≤ 1<<20, кадр ≤ 4 МиБ"],
+   ["STAT_REQUEST","0x22","C→S","path:str","метаданные одной записи"],
+   ["STAT_RESPONSE","0x23","S→C","path:str, DirEntry",""],
+   ["CHECKSUM_REQUEST","0x24","C→S","path:str","сумма считается лениво"],
+   ["CHECKSUM_RESPONSE","0x25","S→C","path:str, algo:u8, checksum[32]","algo: 0=ещё считается,1=CRC32,2=SHA256"]]},
+ {g:"Передача · 0x30–0x34",col:"amber",role:"user",msgs:[
+   ["DOWNLOAD_REQUEST","0x30","C→S","path:str, offset:u64","offset>0 = докачка"],
+   ["DOWNLOAD_ACCEPT","0x31","S→C","transfer_id:u32, total_size:u64","назначает id, сообщает размер"],
+   ["CHUNK_DATA","0x32","S→C","transfer_id:u32, сырые байты (без префикса)","≤ 64 КиБ; длина = кадр − 4"],
+   ["DOWNLOAD_DONE","0x33","S→C","transfer_id:u32, algo:u8, checksum[32]","сумма всего файла для сверки"],
+   ["DOWNLOAD_CANCEL","0x34","C→S","transfer_id:u32","отмена без разрыва (R3-2)"]]},
+ {g:"События (push) · 0x40–0x43",col:"blue",role:"user (SUBSCRIBE)",msgs:[
+   ["SUBSCRIBE","0x40","C→S","mask:u32 (fs=1,notice=2,config=4)","у не-админа бит config снимается (CR-07)"],
+   ["EVENT_FS","0x41","S→C","op:u8, kind:u8, path:str, size:u64, mtime:u64","создан/изменён/удалён"],
+   ["EVENT_NOTICE","0x42","S→C","severity:u8, text:str","инфо/предупреждение/ошибка"],
+   ["EVENT_CONFIG","0x43","S→C","key:str, new_value:str","только подписчикам-админам"]]},
+ {g:"Админ-канал · 0x50–0x5D",col:"mag",role:"admin",msgs:[
+   ["ADMIN_GET_CONFIG","0x50","C→S","—","→ ADMIN_CONFIG"],
+   ["ADMIN_CONFIG","0x51","S→C","json_len:u32, json (сырой)","u32-префикс (не u16-строка): JSON может быть >64 КиБ; кадр ≤ 4 МиБ — как у LIST_DIR_RESPONSE и ADMIN_CLIENTS"],
+   ["ADMIN_SET","0x52","C→S","key:str, value:str","только белый список hot-ключей"],
+   ["ADMIN_SET_RESULT","0x53","S→C","ok:u8, message:str",""],
+   ["ADMIN_LIST_CLIENTS","0x54","C→S","—","→ ADMIN_CLIENTS"],
+   ["ADMIN_CLIENTS","0x55","S→C","count:u32, count×ClientInfo","поля: id,login,ip,role,path,bytes,speed; count ≤ 1<<20, кадр ≤ 4 МиБ"],
+   ["ADMIN_KICK","0x56","C→S","session_id:u64","само-kick запрещён"],
+   ["ADMIN_KICK_RESULT","0x57","S→C","ok:u8, message:str",""],
+   ["ADMIN_STATS","0x58","C→S","—","→ ADMIN_STATS_RESPONSE"],
+   ["ADMIN_STATS_RESPONSE","0x59","S→C","uptime,bytes,completed,conns,downloads,files,per_client_bps,global_bps,version",""],
+   ["ADMIN_SHUTDOWN","0x5A","C→S","grace_seconds:u32","корректная остановка с дренажом"],
+   ["ADMIN_SHUTDOWN_RESULT","0x5B","S→C","ok:u8, message:str",""],
+   ["ADMIN_RELOAD_USERS","0x5C","C→S","—","перечитать users.json без рестарта"],
+   ["ADMIN_RELOAD_USERS_RESULT","0x5D","S→C","ok:u8, message:str","расширение Go-порта"]]}
+];
+var gtabs=document.getElementById("grouptabs"),mtable=document.getElementById("msgtable");
+function drawGroup(gi){
+  var G=groups[gi];
+  gtabs.querySelectorAll("button").forEach(function(b,j){b.classList.toggle("on",j===gi);
+    if(j===gi)b.style.color="var(--"+G.col+")";else b.style.color=""});
+  var rows="<p class='note'>Минимальная роль группы: <span class='pill' style='color:var(--"+G.col+")'>"+G.role+"</span></p>"+
+    "<table><tr><th>сообщение</th><th>код</th><th>напр.</th><th>тело</th><th>примечание</th></tr>";
+  G.msgs.forEach(function(m){
+    rows+="<tr class='msgrow'><td style='color:var(--"+G.col+")'>"+m[0]+"</td><td class='code'>"+m[1]+
+      "</td><td class='dir'>"+m[2]+"</td><td class='mono' style='font-size:.82em'>"+m[3]+
+      "</td><td class='note'>"+m[4]+"</td></tr>";
+  });
+  rows+="</table>";
+  mtable.innerHTML=rows;
+}
+groups.forEach(function(G,i){var b=document.createElement("button");b.textContent=G.g;
+  b.style.borderColor="var(--"+G.col+")";
+  b.addEventListener("click",function(){drawGroup(i)});gtabs.appendChild(b)});
+drawGroup(1);
+
+/* ─────────── SCRAM ─────────── */
+var scramNodes=[
+ {id:"pw",t:"password",d:"пароль в открытом виде — живёт лишь мгновение в памяти клиента, по сети НЕ идёт"},
+ {id:"sp",t:"SaltedPassword = PBKDF2-HMAC-SHA256(password, salt=«fileshare-v2:»+login, 600k)",d:"«растянутый» пароль: дорогой перебор. Соль = константный префикс «fileshare-v2:» плюс логин (auth.saltFor) — важно повторить точно для совместимости"},
+ {id:"ck",t:"ClientKey = HMAC(SaltedPassword, «Client Key»)",d:"его-то и маскируют в доказательстве; в базе его НЕТ"},
+ {id:"sk",t:"StoredKey = SHA256(ClientKey)",d:"верификатор — единственное, что хранит сервер в users.json",stored:true},
+ {id:"pr",t:"ClientProof = ClientKey XOR HMAC(StoredKey, challenge‖login)",d:"уходит в AUTH_REQUEST; ClientKey «замаскирован» замком, который без StoredKey не снять"},
+ {id:"vf",t:"Verify: SHA256( proof XOR HMAC(StoredKey, challenge‖login) ) == StoredKey",d:"сервер снимает тот же замок, восстанавливает кандидат ClientKey и сверяет — сравнением КОНСТАНТНОГО времени"}
+];
+var scramModes=[
+ {sel:["pw","sp","ck","sk"],
+  exp:"<b>① Вывод ключа.</b> Из пароля клиент (а при создании учётки — сервер) выводит цепочку: PBKDF2 растягивает пароль в <code>SaltedPassword</code>, из него HMAC даёт <code>ClientKey</code>, а его SHA256 — <code>StoredKey</code>. В <code>users.json</code> сохраняется <span style='color:var(--red)'>только StoredKey</span>. Обратно цепочку не развернуть."},
+ {sel:["ck","sk","pr"],
+  exp:"<b>② Доказательство.</b> Получив в <code>HELLO_OK</code> одноразовый <code>challenge</code>, клиент считает <code>ClientProof = ClientKey XOR HMAC(StoredKey, challenge‖login)</code> и кладёт его в <code>AUTH_REQUEST</code>. Пароль и ClientKey по сети не идут; challenge делает proof неповторимым."},
+ {sel:["sk","pr","vf"],
+  exp:"<b>③ Проверка.</b> Сервер знает <code>StoredKey</code> и <code>challenge</code>. Он снимает тот же замок: <code>recovered = proof XOR HMAC(StoredKey, challenge‖login)</code>, берёт <code>SHA256(recovered)</code> и сверяет с хранимым <code>StoredKey</code> сравнением <b>константного времени</b>. Совпало — <code>AUTH_OK</code>."}
+];
+var chainEl=document.getElementById("scramchain"),scramExp=document.getElementById("scramexp"),
+    smodes=document.querySelectorAll("#scrammodes button");
+function drawChain(){
+  chainEl.innerHTML="";
+  scramNodes.forEach(function(n,i){
+    if(i>0){var a=document.createElement("div");a.className="arrow";a.textContent="│";chainEl.appendChild(a)}
+    var d=document.createElement("div");d.className="node"+(n.stored?" stored":"");d.dataset.id=n.id;
+    d.innerHTML="<div class='t'>"+n.t+"</div><div class='d'>"+n.d+"</div>";
+    chainEl.appendChild(d);
+  });
+}
+function setScram(mi){
+  smodes.forEach(function(b,j){b.classList.toggle("on",j===mi)});
+  var M=scramModes[mi];
+  chainEl.querySelectorAll(".node").forEach(function(nd){
+    nd.classList.toggle("on",M.sel.indexOf(nd.dataset.id)>=0)});
+  scramExp.innerHTML=M.exp;
+}
+drawChain();
+smodes.forEach(function(b){b.addEventListener("click",function(){setScram(+b.dataset.m)})});
+setScram(0);
+
+/* ─────────── сценарии ─────────── */
+var flows=[
+ {name:"1 · Вход",sum:"TCP-звонок в фоновой tea.Cmd; симметричный обмен HELLO/AUTH под дедлайном рукопожатия; пароль по сети не идёт — клиент шлёт SCRAM-доказательство, сервер проверяет константным временем.",
+  steps:[
+   ["TUI","doConnect читает форму, запоминает host/port/password для будущего реконнекта и запускает dialCmd как фоновую tea.Cmd — UI-поток не блокируется на сети."],
+   ["Client","Dial: net.DialTimeout (10 с), затем весь handshake под read-дедлайном (CR-04)."],
+   ["Client","шлёт HELLO с версией и именем клиента.","→ HELLO {proto_ver=2, client_name}"],
+   ["Daemon","Accept проверяет MaxConnections, заводит Session (nextSession++), reg.add, запускает единственный writeLoop."],
+   ["Session","handshake под дедлайном и малым потолком кадра (CR-05); требует HELLO, отвергает версию≠2."],
+   ["Session","генерит 16-байтный challenge и отвечает HELLO_OK; auth_mode=none, если база пуста (bootstrap).","← HELLO_OK {challenge[16], pbkdf2_iters}"],
+   ["Client","валидирует чужие параметры, зажимает iters, считает proof = ClientKey XOR HMAC(StoredKey, challenge‖login).","→ AUTH_REQUEST {login, proof[32]}"],
+   ["Session","guard.Banned(IP)? Verify(storedKey, challenge, login, proof) восстанавливает кандидат ClientKey и сверяет константным временем."],
+   ["Session","успех: reserveUserSlot атомарно чтит лимит сессий (CR-06) и метит authed; иначе AUTH_FAIL + возможный бан IP.","← AUTH_OK {role, session_id, motd}"],
+   ["TUI","dialCmd → connectedMsg; onConnected принимает клиент, строит две панели, subscribeFS + startPump и listRemote(«/»)."]
+  ]},
+ {name:"2 · Листинг",sum:"Удалённый cd/refresh — фоновая tea.Cmd под clientMu; клиент блокируется в ожидании ответа, прозрачно переправляя внеочередные EVENT_*/PONG; сервер авторизует по роли и листает через VFS.",
+  steps:[
+   ["TUI","enter() на удалённой папке: если не busy → busy=true, listRemote(path) (берёт clientMu)."],
+   ["Client","пишет запрос и ждёт ответ; recvExpect переправляет асинхронные кадры в обработчик, ERROR превращает в *RemoteError.","→ LIST_DIR_REQUEST {path}"],
+   ["Session","serveRequests: ReadFrame, touch(), roleAllows(role, user), Decode, inFlight=true (не реапить медленный листинг — R3-6)."],
+   ["Vfs","List(path): чистит путь, читает каталог через os.Root, прячет опасные записи (длинное имя, симлинк наружу), сортирует «папки вперёд»."],
+   ["Session","заранее считает точный размер кадра; если превысил бы 4 МиБ — ERROR(INTERNAL) вместо oversize (CR-10); иначе send (блокирующе).","← LIST_DIR_RESPONSE {path, entries[]}"],
+   ["TUI","onRemoteListing заполняет панель, busy=false, startNext() дренирует очередь."]
+  ]},
+ {name:"3 · Скачивание + докачка",sum:"F5 ставит задания в очередь (по одному); клиент докачивает с «.part», сервер стримит отдельной горутиной, тормозит каждый чанк живыми лимитами и в конце шлёт сумму — клиент сверяет и атомарно переименовывает.",
+  steps:[
+   ["TUI","download() кладёт downloadJob на каждую цель; startNext делает отменяемый ctx (Esc) и горутину под clientMu → DownloadCtx с колбэком прогресса."],
+   ["Client","downloadOnce стат-ит «.part» → offset докачки, MkdirAll, ставит сторожа ctx.Done (Cancel/Close).","→ DOWNLOAD_REQUEST {path, offset}"],
+   ["Transfer","startDownload: одна передача/сессия (CompareAndSwap), vfs.Open, offset>total → ERROR; tid=nextTransfer++, setCancel(tid), setCurPath ДО ACCEPT (чтобы дренаж видел активную передачу)."],
+   ["Transfer","streamFile: Seek к offset, шлёт ACCEPT.","← DOWNLOAD_ACCEPT {transfer_id, total_size}"],
+   ["Client","открывает «.part» на дозапись (докачка) или с усечением (заново), шлёт первый тик прогресса."],
+   ["Transfer","цикл: чтение ≤ остатка, limiter.Wait(ctx, login, per_client, global, n) — глобальное ведро, затем на логин — и шлёт чанк; счётчики растут.","← CHUNK_DATA {transfer_id, data ≤ 64 КиБ}"],
+   ["Limiter","SetLimit при смене bps; ведро на логин (N закачек делят бюджет, bug 11); active>0 не даёт reaper'у его удалить."],
+   ["Client","на каждый чанк проверяет transfer_id и received+len≤total (иначе рвёт рассинхрон, R3-3), пишет в «.part», шлёт прогресс в UI (неблокирующе)."],
+   ["Transfer","досчитал: sent==total? vfs.ChecksumCtx (SHA-256, отменяемо — R4-3), шлёт DONE.","← DOWNLOAD_DONE {algo=SHA256, checksum[32]}"],
+   ["Client","сверяет сумму пересобранного файла; совпало → os.Rename «.part»→файл (атомарно, bug #3); нет → удаляет «.part»."],
+   ["TUI","downloadDoneMsg → лог, refreshLocal, startNext дренирует очередь. Если сервер отверг устаревший offset — клиент удаляет «.part» и повторяет с нуля."]
+  ]},
+ {name:"4 · Живое событие",sum:"fsnotify под корнем → debounce в watcher → сервер сбрасывает устаревшую сумму и неблокирующе рассылает EVENT_FS подписчикам SubFS; насос клиента читает его в простое и обновляет показанную панель.",
+  steps:[
+   ["Watcher","при старте (если Events.Enabled) подписывается рекурсивно на каждую поддиректорию share-root."],
+   ["Watcher","файл изменился: новые папки берутся под слежение, удалённые — снимаются; событие схлопывается time.AfterFunc(debounce)."],
+   ["Watcher","emit: os.Stat классифицирует op/kind/size/mtime; vpathOf → VirtualPath от корня (пусто, если вне корня)."],
+   ["Daemon","handleFsEvent: vfs.InvalidateChecksum(vpath) (чтобы CHECKSUM/DOWNLOAD не отдали устаревшую сумму), затем broadcast.","← EVENT_FS {op, kind, path, size, mtime}"],
+   ["Registry","broadcast: перебирает сессии и trySend (неблокирующе, drop-on-full) тем, у кого бит SubFS — один тормоз не задержит остальных."],
+   ["Client","насос runPump вызывает PollEvents(150мс): читает первый байт под дедлайном (таймаут до байта = чистое «нет события», R3-7), декодит; EVENT_FS → обработчик."],
+   ["TUI","eventForwarder неблокирующе шлёт eventMsg в канал; onEvent: если !busy и это текущая папка — обновляет панель, сохранив курсор."]
+  ]},
+ {name:"5 · Живой лимит скорости",sum:"Админ правит hot-ключ; сервер валидирует и атомарно подменяет весь снимок Settings (не трогая опубликованный), сохраняет и рассылает EVENT_CONFIG. Идущая закачка читает снимок на каждом чанке — скорость меняется мгновенно.",
+  steps:[
+   ["TUI","на вкладке Settings Enter → правка только hot-строки (restart-ключи UI не даёт менять); adminSetCmd под clientMu.","→ ADMIN_SET {key, value}"],
+   ["Dispatch","roleAllows(role, admin) — авторизация на сервере независимо от UI; handleAdmin → adminSet."],
+   ["Hub","Set под wmu: копирует Current(), applyKey парсит и проверяет диапазон, Validate(), snap.Store(&next) — одна атомарная подмена всего снимка; onChange под тем же локом."],
+   ["Daemon","onConfigChange: обновляет живой уровень лога; Save(configPath) атомарно; broadcast EVENT_CONFIG только админам (CR-07).","← EVENT_CONFIG {key, new_value}"],
+   ["Transfer","любая активная streamFile на СЛЕДУЮЩЕМ чанке: lim:=hub.Current().Limits (атомарная загрузка), limiter.Wait → SetLimit — закачка перетормаживается вживую."],
+   ["TUI","админ получает EVENT_CONFIG и ADMIN_SET_RESULT → строка настройки обновляется, вкладка перечитывается.","← ADMIN_SET_RESULT {ok, message}"]
+  ]},
+ {name:"6 · Heartbeat + реконнект",sum:"Насос держит канал живым PING'ом каждые 20 с и ловит обрыв; при потере модель сносит старый клиент и переподключается с экспоненциальным backoff, заново проигрывая SCRAM и восстанавливая подписки, насос и показанную папку.",
+  steps:[
+   ["TUI","runPump в цикле: PollEvents(150мс) поглощает события; если прошло >20 с — c.Ping()."],
+   ["Client","Ping пишет PING; сервер отвечает PONG, который как асинхронный кадр поглощается следующим Poll, не путаясь с ответом.","→ PING  ←  PONG"],
+   ["TUI","если ошибка и isConnLost (не RemoteError/AuthError/Canceled) → connLostMsg, выход из насоса."],
+   ["TUI","beginReconnect (идемпотентно, только на экране командера): link=реконнект, stopPump, Close+nil клиента, backoff=1с."],
+   ["Connection","reconnectCmd спит backoff, затем Dial с сохранённым паролем — полный SCRAM заново.","→ HELLO / AUTH_REQUEST"],
+   ["TUI","onReconnected: новый клиент, link=up, subscribeFS, startPump, перечитать текущую папку (курсор сохранён). Иначе backoff×2 (до 30 с) и снова."]
+  ]},
+ {name:"7 · Kick / остановка",sum:"Kick закрывает сокет цели — её reader/writer разблокируются и handleConn всё сворачивает. Остановка сначала отвечает, потом отменяет цикл приёма и дренирует: ждёт активные передачи до grace, затем закрывает силой.",
+  steps:[
+   ["TUI","Clients: F8/k → kickSelected (свою сессию нельзя) → модалка подтверждения → adminKickCmd.","→ ADMIN_KICK {session_id}"],
+   ["Admin","adminKick: само-kick запрещён; EVENT_NOTICE(warn); target.conn.Close() разблокирует reader/writer цели.","← ADMIN_KICK_RESULT {ok, message}"],
+   ["Session","у кикнутого serveRequests падает на ReadFrame; defer handleConn: закрыть done, дать writeLoop дослать, conn.Close, reg.remove."],
+   ["TUI","SHUTDOWN: F2 → Graceful → ввод «shutdown [сек]» → adminShutdownCmd.","→ ADMIN_SHUTDOWN {grace_seconds}"],
+   ["Admin","adminShutdown: EVENT_NOTICE(warn) «остановка через N сек», отвечает результат, и ТОЛЬКО ПОТОМ go requestShutdown(grace).","← ADMIN_SHUTDOWN_RESULT {ok, message}"],
+   ["Daemon","requestShutdown отменяет цикл приёма; drain ждёт connWg до grace — активные закачки успевают доиграть — затем closeAll() и ждёт горутины."]
+  ]}
+];
+var ftabs=document.getElementById("flowtabs"),fsum=document.getElementById("flowsum"),fsteps=document.getElementById("flowsteps");
+function drawFlow(fi){
+  var F=flows[fi];
+  ftabs.querySelectorAll("button").forEach(function(b,j){b.classList.toggle("on",j===fi)});
+  fsum.textContent=F.sum;
+  fsteps.innerHTML="";
+  F.steps.forEach(function(s){
+    var row=document.createElement("div");row.className="step";
+    var wire="";
+    if(s[2]){var rx=s[2].charAt(0)==="←";wire="<span class='wire"+(rx?" rx":"")+"'>"+s[2]+"</span>"}
+    row.innerHTML="<div class='actor'>"+s[0]+"</div><div class='act'>"+s[1]+wire+"</div>";
+    fsteps.appendChild(row);
+  });
+}
+flows.forEach(function(F,i){var b=document.createElement("button");b.textContent=F.name;
+  b.addEventListener("click",function(){drawFlow(i)});ftabs.appendChild(b)});
+drawFlow(0);
+
+})();
+</script>

@@ -13,6 +13,12 @@ This port follows the self-sufficient specification in
 reproduced **byte-for-byte**, so a Go server can serve the original C++ client
 and vice-versa.
 
+> **📖 Интерактивная документация:** как устроена система целиком — карта
+> пакетов, кадр протокола по байтам, карта сообщений, пошаговый разбор входа
+> SCRAM и сквозные сценарии — живёт одной самодостаточной страницей в
+> [`docs/interactive/index.html`](docs/interactive/index.html). Откройте её в
+> браузере (`xdg-open docs/interactive/index.html`) или включите GitHub Pages.
+
 ## Components
 
 | Binary | Role |
@@ -102,6 +108,7 @@ internal/watcher       fs events (fsnotify) -> EVENT_FS
 internal/client        blocking client transport
 internal/tui           Bubble Tea model/update/view + connection bridge
 docs/tz                the specification this port follows
+docs/interactive       single-page interactive architecture doc (open in a browser)
 ```
 
 ## Предметные типы и комментарии (для мейнтейнеров)
