@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -16,8 +15,7 @@ const cmdHelp = "commands: cd <path> · get [file…] · info [file] · refresh 
 
 // enterCmdMode focuses the bottom command line (opened with ":").
 func (m *Model) enterCmdMode() {
-	ti := textinput.New()
-	ti.Prompt = ""
+	ti := newThemedInput()
 	ti.Focus()
 	w := m.width - 16
 	if w < 8 {

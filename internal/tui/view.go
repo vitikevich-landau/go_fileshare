@@ -30,31 +30,38 @@ func (m *Model) View() string {
 
 func (m *Model) viewConnect() string {
 	var b strings.Builder
-	b.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colCyan).Render("  fileshare commander") + "\n\n")
-	b.WriteString("  Host:  " + m.fields[0].View() + "    Port: " + m.fields[1].View() + "\n")
-	b.WriteString("  Login: " + m.fields[2].View() + "\n")
-	b.WriteString("  Pass:  " + m.fields[3].View() + "\n\n")
+	b.WriteString("\n")
+	b.WriteString("  " + styAccent.Render("▍") +
+		lipgloss.NewStyle().Bold(true).Foreground(colFg).Render("fileshare commander") +
+		styDim.Render("  // neon grid transfer client") + "\n\n")
+	b.WriteString("  " + styDim.Render("Host:") + "  " + m.fields[0].View() + "    " + styDim.Render("Port:") + " " + m.fields[1].View() + "\n")
+	b.WriteString("  " + styDim.Render("Login:") + " " + m.fields[2].View() + "\n")
+	b.WriteString("  " + styDim.Render("Pass:") + "  " + m.fields[3].View() + "\n\n")
 
 	if m.hasProfiles() {
-		b.WriteString("  Saved profiles:\n")
+		b.WriteString("  " + styAccent.Render("▍") + styDim.Render("saved profiles") + "\n")
 		for i, pr := range m.profiles.Profiles {
 			cursor := "    "
 			line := fmt.Sprintf("%s (%s@%s:%d)", pr.Name, pr.Login, pr.Host, pr.Port)
 			if m.focus == m.profilesFocus() && i == m.profileCursor {
-				cursor = "  > "
-				line = styActiveTitle.Render(line)
+				cursor = "  " + styAccent.Render("▸") + " "
+				line = styCursor.Render(" " + line + " ")
+			} else {
+				line = styText.Render(line)
 			}
 			b.WriteString(cursor + line + "\n")
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString(styDim.Render("  [Enter] connect   [Tab] next field   [Esc] quit") + "\n")
+	b.WriteString("  " + styAccent.Render("ENTER") + styDim.Render(" connect · ") +
+		styAccent.Render("TAB") + styDim.Render(" next field · ") +
+		styAccent.Render("ESC") + styDim.Render(" quit") + "\n")
 	if m.connecting {
-		b.WriteString("\n  " + m.spinner.View() + " " + m.status + "\n")
+		b.WriteString("\n  " + m.spinner.View() + " " + styText.Render(m.status) + "\n")
 		b.WriteString(styDim.Render("  TCP → handshake → auth → loading    [Esc to cancel]") + "\n")
 	}
 	if m.connectErr != "" {
-		b.WriteString("\n  " + styErr.Render("error: "+m.connectErr) + "\n")
+		b.WriteString("\n  " + styErr.Render("✕ error: "+m.connectErr) + "\n")
 	}
 	return b.String()
 }
@@ -300,7 +307,8 @@ func (m *Model) renderPrompt() string {
 	if login == "" {
 		login = "anon"
 	}
-	base := styPrompt.Render(fmt.Sprintf("%s@%s:%s$", login, m.serverName, path))
+	base := styAccent.Render(login) + styDim.Render("@") + styPrompt.Render(m.serverName) +
+		styDim.Render(":") + styText.Render(path) + styAccent.Render(" ❯")
 	if m.cmdMode {
 		return base + " " + m.cmdInput.View()
 	}
@@ -308,11 +316,25 @@ func (m *Model) renderPrompt() string {
 }
 
 func (m *Model) renderFbar() string {
-	keys := "F1 Help  F5 Get  Ctrl+R Refresh  Ctrl+N Seen  Tab Switch  F10 Quit"
-	if m.role == 2 { // admin
-		keys = "F1 Help  F5 Get  Ctrl+R Refresh  F9 Admin  Tab Switch  F10 Quit"
+	pairs := [][2]string{
+		{"F1", "Help"}, {"F5", "Get"}, {"^R", "Refresh"}, {"^N", "Seen"}, {"TAB", "Switch"}, {"F10", "Quit"},
 	}
-	return styFbar.Render(fit(keys, m.width))
+	if m.role == 2 { // admin
+		pairs = [][2]string{
+			{"F1", "Help"}, {"F5", "Get"}, {"^R", "Refresh"}, {"F9", "Admin"}, {"TAB", "Switch"}, {"F10", "Quit"},
+		}
+	}
+	var b strings.Builder
+	b.WriteString(styFbar.Render(" "))
+	for _, p := range pairs {
+		b.WriteString(styFbarKey.Render(p[0]))
+		b.WriteString(styFbar.Render(" " + p[1] + "  "))
+	}
+	s := b.String()
+	if pad := m.width - lipgloss.Width(s); pad > 0 {
+		s += styFbar.Render(strings.Repeat(" ", pad))
+	}
+	return clipTo(s, m.width)
 }
 
 // fit truncates or pads s to exactly w runes.
