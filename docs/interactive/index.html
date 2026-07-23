@@ -593,11 +593,11 @@ var groups=[
    ["EVENT_CONFIG","0x43","S→C","key:str, new_value:str","только подписчикам-админам"]]},
  {g:"Админ-канал · 0x50–0x5D",col:"mag",role:"admin",msgs:[
    ["ADMIN_GET_CONFIG","0x50","C→S","—","→ ADMIN_CONFIG"],
-   ["ADMIN_CONFIG","0x51","S→C","json_len:u32, json (сырой)","единственное, что может быть >64 КиБ"],
+   ["ADMIN_CONFIG","0x51","S→C","json_len:u32, json (сырой)","u32-префикс (не u16-строка): JSON может быть >64 КиБ; кадр ≤ 4 МиБ — как у LIST_DIR_RESPONSE и ADMIN_CLIENTS"],
    ["ADMIN_SET","0x52","C→S","key:str, value:str","только белый список hot-ключей"],
    ["ADMIN_SET_RESULT","0x53","S→C","ok:u8, message:str",""],
    ["ADMIN_LIST_CLIENTS","0x54","C→S","—","→ ADMIN_CLIENTS"],
-   ["ADMIN_CLIENTS","0x55","S→C","count:u32, count×ClientInfo","id,login,ip,role,path,bytes,speed"],
+   ["ADMIN_CLIENTS","0x55","S→C","count:u32, count×ClientInfo","поля: id,login,ip,role,path,bytes,speed; count ≤ 1<<20, кадр ≤ 4 МиБ"],
    ["ADMIN_KICK","0x56","C→S","session_id:u64","само-kick запрещён"],
    ["ADMIN_KICK_RESULT","0x57","S→C","ok:u8, message:str",""],
    ["ADMIN_STATS","0x58","C→S","—","→ ADMIN_STATS_RESPONSE"],
