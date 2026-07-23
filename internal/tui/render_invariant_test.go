@@ -131,6 +131,38 @@ func TestAdminSettingsCursorClampsOnShrink(t *testing.T) {
 	}
 }
 
+// TestAdminConfigRefreshKeepsClientSelection guards the cross-tab regression:
+// adminCursor is shared between tabs, so an async ADMIN_CONFIG arriving while the
+// operator is on the Clients tab (e.g. openAdmin's batched requests completing)
+// must NOT clamp/move the highlighted client — otherwise the next Enter/F8/kick
+// would act on a different session than the one selected.
+func TestAdminConfigRefreshKeepsClientSelection(t *testing.T) {
+	m := adminFixture()
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.adminTab = adminTabClients
+	m.adminClients = []proto.ClientInfo{
+		{SessionID: 1, Login: "a"}, {SessionID: 2, Login: "b"},
+		{SessionID: 3, Login: "c"}, {SessionID: 4, Login: "d"},
+	}
+	m.adminCursor = 3 // operator moved to the 4th client
+
+	// A shorter config list arrives while the Clients tab owns the cursor.
+	m.Update(adminConfigMsg{rows: []configKey{{Key: "limits.global_bps", Value: "0", Hot: true}}})
+	if m.adminCursor != 3 {
+		t.Fatalf("client selection moved to %d after a config refresh; want 3", m.adminCursor)
+	}
+
+	// Symmetric guard: a shorter client list arriving while on Settings must not
+	// disturb the settings cursor either.
+	m.adminTab = adminTabSettings
+	m.adminConfig = []configKey{{Key: "a", Hot: true}, {Key: "b", Hot: true}, {Key: "c", Hot: true}}
+	m.adminCursor = 2
+	m.Update(adminClientsMsg{clients: []proto.ClientInfo{{SessionID: 1}}})
+	if m.adminCursor != 2 {
+		t.Fatalf("settings selection moved to %d after a clients refresh; want 2", m.adminCursor)
+	}
+}
+
 // TestFitCols pads and truncates by display columns, unlike rune-based fit().
 func TestFitCols(t *testing.T) {
 	if got := lipgloss.Width(fitCols("abc", 10)); got != 10 {

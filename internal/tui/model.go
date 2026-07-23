@@ -296,7 +296,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmd = m.adminErr(msg.err)
 		} else {
 			m.adminClients = msg.clients
-			if m.adminCursor >= len(m.adminClients) {
+			// Курсор общий на все вкладки, поэтому зажимаем его ТОЛЬКО когда им
+			// владеет вкладка Clients. Иначе асинхронный список клиентов (батч
+			// openAdmin, рефреш после kick) сбросил бы выделение на другой вкладке.
+			if m.adminTab == adminTabClients && m.adminCursor >= len(m.adminClients) {
 				m.adminCursor = 0
 			}
 		}
@@ -305,10 +308,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmd = m.adminErr(msg.err)
 		} else {
 			m.adminConfig = msg.rows
-			// Зажимаем курсор в новые границы (симметрично adminClientsMsg):
-			// если рефреш вернул меньше строк, устаревший курсор увёл бы окно
-			// прокрутки за конец списка и вкладка Settings отрисовала бы пусто.
-			if m.adminCursor >= len(m.adminConfig) {
+			// Симметрично клиентам: зажимаем общий курсор только на своей вкладке
+			// (Settings). Если рефреш вернул меньше строк, а мы на Settings —
+			// устаревший курсор увёл бы окно прокрутки за конец списка и вкладка
+			// отрисовалась бы пустой. А вот конфиг, пришедший пока открыта вкладка
+			// Clients, НЕ должен трогать выбранного клиента — иначе следующий
+			// Enter/F8/k подействует не на ту сессию.
+			if m.adminTab == adminTabSettings && m.adminCursor >= len(m.adminConfig) {
 				m.adminCursor = 0
 			}
 		}
