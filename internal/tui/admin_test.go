@@ -45,9 +45,11 @@ func TestAdminSettingsEditHotVsRestart(t *testing.T) {
 		t.Fatalf("expected restart-only message, got %q", m.adminMsg)
 	}
 
-	// Hot row enters edit mode prefilled with the current value.
+	// Hot row enters edit mode prefilled with the current value. No command is
+	// expected: the themed input uses a static cursor, so there is no Blink cmd.
 	m.adminCursor = 1
-	if cmd := m.startEditSetting(); cmd == nil || !m.adminEditing {
+	m.startEditSetting()
+	if !m.adminEditing {
 		t.Fatal("hot key should enter edit mode")
 	}
 	if m.adminEditKey != "limits.global_bps" || m.adminInput.Value() != "0" {
@@ -83,7 +85,7 @@ func TestAdminJournalAccumulatesAndRenders(t *testing.T) {
 
 	m.adminTab = adminTabJournal
 	out := m.viewAdmin()
-	for _, want := range []string{"4 Journal", "kicked session 7", "limits.global_bps = 1000000"} {
+	for _, want := range []string{"4 JOURNAL", "kicked session 7", "limits.global_bps = 1000000"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("journal view missing %q\n%s", want, out)
 		}
@@ -235,7 +237,7 @@ func TestAdminSessionDetail(t *testing.T) {
 		t.Fatal("Enter on a client row should open its session detail")
 	}
 	out := m.viewAdmin()
-	for _, want := range []string{"Session 7", "bob", "10.0.0.5", "/video"} {
+	for _, want := range []string{"SESSION 7", "bob", "10.0.0.5", "/video"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("detail view missing %q", want)
 		}
@@ -260,7 +262,7 @@ func TestViewAdminRenders(t *testing.T) {
 
 	// Overview
 	out := m.viewAdmin()
-	for _, want := range []string{"ADMIN: vps", "Overview", "go-2.0", "unlimited"} {
+	for _, want := range []string{"FSHARE ADMIN", "vps", "OVERVIEW", "go-2.0", "unlimited"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("overview missing %q", want)
 		}
@@ -272,7 +274,7 @@ func TestViewAdminRenders(t *testing.T) {
 	}
 	// Settings tab
 	m.adminTab = adminTabSettings
-	if s := m.viewAdmin(); !strings.Contains(s, "limits.global_bps") || !strings.Contains(s, "[hot]") {
+	if s := m.viewAdmin(); !strings.Contains(s, "limits.global_bps") || !strings.Contains(s, "hot") {
 		t.Error("settings tab missing config row")
 	}
 }

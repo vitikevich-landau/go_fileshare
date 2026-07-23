@@ -135,35 +135,36 @@ type Model struct {
 // переопределяют форму. Здесь же готовятся текстовые поля, спиннер и канал events,
 // через который в UI будут приходить асинхронные сообщения.
 func New(prefill Profile) *Model {
-	host := textinput.New()
+	host := newThemedInput()
 	host.Placeholder = "host"
 	host.CharLimit = 255
 	host.Width = 28
 	host.Focus()
 
-	port := textinput.New()
+	port := newThemedInput()
 	port.SetValue("5555")
 	port.CharLimit = 5
 	port.Width = 8
 
-	login := textinput.New()
+	login := newThemedInput()
 	login.Placeholder = "login"
 	login.Width = 20
 
-	pw := textinput.New()
+	pw := newThemedInput()
 	pw.Placeholder = "password"
 	pw.EchoMode = textinput.EchoPassword
-	pw.EchoCharacter = '*'
+	pw.EchoCharacter = '•'
 	pw.Width = 20
 
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
+	sp.Style = styAccent
 
 	m := &Model{
 		screen:           screenConnect,
 		fields:           []textinput.Model{host, port, login, pw},
 		profiles:         LoadProfiles(),
-		prog:             progress.New(progress.WithDefaultGradient()),
+		prog:             progress.New(progress.WithGradient("#bb9af7", "#7dcfff")),
 		spinner:          sp,
 		events:           make(chan tea.Msg, 64),
 		link:             linkDown,
@@ -192,11 +193,12 @@ func New(prefill Profile) *Model {
 	return m
 }
 
-// Init реализует tea.Model: стартовые команды. Помимо мигания курсора запускает
-// waitForActivity — «слушателя» канала events, который превращает приходящие
-// туда кадры в сообщения tea.Msg (без него сообщения из канала не дойдут).
+// Init реализует tea.Model: стартовая команда — waitForActivity, «слушатель»
+// канала events, который превращает приходящие туда кадры в сообщения tea.Msg
+// (без него сообщения из канала не дойдут). Мигание курсора (textinput.Blink)
+// не запускается осознанно: тема использует статичный курсор (style.go).
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(textinput.Blink, waitForActivity(m.events))
+	return waitForActivity(m.events)
 }
 
 // Update реализует tea.Model: ЕДИНСТВЕННОЕ место, где меняется состояние модели.
@@ -593,7 +595,7 @@ func (m *Model) handleCommanderKey(k tea.KeyMsg) tea.Cmd {
 		}
 	case ":":
 		m.enterCmdMode()
-		return textinput.Blink
+		return nil
 	case "f1":
 		m.log(lineInfo, helpText)
 	}
