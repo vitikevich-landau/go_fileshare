@@ -105,6 +105,32 @@ func TestAdminKickAcceptsUppercaseY(t *testing.T) {
 	}
 }
 
+// TestAdminSettingsCursorClampsOnShrink guards against a stale Settings cursor
+// blanking the tab: if a config refresh returns fewer rows while the cursor sits
+// past the new end, the scroll window would start beyond the slice and render
+// nothing. The adminConfigMsg handler must clamp the cursor (as clients do).
+func TestAdminSettingsCursorClampsOnShrink(t *testing.T) {
+	m := adminFixture()
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.adminTab = adminTabSettings
+
+	big := make([]configKey, 0, 10)
+	for i := 0; i < 10; i++ {
+		big = append(big, configKey{Key: "limits.key_" + string(rune('a'+i)), Value: "0", Hot: true})
+	}
+	m.adminConfig = big
+	m.adminCursor = 9
+
+	// Refresh returns just two rows; cursor 9 is now out of range.
+	m.Update(adminConfigMsg{rows: big[:2]})
+	if m.adminCursor >= len(m.adminConfig) {
+		t.Fatalf("cursor %d not clamped into config len %d", m.adminCursor, len(m.adminConfig))
+	}
+	if !strings.Contains(m.viewAdmin(), "limits.key_a") {
+		t.Fatal("settings tab rendered no rows after the config list shrank")
+	}
+}
+
 // TestFitCols pads and truncates by display columns, unlike rune-based fit().
 func TestFitCols(t *testing.T) {
 	if got := lipgloss.Width(fitCols("abc", 10)); got != 10 {

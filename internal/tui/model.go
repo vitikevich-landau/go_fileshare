@@ -305,6 +305,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmd = m.adminErr(msg.err)
 		} else {
 			m.adminConfig = msg.rows
+			// Зажимаем курсор в новые границы (симметрично adminClientsMsg):
+			// если рефреш вернул меньше строк, устаревший курсор увёл бы окно
+			// прокрутки за конец списка и вкладка Settings отрисовала бы пусто.
+			if m.adminCursor >= len(m.adminConfig) {
+				m.adminCursor = 0
+			}
 		}
 	case adminSetResultMsg:
 		if msg.err != nil {
