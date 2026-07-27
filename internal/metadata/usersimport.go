@@ -302,8 +302,26 @@ func legacyToUser(rec legacyRecord, authIters int) NewUser {
 	}
 }
 
+// renameAdvice — что делать оператору с записью, чей логин перенести нельзя.
+//
+// Совет обязан называть ОБА действия. Соль до раунда AUTH_PARAMS (M14)
+// детерминирована и равна `"fileshare-v2:" || login` (§6.2 п. 2), поэтому
+// stored_key привязан к логину: под новым логином клиент выведет ClientKey с
+// другой солью, и прежний верификатор ему не подойдёт. Совет «переименуйте
+// запись» без второй половины дал бы успешный импорт и учётку, которая не
+// пускает по своему же паролю, — то есть ровно тот молчаливый отказ входа, от
+// которого спасает вся остальная работа этого файла. По той же причине §7.4 не
+// предоставляет команды `user rename` до перехода на случайные соли.
+const renameAdvice = "such a record cannot be migrated as it is: rename it in the JSON AND reset its " +
+	"password afterwards — stored_key is bound to the login through the salt \"fileshare-v2:\"||login " +
+	"(§6.2 п. 2), so a renamed account cannot authenticate with the old password"
+
 // parseLegacyUsers разбирает users.json и отвергает всё, что нельзя перенести
 // без молчаливой подмены смысла.
+//
+// Найденное сообщается ЦЕЛИКОМ, а не по одной находке за запуск: импорт всё
+// равно всё или ничего, и оператор, правящий файл, должен увидеть полный список
+// записей, требующих внимания, — тем же способом, что и VerifyInvariants.
 //
 // Конфликт логинов ВНУТРИ файла — ошибка всегда (§21.4), даже при
 // --overwrite-existing: файл, где один логин встречается дважды, не выражает
@@ -328,10 +346,20 @@ func parseLegacyUsers(data []byte) ([]legacyRecord, error) {
 
 	users := *ff.Users
 	seen := make(map[string]int, len(users))
+	var problems []error
 	for i, rec := range users {
 		where := fmt.Sprintf("users[%d]", i)
+
+		// Правила логина — MaxLoginLen и запрет управляющих символов — введены
+		// вместе с новой моделью, и старый файл о них не знал: `--add-user`
+		// пишет в users.json любую непустую строку, а загрузчик её принимает.
+		// Значит, такая учётка могла годами работать и входить. Перенести её как
+		// есть всё равно нельзя (логин уходит в соль и в записи аудита §20.2),
+		// поэтому отказ остаётся — но сопровождается выполнимым указанием, а не
+		// одной констатацией.
 		if err := validateLogin(rec.Login); err != nil {
-			return nil, fmt.Errorf("metadata: parse users.json: %s: %w", where, err)
+			problems = append(problems, fmt.Errorf("%s: %w; %s", where, err, renameAdvice))
+			continue
 		}
 		// Логин `system` в старом файле совершенно легален — резервирует его
 		// только §6.2, которого во времена users.json не существовало. Но в
@@ -343,16 +371,17 @@ func parseLegacyUsers(data []byte) ([]legacyRecord, error) {
 		// руками. Поэтому отказ, а не пропуск записи: пропустив, мы потеряли бы
 		// пользователя молча.
 		if rec.Login == domain.SystemLogin {
-			return nil, fmt.Errorf(
-				"metadata: parse users.json: %s: login %q is reserved for the pre-seeded system account (§6.2): %w; "+
-					"rename this account in the JSON before importing",
-				where, rec.Login, ErrReservedLogin)
+			problems = append(problems, fmt.Errorf(
+				"%s: login %q is reserved for the pre-seeded system account (§6.2): %w; %s",
+				where, rec.Login, ErrReservedLogin, renameAdvice))
+			continue
 		}
 		if prev, dup := seen[rec.Login]; dup {
-			return nil, fmt.Errorf(
-				"metadata: parse users.json: login %q appears twice (users[%d] and %s); "+
+			problems = append(problems, fmt.Errorf(
+				"login %q appears twice (users[%d] and %s); "+
 					"the file does not say which record is current, so the migration cannot choose (§21.4)",
-				rec.Login, prev, where)
+				rec.Login, prev, where))
+			continue
 		}
 		seen[rec.Login] = i
 
@@ -361,19 +390,21 @@ func parseLegacyUsers(data []byte) ([]legacyRecord, error) {
 		// миграции значило бы понизить администратора из-за опечатки и не
 		// сказать об этом.
 		if _, err := domain.ParseRole(rec.Role); err != nil {
-			return nil, fmt.Errorf("metadata: parse users.json: %s (login %q): %w", where, rec.Login, err)
+			problems = append(problems, fmt.Errorf("%s (login %q): %w", where, rec.Login, err))
 		}
 
 		raw, err := hex.DecodeString(rec.StoredKey)
-		if err != nil {
-			return nil, fmt.Errorf("metadata: parse users.json: %s (login %q): stored_key is not hex: %w",
-				where, rec.Login, err)
+		switch {
+		case err != nil:
+			problems = append(problems, fmt.Errorf("%s (login %q): stored_key is not hex: %w",
+				where, rec.Login, err))
+		case len(raw) != StoredKeyLen:
+			problems = append(problems, fmt.Errorf("%s (login %q): stored_key is %d bytes, want %d",
+				where, rec.Login, len(raw), StoredKeyLen))
 		}
-		if len(raw) != StoredKeyLen {
-			return nil, fmt.Errorf(
-				"metadata: parse users.json: %s (login %q): stored_key is %d bytes, want %d",
-				where, rec.Login, len(raw), StoredKeyLen)
-		}
+	}
+	if len(problems) != 0 {
+		return nil, fmt.Errorf("metadata: parse users.json: %w", errors.Join(problems...))
 	}
 	return users, nil
 }

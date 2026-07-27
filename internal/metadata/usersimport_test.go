@@ -646,3 +646,79 @@ func TestImportRepairsMixedAuthIters(t *testing.T) {
 		t.Errorf("после перезаписи всех секретов база не стартует: %v", err)
 	}
 }
+
+// TestImportRejectsLegacyLoginWithAdvice — логин, законный для старого файла,
+// но не проходящий новых правил, отвергается с ВЫПОЛНИМЫМ указанием.
+//
+// Такие учётки существуют: --add-user пишет в users.json любую непустую строку,
+// а загрузчик её принимает, так что запись могла годами работать и входить.
+// Перенести её как есть нельзя — логин уходит в соль и в записи аудита §20.2, —
+// но сообщение обязано назвать ОБА действия. Соль до M14 равна
+// "fileshare-v2:"||login, поэтому под новым логином прежний stored_key не
+// подойдёт: совет «переименуйте» без «и смените пароль» дал бы успешный импорт
+// и учётку, не пускающую по своему же паролю.
+func TestImportRejectsLegacyLoginWithAdvice(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct{ why, login string }{
+		{"перевод строки в логине", `a\nb`},
+		{"логин длиннее предела", strings.Repeat("x", metadata.MaxLoginLen+1)},
+	} {
+		d, us, _ := repos(t)
+		body := usersJSON(rec(tc.login, "admin", keyHex(1), true))
+		_, err := metadata.ImportUsers(ctx, d, us, body, importOpts())
+		if !errors.Is(err, metadata.ErrInvalidLogin) {
+			t.Errorf("%s: %v, want ErrInvalidLogin", tc.why, err)
+			continue
+		}
+		for _, want := range []string{"rename", "reset its password", "fileshare-v2:"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%s: в совете нет %q: %v", tc.why, want, err)
+			}
+		}
+	}
+}
+
+// TestImportSystemLoginAdviceMentionsPassword — тот же совет обязан
+// сопровождать и отказ по зарезервированному логину: переименование системной
+// учётки обесценивает её пароль ровно так же.
+func TestImportSystemLoginAdviceMentionsPassword(t *testing.T) {
+	ctx := context.Background()
+	d, us, _ := repos(t)
+
+	_, err := metadata.ImportUsers(ctx, d, us,
+		usersJSON(rec(domain.SystemLogin, "admin", keyHex(1), true)), importOpts())
+	if !errors.Is(err, metadata.ErrReservedLogin) {
+		t.Fatalf("%v, want ErrReservedLogin", err)
+	}
+	for _, want := range []string{"rename", "reset its password", "fileshare-v2:"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("в совете нет %q: %v", want, err)
+		}
+	}
+}
+
+// TestImportReportsAllProblemsAtOnce — разбор сообщает обо ВСЕХ негодных
+// записях сразу. Импорт всё равно всё или ничего, и оператор, правящий файл,
+// должен увидеть полный список, а не чинить по одной записи за запуск.
+func TestImportReportsAllProblemsAtOnce(t *testing.T) {
+	ctx := context.Background()
+	d, us, _ := repos(t)
+
+	// Перевод строки записан ЭКРАНИРОВАННЫМ: сырой сделал бы невалидным сам
+	// JSON, и разбор упал бы раньше проверки логинов.
+	body := rec("ok", "admin", keyHex(1), true) + "," +
+		rec(`bad\nlogin`, "user", keyHex(2), true) + "," +
+		rec("wrongrole", "root", keyHex(3), true) + "," +
+		rec("badkey", "user", "zz", true) + "," +
+		rec(domain.SystemLogin, "admin", keyHex(4), true)
+	_, err := metadata.ImportUsers(ctx, d, us, usersJSON(body), importOpts())
+	if err == nil {
+		t.Fatal("файл с четырьмя негодными записями принят")
+	}
+	for _, want := range []string{"users[1]", "wrongrole", "badkey", "system"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("в отчёте нет %q:\n%v", want, err)
+		}
+	}
+}
