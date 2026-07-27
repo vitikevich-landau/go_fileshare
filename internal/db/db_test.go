@@ -424,3 +424,14 @@ func TestDefaultReadConns(t *testing.T) {
 		t.Fatalf("default ReadConns = %d, want >= 4", d.ReadConns())
 	}
 }
+
+// TestReaderRequiresExistingDatabase — §6.4 п. 9 ADR 0001: mode=ro не создаёт ни
+// файл БД, ни WAL, поэтому читающий handle, открытый до миграций, обязан дать
+// ошибку, а не тихо создать пустую базу. Именно это и фиксирует порядок
+// открытия §4.4.
+func TestReaderRequiresExistingDatabase(t *testing.T) {
+	cfg := testConfig(t)
+	if _, err := openReader(context.Background(), cfg); err == nil {
+		t.Fatal("reader opened a database that does not exist")
+	}
+}
