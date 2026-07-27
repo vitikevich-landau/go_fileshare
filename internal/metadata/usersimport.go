@@ -54,6 +54,11 @@ type ImportReport struct {
 	Created []string
 	Skipped []string
 	Updated []string
+	// NoActiveAdmin сообщает, что в получившейся базе нет ни одного
+	// пользователя с ролью admin и состоянием active. Это не ошибка импорта
+	// (см. ImportUsers), но daemon с такой базой не стартует (§7.5), поэтому
+	// команда обязана сказать об этом вслух.
+	NoActiveAdmin bool
 }
 
 // ImportUsers переносит users.json в таблицу users (§21.4).
@@ -66,6 +71,19 @@ type ImportReport struct {
 //
 // Исходный JSON не удаляется и не изменяется: файл читает вызывающий, сюда
 // приходит его содержимое.
+//
+// Инвариант последнего администратора (§2.2 п. 13) применяется ровно в той
+// форме, в какой его задаёт §7.4: отклоняются операции, которые СДЕЛАЛИ БЫ
+// множество активных администраторов пустым. Импорт, после которого админов не
+// осталось, хотя до него они были, — это оно и есть, и он отклоняется.
+//
+// А вот импорт в базу, где активных администраторов не было И ДО него,
+// проходит: множество пустым делает не он. Отказ в этом случае был бы прямо
+// вреден — восстановительный путь §7.5 это `fshare-daemon --promote <login>`,
+// то есть повышение УЖЕ ИМПОРТИРОВАННОГО пользователя, и запрет на импорт
+// сделал бы его невыполнимым. Оператор получил бы файл, который некуда залить,
+// и базу, которую некем починить. Вместо отказа поднимается флаг
+// ImportReport.NoActiveAdmin, о котором команда сообщает вслух.
 func ImportUsers(ctx context.Context, d *db.DB, us *Users, data []byte, opts ImportOptions) (ImportReport, error) {
 	if opts.AuthIters <= 0 {
 		return ImportReport{}, fmt.Errorf("metadata: import users: auth_iters = %d, must be > 0", opts.AuthIters)
@@ -78,6 +96,10 @@ func ImportUsers(ctx context.Context, d *db.DB, us *Users, data []byte, opts Imp
 	var rep ImportReport
 	err = d.Write(ctx, func(tx *sql.Tx) error {
 		rep = ImportReport{}
+		adminsBefore, err := us.CountActiveAdmins(ctx, tx)
+		if err != nil {
+			return err
+		}
 		for _, rec := range records {
 			action, err := importOne(ctx, tx, us, rec, opts)
 			if err != nil {
@@ -92,6 +114,20 @@ func ImportUsers(ctx context.Context, d *db.DB, us *Users, data []byte, opts Imp
 				rep.Updated = append(rep.Updated, rec.Login)
 			}
 		}
+		// Счёт снимается в ТОЙ ЖЕ транзакции, что и записи: иначе отказ уже
+		// ничего не откатил бы.
+		adminsAfter, err := us.CountActiveAdmins(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if adminsAfter == 0 && adminsBefore > 0 {
+			return fmt.Errorf(
+				"metadata: import users: the import would leave the database without an active administrator "+
+					"(%d before, 0 after): %w; keep at least one record with role \"admin\" and \"enabled\": true "+
+					"in the JSON (§2.2 инвариант 13, §7.4)",
+				adminsBefore, ErrLastAdminRequired)
+		}
+		rep.NoActiveAdmin = adminsAfter == 0
 		return nil
 	})
 	if err != nil {
@@ -271,6 +307,21 @@ func parseLegacyUsers(data []byte) ([]legacyRecord, error) {
 		where := fmt.Sprintf("users[%d]", i)
 		if err := validateLogin(rec.Login); err != nil {
 			return nil, fmt.Errorf("metadata: parse users.json: %s: %w", where, err)
+		}
+		// Логин `system` в старом файле совершенно легален — резервирует его
+		// только §6.2, которого во времена users.json не существовало. Но в
+		// новой схеме он принадлежит предсозданной записи id = 0, и импорт
+		// поверх неё ломает установку необратимо: с --overwrite-existing запись
+		// получила бы role, state и секрет из JSON, а обычная (enabled) учётка
+		// перевела бы системный аккаунт в active — после чего verifySystemAccount
+		// не пускает demon стартовать, и починить это можно только правкой БД
+		// руками. Поэтому отказ, а не пропуск записи: пропустив, мы потеряли бы
+		// пользователя молча.
+		if rec.Login == domain.SystemLogin {
+			return nil, fmt.Errorf(
+				"metadata: parse users.json: %s: login %q is reserved for the pre-seeded system account (§6.2): %w; "+
+					"rename this account in the JSON before importing",
+				where, rec.Login, ErrReservedLogin)
 		}
 		if prev, dup := seen[rec.Login]; dup {
 			return nil, fmt.Errorf(

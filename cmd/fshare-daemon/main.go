@@ -291,6 +291,15 @@ func runMigrateUsers(cfg config.Settings, path string, overwriteExisting bool) e
 	}
 	fmt.Printf("imported %s into %s: %d created, %d skipped, %d updated\n",
 		path, cfg.Database.Path, len(report.Created), len(report.Skipped), len(report.Updated))
+	if report.NoActiveAdmin {
+		// Импорт при этом не отклонён: множество активных администраторов было
+		// пустым и до него, а восстановительный путь §7.5 (`--promote <login>`)
+		// работает именно по импортированным записям. Молчать нельзя — с такой
+		// базой daemon не стартует.
+		fmt.Fprintf(os.Stderr,
+			"warning: the database has no user with role \"admin\" and state \"active\"; "+
+				"the daemon will not serve with it — promote one of the imported logins (§7.5)\n")
+	}
 	for _, group := range []struct {
 		verb   string
 		logins []string

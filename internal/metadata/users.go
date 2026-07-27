@@ -19,6 +19,15 @@ var ErrLoginExists = errors.New("metadata: login already exists")
 // ErrInvalidLogin — логин не проходит минимальную проверку (см. validateLogin).
 var ErrInvalidLogin = errors.New("metadata: invalid login")
 
+// ErrLastAdminRequired — операция опустошила бы множество пользователей с ролью
+// admin и состоянием active (§2.2 инвариант 13, §7.4). На границе server
+// отображается в код LAST_ADMIN_REQUIRED.
+var ErrLastAdminRequired = errors.New("metadata: at least one active administrator is required")
+
+// ErrReservedLogin — логин принадлежит предсозданному системному аккаунту §6.2
+// и не может быть занят или перезаписан.
+var ErrReservedLogin = errors.New("metadata: login is reserved")
+
 // MaxLoginLen — предел длины логина в байтах.
 //
 // §6.2 словаря символов логина не задаёт, и это ограничение — не политика, а

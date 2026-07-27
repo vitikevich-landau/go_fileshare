@@ -3,6 +3,7 @@ package metadata_test
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -434,5 +435,118 @@ func TestImportRequiresUsersArray(t *testing.T) {
 	}
 	if len(report.Created)+len(report.Skipped)+len(report.Updated) != 0 {
 		t.Errorf("пустой массив что-то изменил: %+v", report)
+	}
+}
+
+// TestImportRejectsDemotingLastAdmin — §7.4: отклоняются операции, которые
+// СДЕЛАЛИ БЫ множество активных администраторов пустым. Импорт, снимающий
+// последнего админа, — это оно и есть.
+func TestImportRejectsDemotingLastAdmin(t *testing.T) {
+	ctx := context.Background()
+	d, us, _ := repos(t)
+
+	if _, err := metadata.ImportUsers(ctx, d, us,
+		usersJSON(rec("root", "admin", keyHex(1), true)), importOpts()); err != nil {
+		t.Fatalf("подготовка: %v", err)
+	}
+
+	opts := importOpts()
+	opts.OverwriteExisting = true
+	for _, tc := range []struct{ why, body string }{
+		{"понижение роли", rec("root", "user", keyHex(1), true)},
+		{"отключение", rec("root", "admin", keyHex(1), false)},
+	} {
+		_, err := metadata.ImportUsers(ctx, d, us, usersJSON(tc.body), opts)
+		if !errors.Is(err, metadata.ErrLastAdminRequired) {
+			t.Errorf("%s: %v, want ErrLastAdminRequired", tc.why, err)
+		}
+	}
+
+	// Транзакция откатилась целиком: админ на месте.
+	root, err := us.ByLogin(ctx, "root")
+	if err != nil {
+		t.Fatalf("ByLogin: %v", err)
+	}
+	if root.Role != domain.RoleAdmin || root.State != domain.UserActive {
+		t.Errorf("админ изменён несмотря на отказ: role = %q, state = %q", root.Role, root.State)
+	}
+
+	// А замена одного админа другим в том же файле проходит: множество не
+	// пустеет.
+	body := rec("root", "user", keyHex(1), true) + "," + rec("root2", "admin", keyHex(2), true)
+	if _, err := metadata.ImportUsers(ctx, d, us, usersJSON(body), opts); err != nil {
+		t.Errorf("замена админа отклонена: %v", err)
+	}
+}
+
+// TestImportWithoutAdminsIsAllowed — импорт в базу, где активных админов не
+// было И ДО него, проходит и лишь помечается флагом.
+//
+// Отказ здесь был бы прямо вреден: восстановительный путь §7.5 — это
+// `--promote <login>`, повышение УЖЕ ИМПОРТИРОВАННОГО пользователя. Запретив
+// импорт, мы оставили бы оператора с файлом, который некуда залить, и базой,
+// которую некем починить.
+func TestImportWithoutAdminsIsAllowed(t *testing.T) {
+	ctx := context.Background()
+	d, us, _ := repos(t)
+
+	report, err := metadata.ImportUsers(ctx, d, us,
+		usersJSON(rec("alice", "user", keyHex(1), true)+","+rec("bob", "admin", keyHex(2), false)),
+		importOpts())
+	if err != nil {
+		t.Fatalf("импорт без активных админов отклонён: %v", err)
+	}
+	if !report.NoActiveAdmin {
+		t.Error("NoActiveAdmin не поднят: команда промолчит о непригодной к старту базе")
+	}
+	if _, err := us.ByLogin(ctx, "alice"); err != nil {
+		t.Errorf("пользователи не импортированы: %v", err)
+	}
+
+	// А когда админ есть, флаг не поднимается.
+	d2, us2, _ := repos(t)
+	report, err = metadata.ImportUsers(ctx, d2, us2,
+		usersJSON(rec("root", "admin", keyHex(1), true)), importOpts())
+	if err != nil {
+		t.Fatalf("импорт: %v", err)
+	}
+	if report.NoActiveAdmin {
+		t.Error("NoActiveAdmin поднят при живом администраторе")
+	}
+}
+
+// TestImportRejectsSystemLogin — логин системного аккаунта отвергается всегда.
+//
+// В старом файле он совершенно легален: резервирует его §6.2, которого во
+// времена users.json не было. Но в новой схеме он принадлежит предсозданной
+// записи id = 0, и импорт поверх неё ломает установку необратимо: обычная
+// (enabled) учётка перевела бы системный аккаунт в active, после чего
+// verifySystemAccount не пускает daemon стартовать.
+func TestImportRejectsSystemLogin(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		why       string
+		overwrite bool
+	}{{"без флага", false}, {"с --overwrite-existing", true}} {
+		d, us, _ := repos(t)
+		opts := importOpts()
+		opts.OverwriteExisting = tc.overwrite
+
+		body := rec("alice", "admin", keyHex(1), true) + "," +
+			rec(domain.SystemLogin, "admin", keyHex(2), true)
+		_, err := metadata.ImportUsers(ctx, d, us, usersJSON(body), opts)
+		if !errors.Is(err, metadata.ErrReservedLogin) {
+			t.Errorf("%s: %v, want ErrReservedLogin", tc.why, err)
+		}
+
+		// Системный аккаунт нетронут и база по-прежнему стартует.
+		if err := metadata.VerifyInvariants(ctx, d.Reader); err != nil {
+			t.Errorf("%s: системный аккаунт повреждён: %v", tc.why, err)
+		}
+		// И весь импорт отменён: alice не появилась.
+		if _, err := us.ByLogin(ctx, "alice"); !errors.Is(err, metadata.ErrNotFound) {
+			t.Errorf("%s: импорт применился частично", tc.why)
+		}
 	}
 }
