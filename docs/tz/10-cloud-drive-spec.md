@@ -1382,7 +1382,21 @@ Startup reconciliation выполняется **до открытия listener**
 - SQLite работает в WAL mode;
 - foreign keys включены: `PRAGMA foreign_keys = ON` выполняется на каждом
   соединении пула, а не однократно при открытии базы;
-- busy timeout настроен;
+- busy timeout настроен — на каждом соединении пула, по тому же правилу, что и
+  `foreign_keys`; значение берётся из `database.busy_timeout_ms` (§19.3);
+- `PRAGMA synchronous` установлен в `NORMAL` — значение берётся из
+  `database.synchronous` (§19.3). В WAL-режиме `NORMAL` не теряет закоммиченные
+  транзакции при падении процесса: потеря возможна только при отказе питания или
+  ядра, и цена этого риска ниже, чем `FULL` на каждом commit. Значение обязано
+  быть выражено в конфиге, а не зашито в DSN, потому что §6.1 требует сверять
+  фактическое значение с ожидаемым, а ожидаемое обязано иметь единственный
+  источник;
+- каждая транзакция, способная выполнить запись, открывается как
+  `BEGIN IMMEDIATE`; читающие транзакции остаются `DEFERRED` (см. ниже);
+- фактические значения PRAGMA вычитываются обратно после открытия каждого
+  соединения и сверяются с ожидаемыми; расхождение — фатальная ошибка старта
+  (см. ниже);
+- все таблицы раздела 6 объявлены `STRICT` (см. ниже);
 - schema version хранится в `schema_migrations`;
 - все миграции forward-only и выполняются до начала listener;
 - тяжёлые пересчёты не держат write transaction дольше необходимого;
@@ -1404,7 +1418,7 @@ CREATE TABLE schema_migrations (
     version       INTEGER PRIMARY KEY,
     name          TEXT NOT NULL,
     applied_at_ms INTEGER NOT NULL
-);
+) STRICT;
 ```
 
 Раздел 6 — единственное место документа, где объявляются таблицы, колонки и
@@ -1438,6 +1452,85 @@ CREATE TABLE schema_migrations (
 - работоспособность в образе `FROM scratch` (никаких внешних .so и /etc-файлов);
 - поведение при `busy_timeout` и на WAL-режиме под конкурентной записью.
 
+Замеры по этим критериям и выбор драйвера зафиксированы в
+[ADR 0001](../adr/0001-sqlite-driver.md); числа в трёх врезках ниже взяты оттуда.
+
+**Пишущие транзакции открываются как `BEGIN IMMEDIATE`.** Требования «busy timeout
+настроен» недостаточно, и это доказано замером, а не выведено из общих
+соображений. Каждая транзакция, которая МОЖЕТ выполнить запись, обязана
+открываться как `BEGIN IMMEDIATE` — в терминах `database/sql` это либо
+`_txlock=immediate` на пишущем handle, либо явный `BEGIN IMMEDIATE`. Читающие
+транзакции остаются `DEFERRED`.
+
+Причина в том, что `busy_timeout` этот класс отказов не покрывает
+принципиально. `DEFERRED`-транзакция берёт read-снапшот на первом `SELECT`. Если
+между этим моментом и первой записью другой писатель успел закоммитить, апгрейд
+read-снапшота до write-блокировки возвращает `SQLITE_BUSY_SNAPSHOT`. Ожидание
+здесь бессмысленно — снапшот уже устарел и валидным не станет, сколько ни жди, —
+поэтому обработчик `busy_timeout` не вызывается вовсе, и транзакция получает
+`SQLITE_BUSY` немедленно. `BEGIN IMMEDIATE` берёт write-блокировку сразу, до
+первого чтения; апгрейда не требуется, и вот здесь `busy_timeout` работает и
+честно ждёт освобождения. Это семантика самого SQLite, одинаковая у всех
+проверенных драйверов, а не дефект конкретного из них.
+
+Под правило попадает КАЖДАЯ транзакция вида «SELECT, затем
+INSERT/UPDATE/DELETE», а таких в этом документе почти все пишущие: любая мутация
+§9 читает `resources` для проверки конфликта имени перед вставкой, commit
+загрузки §8.4 читает `users` для проверки квоты перед списанием, туда же
+относятся restore §10.2, purge §10.3, операции с версиями §11 и compaction
+журнала §14.6. Замер: 8 горутин × 250 таких транзакций при `busy_timeout = 5000`
+дают на `DEFERRED` **189–436 успешных из 2000** (остальные — `SQLITE_BUSY`,
+то есть 78–91% штатных мутаций отваливаются), а на `BEGIN IMMEDIATE` —
+**2000 из 2000, ноль `SQLITE_BUSY`** у всех трёх кандидатов. Плата за это —
+сериализация писателей (SQLite и так допускает ровно одного), а не отказы.
+То же требование продублировано в §23.2.
+
+**Обратная вычитка PRAGMA обязательна и фатальна при расхождении.** Замер
+показал, что драйверы МОЛЧА проглатывают любую опечатку в DSN: `foreign_keyz`
+вместо `foreign_keys`, `_pragmaa=` вместо `_pragma=`, мусорное значение
+(`busy_timeout(abc)`), неизвестный параметр целиком — ни ошибки, ни
+предупреждения при открытии, при этом `foreign_keys` остаётся `0`. Единственный
+параметр, который вообще валидируется, — `_txlock`. То есть одна опечатка тихо
+отключает ссылочную целостность на всём проде, и ни один тест этого не заметит:
+нарушения FK просто перестанут отклоняться, а тесты, ожидающие отказа, — упадут
+не там, где причина.
+
+Поэтому после открытия КАЖДОГО соединения пула сервер обязан прочитать обратно
+`PRAGMA foreign_keys`, `PRAGMA journal_mode`, `PRAGMA busy_timeout` и
+`PRAGMA synchronous` и сверить их с ожидаемыми значениями. Любое расхождение —
+фатальная ошибка старта с указанием конкретного PRAGMA, ожидаемого и
+фактического значения, а не предупреждение в лог и не «продолжим с тем, что
+получилось». Для читающего пула вычитка выполняется на всех `N` соединениях,
+взятых одновременно, иначе проверено будет одно и то же соединение `N` раз.
+Обязательный unit-тест — §24.1 п. 18.
+
+**Все таблицы раздела 6 объявлены `STRICT`.** Правило «все timestamps — тип
+`INTEGER`, RFC3339 в базе не хранится нигде» без `STRICT` не имеет никакого
+механического обеспечения: замер показал, что случайно забинденный `time.Time`
+молча ложится в `INTEGER`-колонку `…_ms` как TEXT (`typeof = 'text'`, значение
+вида `2026-07-27 10:00:00 +0000 UTC`) на всех трёх проверенных драйверах — из-за
+type affinity обычных rowid-таблиц. `STRICT` такую вставку отклоняет
+(`cannot store TEXT value in INTEGER column`), то есть превращает запрет §6.1 из
+договорённости в ограничение схемы. Проверено, что вся схема раздела 6 со всеми
+табличными `CHECK` и всеми частичными индексами создаётся как `STRICT` без
+изменений, а `STRICT` доступен начиная с SQLite 3.37 — версии заведомо ниже той,
+что несут кандидаты.
+
+Практические следствия, которые обязана учитывать миграция `0001`:
+
+- допустимы только типы колонок `INT`, `INTEGER`, `REAL`, `TEXT`, `BLOB` и
+  `ANY`; колонка без типа или с любым другим типом не создастся;
+- в `STRICT`-таблице любая `PRIMARY KEY`-колонка неявно `NOT NULL`, поэтому
+  явные `NOT NULL` у `TEXT PRIMARY KEY` выше становятся страховкой на случай
+  отката требования, а не единственной защитой;
+- `STRICT` объявляется сразу, при создании таблицы: добавить его существующей
+  таблице `ALTER TABLE` не умеет, и задним числом это уже пересоздание таблицы с
+  копированием данных.
+
+То же требование действует и для локальной БД sync-клиента (§15.3): она хранит
+те же `INTEGER`-метки времени и те же `BLOB`-суммы, и та же ошибка bind'а даёт
+там ту же тихую порчу.
+
 ### 6.2. Таблица users
 
 ```sql
@@ -1461,7 +1554,7 @@ CREATE TABLE users (
     updated_at_ms        INTEGER NOT NULL,
     CHECK (id >= 0),
     CHECK ((state = 'pending_delete') = (pending_delete_at_ms IS NOT NULL))
-);
+) STRICT;
 ```
 
 `quota_bytes=0` означает unlimited.
@@ -1543,7 +1636,7 @@ CREATE TABLE resources (
     CHECK (id <> parent_id OR kind = 'dir' OR deleted_at_ms IS NOT NULL),
     CHECK (name <> '' OR id = parent_id),
     CHECK (kind = 'file' OR size_bytes = 0)
-);
+) STRICT;
 
 CREATE UNIQUE INDEX resources_uniq_name
     ON resources(namespace, parent_id, name)
@@ -1700,7 +1793,7 @@ CREATE TABLE uploads (
     FOREIGN KEY(target_parent_id) REFERENCES resources(id) ON DELETE RESTRICT,
     CHECK (synced_bytes <= received_bytes),
     CHECK (received_bytes <= expected_size)
-);
+) STRICT;
 
 CREATE UNIQUE INDEX uploads_client_key
     ON uploads(user_id, client_upload_key)
@@ -1801,7 +1894,7 @@ CREATE TABLE versions (
     PRIMARY KEY(resource_id, revision),
     FOREIGN KEY(resource_id)   REFERENCES resources(id) ON DELETE CASCADE,
     FOREIGN KEY(owner_user_id) REFERENCES users(id)     ON DELETE RESTRICT
-);
+) STRICT;
 
 CREATE INDEX versions_expiry ON versions(expires_at_ms);
 CREATE INDEX versions_owner  ON versions(owner_user_id);
@@ -1840,7 +1933,7 @@ CREATE TABLE trash_entries (
     FOREIGN KEY(user_id)            REFERENCES users(id)     ON DELETE RESTRICT,
     FOREIGN KEY(resource_id)        REFERENCES resources(id) ON DELETE CASCADE,
     FOREIGN KEY(original_parent_id) REFERENCES resources(id) ON DELETE SET NULL
-);
+) STRICT;
 
 CREATE INDEX trash_expiry ON trash_entries(expires_at_ms);
 CREATE INDEX trash_user   ON trash_entries(user_id, deleted_at_ms);
@@ -1889,7 +1982,7 @@ CREATE TABLE changes (
     actor_client_id   TEXT,
     created_at_ms     INTEGER NOT NULL,
     CHECK (namespace <> 'public' OR user_id IS NULL OR operation = 'trash')
-);
+) STRICT;
 
 CREATE INDEX changes_user_seq ON changes(user_id, seq);
 CREATE INDEX changes_ns_seq   ON changes(namespace, seq);
@@ -1976,7 +2069,7 @@ CREATE TABLE journal_state (
     baseline_seq           INTEGER NOT NULL,
     baseline_created_at_ms INTEGER NOT NULL,
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-);
+) STRICT;
 ```
 
 Правила:
@@ -2020,7 +2113,7 @@ CREATE TABLE shares (
     FOREIGN KEY(resource_id)   REFERENCES resources(id) ON DELETE CASCADE,
     CHECK ((state = 'revoked')   = (revoked_at_ms IS NOT NULL)),
     CHECK ((state = 'suspended') = (suspended_at_ms IS NOT NULL))
-);
+) STRICT;
 
 CREATE INDEX shares_owner    ON shares(owner_user_id, state);
 CREATE INDEX shares_resource ON shares(resource_id);
@@ -2072,7 +2165,7 @@ CREATE TABLE audit_events (
     subject_id    TEXT,
     result        TEXT NOT NULL CHECK (result IN ('ok','denied','error')),
     details_json  TEXT
-);
+) STRICT;
 
 CREATE INDEX audit_ts        ON audit_events(ts_ms);
 CREATE INDEX audit_actor_ts  ON audit_events(actor_user_id, ts_ms);
@@ -2110,7 +2203,7 @@ CREATE TABLE blob_gc (
     next_attempt_at_ms INTEGER NOT NULL,
     attempts           INTEGER NOT NULL DEFAULT 0,
     last_error         TEXT
-);
+) STRICT;
 
 CREATE INDEX blob_gc_due ON blob_gc(next_attempt_at_ms);
 ```
@@ -2209,7 +2302,7 @@ CREATE TABLE server_secrets (
     created_at_ms INTEGER NOT NULL,
     rotated_at_ms INTEGER,
     CHECK (length(value) = 32)
-);
+) STRICT;
 ```
 
 Правила:
@@ -4189,7 +4282,7 @@ CREATE TABLE sync_entries (
     last_sync_ms        INTEGER,
     updated_at_ms       INTEGER NOT NULL,
     UNIQUE(resource_id)
-);
+) STRICT;
 
 CREATE INDEX sync_entries_inode ON sync_entries(local_dev, local_inode);
 CREATE INDEX sync_entries_state ON sync_entries(state);
@@ -4235,7 +4328,7 @@ CREATE TABLE sync_intents (
     client_upload_key BLOB,
     staging_path      TEXT,
     created_at_ms     INTEGER NOT NULL
-);
+) STRICT;
 ```
 
 Служебные значения профиля:
@@ -4244,7 +4337,7 @@ CREATE TABLE sync_intents (
 CREATE TABLE sync_meta (
     key   TEXT NOT NULL PRIMARY KEY,
     value TEXT NOT NULL
-);
+) STRICT;
 ```
 
 Обязательные ключи: `profile_id`, `remote_root`, `local_root`, `remote_cursor`,
@@ -4252,10 +4345,23 @@ CREATE TABLE sync_meta (
 целевой ФС: `fs_mtime_granularity_ns`, `fs_ctime_reliable`,
 `fs_inode_reliable`, `fs_case_sensitive`, `fs_normalization`.
 
-Локальная БД работает в WAL mode с единственным писателем. Она не является
-источником истины о содержимом файлов: при расхождении с файловой системой
-побеждает файловая система, а запись приводится в соответствие пересчётом
-checksum (§15.4).
+Все три таблицы объявлены `STRICT` по тому же правилу и по той же причине, что и
+серверные (§6.1): без него забытый bind `time.Time` в `local_mtime_ns` или
+`updated_at_ms` молча ляжет туда TEXT-строкой, и расхождение вскроется не при
+записи, а позже — на сравнении, которое перестанет находить изменения. Единственное
+отличие от серверной схемы остаётся прежним: `local_mtime_ns`/`local_ctime_ns`
+хранятся в наносекундах, а не в миллисекундах, — но тип у них тот же `INTEGER`,
+поэтому `STRICT` применим без оговорок.
+
+Локальная БД работает в WAL mode с единственным писателем. Правило
+`BEGIN IMMEDIATE` для пишущих транзакций (§6.1) действует и здесь: единственный
+писатель снимает конкуренцию внутри процесса, но не с другой копией
+`fshare-sync`, случайно запущенной на том же профиле, и не с открытой на файле
+внешней sqlite-сессией.
+
+Локальная БД не является источником истины о содержимом файлов: при расхождении
+с файловой системой побеждает файловая система, а запись приводится в
+соответствие пересчётом checksum (§15.4).
 
 ### 15.4. Детект локальных изменений
 
@@ -4861,7 +4967,8 @@ Config:
     "cert_file": "certs/server.crt",
     "key_file": "certs/server.key",
     "min_version": "1.3",
-    "require": true
+    "require": true,
+    "autogen_self_signed": true
   }
 }
 ```
@@ -4897,6 +5004,51 @@ tls.listen     TLS: v2- и v3-сессии
    не конфигурируются: используется дефолт Go для выбранной версии.
 6. Оба listener'а обязаны иметь handshake- и idle-дедлайны и общий лимит
    соединений.
+7. Ключи `tls.*` вводятся этапом M14 (§25). До M14 секции `tls` в
+   `config.json` нет: TLS-listener не поднимается, значения по умолчанию §19.3
+   не материализуются, и правила валидации §19.4, относящиеся к `tls.*`, не
+   применяются. Установка с дефолтным конфигом на M12–M13 стартует без всякого
+   сертификата.
+8. Начиная с M14 `tls.enabled = true` остаётся значением по умолчанию. При этом
+   отсутствие файлов `tls.cert_file` и `tls.key_file` НЕ является ошибкой
+   конфигурации: при `tls.autogen_self_signed = true` (значение по умолчанию)
+   daemon при старте создаёт самоподписанную пару по этим путям. Правила
+   генерации:
+   - генерация выполняется, только если отсутствуют ОБА файла; ключ ECDSA
+     P-256, срок действия 825 суток, SAN содержит `localhost`, `127.0.0.1`,
+     `::1` и hostname машины. Сертификат предназначен для режима доверия TOFU
+     (§16.2); режимы system CA и custom CA требуют материала, выданного
+     оператором;
+   - недостающие каталоги пути создаются с правами 0700; файл ключа создаётся с
+     правами 0600, файл сертификата — 0644, владелец — пользователь процесса;
+   - запись атомарна: оба файла пишутся во временные имена в том же каталоге и
+     переименовываются; временный файл ключа создаётся сразу с 0600, окна с
+     более широкими правами не существует;
+   - после генерации, а затем при каждом старте, daemon печатает в лог SPKI-pin
+     действующего сертификата в формате §16.2 — ровно ту строку, которую
+     оператор кладёт в `profile.pinned_spki_hash` или передаёт флагом
+     `--pin-spki`. Факт генерации пишется в audit (§20.2);
+   - существующая пара не перезаписывается и не перегенерируется никогда: ни по
+     истечении срока действия, ни при смене `tls.listen`. Истёкший сертификат
+     даёт предупреждение при старте, а замена материала — действие оператора.
+     Молчаливая регенерация запрещена, потому что она меняет pin (§16.2).
+9. `tls.autogen_self_signed = false` даёт строгое поведение «нет сертификата —
+   не стартуем»: при `tls.enabled = true` и отсутствующей паре daemon не
+   стартует.
+10. Старт прерывается, когда генерация невозможна или материал непригоден:
+    - каталог назначения недоступен на запись или не может быть создан;
+    - путь `tls.cert_file` или `tls.key_file` занят каталогом либо объектом, не
+      являющимся обычным файлом;
+    - существует ровно один файл из двух — пара неполная; это не повод
+      генерировать недостающий, потому что дописывать чужой материал запрещено;
+    - файл существует, но не читается: нет прав, некорректный PEM/DER, ключ не
+      соответствует сертификату;
+    - пары нет при `tls.autogen_self_signed = false`.
+    Во всех перечисленных случаях daemon не стартует и печатает ошибку старта
+    `TLS_MATERIAL_UNAVAILABLE` с именем ключа, путём и причиной от ОС.
+    `TLS_MATERIAL_UNAVAILABLE` — имя ошибки старта в логе, а не код §22:
+    единого пространства кодов оно не расходует, потому что сессии, которой его
+    отправить, ещё не существует.
 
 Флаги ослабления разведены и принадлежат разным программам:
 
@@ -4926,8 +5078,32 @@ CAFile
 PinnedSPKIHash
 ```
 
+SPKI-pin — это `base64(SHA-256(DER SubjectPublicKeyInfo сертификата сервера))`.
+Формат один для всех мест, где pin появляется: `profile.pinned_spki_hash`
+(§19.5), флаг `--pin-spki`, вывод `trust repin` и строка, которую печатает в лог
+daemon (§16.1 п. 8). Хэшируется именно SubjectPublicKeyInfo, а не сертификат
+целиком: перевыпуск сертификата на том же ключе pin не меняет.
+
 При первом TOFU-подключении пользователь подтверждает fingerprint. При смене
 fingerprint соединение блокируется до explicit re-pin.
+
+Самоподписанный сертификат — штатный режим, а не аварийный: сервер генерирует
+его сам при первом старте, если оператор не положил собственный (§16.1 п. 8).
+Отсюда следует:
+
+- источником первого pin служит строка из лога daemon; клиент не пинит ничего
+  автоматически, и правило «auto-pin запрещён» распространяется и на этот
+  случай;
+- pin привязан к ключу, а не к файлу сертификата. Пока сервер не потерял ключ,
+  pin неизменен: рестарт daemon, обновление бинарника и смена `tls.listen` его
+  не трогают;
+- удаление пары (или потеря data root) заставляет daemon сгенерировать новый
+  ключ, и это смена pin. Клиент обязан её заметить: соединение блокируется,
+  `fshare-sync` останавливается с ошибкой и не переподключается, восстановление
+  — только явный `trust repin` с новым значением из лога сервера. Тихая
+  перезапись пина запрещена и здесь;
+- поэтому оператор, которому регенерация нежелательна, включает
+  `tls.autogen_self_signed = false` (§19.3) и управляет материалом сам.
 
 В неинтерактивном режиме (`fshare-sync`, batch-команды `fshare-commander`, CI)
 подтверждать некому, поэтому:
@@ -5553,7 +5729,8 @@ path — restart-only. Лимиты, retention и rate limits могут быт�
   "database": {
     "enabled": true,
     "path": "metadata.db",
-    "busy_timeout_ms": 5000
+    "busy_timeout_ms": 5000,
+    "synchronous": "NORMAL"
   },
   "storage": {
     "data_root": "./data",
@@ -5588,7 +5765,8 @@ path — restart-only. Лимиты, retention и rate limits могут быт�
     "cert_file": "certs/server.crt",
     "key_file": "certs/server.key",
     "min_version": "1.3",
-    "require": true
+    "require": true,
+    "autogen_self_signed": true
   },
   "gateway": {
     "enabled": false,
@@ -5635,11 +5813,24 @@ path — restart-only. Лимиты, retention и rate limits могут быт�
 Блок `tls` обязан совпадать дословно с блоком в §16.1, блок `versions` — с
 блоком в §11.3. При расхождении нормативным считается настоящий раздел.
 
+Секция `tls` показана в полном виде, каким она существует с M14. До M14 её в
+файле нет вовсе (§16.1 п. 7, §19.3).
+
 ### 19.3. Таблица ключей серверного конфига
 
 Колонки: ключ, тип, значение по умолчанию, единица измерения, режим, читатель.
 Читатель `daemon` означает процесс `fshare-daemon`, `gateway` — HTTPS gateway
 (в том числе в one-process mode).
+
+Столбец «читатель» дополнительно несёт пометку об этапе введения ключа вида
+`(с M14)` — тем же способом, каким он несёт пометку `(deprecated, §19.7)`.
+Пометка обязательна для ключей, чья секция до указанного этапа в `config.json`
+ОТСУТСТВУЕТ: до этого этапа ключ не существует, значение по умолчанию не
+материализуется, а правила §19.4, ссылающиеся на такой ключ, не применяются и
+не могут помешать старту. Сегодня пометка стоит на всей секции `tls`, которая
+вводится этапом M14 вместе с TLS (§16.1 п. 7, §25). Остальные ключи объявлены
+с M12 и получают значения по умолчанию сразу, даже если описываемая ими
+подсистема сдаётся позже: их дефолты безвредны и старту не мешают.
 
 ```text
 server.port                            int     5555          TCP-порт        restart-only  daemon
@@ -5667,6 +5858,7 @@ limits.auth_fail_ban_s                 int     60            секунд       
 database.enabled                       bool    true          —               restart-only  daemon
 database.path                          string  metadata.db   путь            restart-only  daemon, gateway
 database.busy_timeout_ms               int     5000          миллисекунд     restart-only  daemon, gateway
+database.synchronous                   enum    "NORMAL"      —               restart-only  daemon, gateway
 
 storage.data_root                      string  ./data        путь            restart-only  daemon, gateway
 storage.min_free_bytes                 uint64  1073741824    байт            hot           daemon
@@ -5690,12 +5882,13 @@ versions.cleaner_interval_s            int     3600          секунд       
 changes.retention_days                 int     90            суток           hot           daemon
 changes.page_size                      int     1000          записей         hot           daemon
 
-tls.enabled                            bool    true          —               restart-only  daemon
-tls.listen                             string  :5556         адрес:порт      restart-only  daemon
-tls.cert_file                          string  certs/server.crt  путь        restart-only  daemon
-tls.key_file                           string  certs/server.key  путь        restart-only  daemon
-tls.min_version                        enum    "1.3"         —               restart-only  daemon
-tls.require                            bool    true          —               restart-only  daemon
+tls.enabled                            bool    true          —               restart-only  daemon (с M14)
+tls.listen                             string  :5556         адрес:порт      restart-only  daemon (с M14)
+tls.cert_file                          string  certs/server.crt  путь        restart-only  daemon (с M14)
+tls.key_file                           string  certs/server.key  путь        restart-only  daemon (с M14)
+tls.min_version                        enum    "1.3"         —               restart-only  daemon (с M14)
+tls.require                            bool    true          —               restart-only  daemon (с M14)
+tls.autogen_self_signed                bool    true          —               restart-only  daemon (с M14)
 
 gateway.enabled                        bool    false         —               restart-only  gateway
 gateway.listen                         string  :8443         адрес:порт      restart-only  gateway
@@ -5735,6 +5928,18 @@ log.format                             enum    "text"        —               h
 - `server.plaintext_enabled = false` отключает plaintext-listener целиком. Это
   breaking change для всех v2-клиентов, поэтому вынесено в отдельный ключ и не
   выводится из `tls.require` (§16.1).
+- секция `tls` целиком вводится этапом M14 (пометка `(с M14)` в таблице). До
+  M14 её в конфиге нет, TLS-listener не поднимается, и правила §19.4 п. 4–6 не
+  применяются: установка с дефолтным конфигом на M12–M13 стартует без
+  сертификата (§16.1 п. 7).
+- `tls.autogen_self_signed = true` разрешает daemon создать самоподписанную
+  пару в `tls.cert_file` и `tls.key_file` при старте, если отсутствуют ОБА
+  файла: ключ получает права 0600, а SPKI-pin печатается в лог в формате §16.2.
+  Благодаря этому дефолт `tls.enabled = true` остаётся secure by default и при
+  этом не требует заранее положенного сертификата. Значение `false` даёт
+  строгое поведение «нет сертификата — не стартуем» (§16.1 п. 9). Ключ не
+  влияет на `gateway.cert_file`/`gateway.key_file`: собственный материал
+  gateway не генерируется никогда.
 - `limits.max_parallel_transfer` — суммарный лимит одновременных передач
   (upload и download вместе) ОДНОГО пользователя по всем его соединениям, а не
   лимит на сессию (§3.5). Значение объявляется в `CapabilitiesResponse`. На M13
@@ -5819,8 +6024,21 @@ log.format                             enum    "text"        —               h
    допустимо лишь как явный выбор оператора и сопровождается предупреждением
    при старте; любое значение ниже `1.2` отвергается. Cipher suites не
    конфигурируются: используется дефолт Go для выбранной версии.
-6. При `tls.enabled = true` файлы `tls.cert_file` и `tls.key_file` обязаны
-   существовать и читаться; отсутствие — отказ старта.
+6. Материал TLS проверяется только когда секция `tls` присутствует в снапшоте,
+   то есть с M14 (§19.3, §16.1 п. 7). При `tls.enabled = true`:
+   - оба файла существуют — они обязаны читаться, разбираться и составлять
+     валидную пару «сертификат + приватный ключ»; иначе отказ старта;
+   - оба файла отсутствуют и `tls.autogen_self_signed = true` — это НЕ ошибка
+     конфигурации. Пара генерируется при старте (§16.1 п. 8), и валидатор
+     проверяет только осуществимость генерации: каталог назначения существует
+     или создаваем, доступен на запись, и ни один из двух путей не занят
+     каталогом либо иным объектом, не являющимся обычным файлом;
+   - оба файла отсутствуют и `tls.autogen_self_signed = false` — отказ старта;
+   - существует ровно один файл из двух — отказ старта при любом значении
+     `tls.autogen_self_signed`: неполная пара не достраивается.
+   Отказ по этому правилу сообщается ошибкой старта `TLS_MATERIAL_UNAVAILABLE`
+   с именем ключа, путём и причиной от ОС (§16.1 п. 10). Отсутствие файлов само
+   по себе основанием для отказа больше не является.
 7. При `gateway.enabled = true` пустой `gateway.base_url` — отказ старта:
    ссылка вида `https://host/s/<token>` строится только из `base_url`, и
    заголовок `Host` для её построения не используется никогда (§17.2).
@@ -5861,7 +6079,13 @@ log.format                             enum    "text"        —               h
 16. `auth.pbkdf2_iters` ниже `MinPBKDF2Iters = 600000`
     (`internal/config/settings.go:79`) принимается с предупреждением, а не
     отвергается: иначе блокируется миграция существующих установок.
-17. Валидация выполняется целиком до применения снапшота. Частично применённый
+17. `database.synchronous` принимает только `"NORMAL"` и `"FULL"`. Значение
+    `"OFF"` запрещено: оно допускает потерю уже закоммиченных транзакций при
+    падении процесса, что делает недостижимыми инварианты §2.2 о согласованности
+    БД и файловой системы. `database.busy_timeout_ms` обязан быть строго больше
+    нуля: нулевой таймаут превращает любую конкурентную запись в немедленный
+    `SQLITE_BUSY`.
+18. Валидация выполняется целиком до применения снапшота. Частично применённый
     снапшот запрещён.
 
 ### 19.5. Профиль подключения клиента
@@ -5896,7 +6120,9 @@ profile.downloads_dir      string  ""        путь       restart-only  client
 - при `profile.tls_mode = "tofu"` пустой `profile.pinned_spki_hash` — фатальная
   ошибка запуска в неинтерактивном режиме, а не приглашение доверять; пин
   задаётся через TUI либо флагом `--pin-spki <base64>`, автоматический пин без
-  подтверждения запрещён (§16.2);
+  подтверждения запрещён (§16.2). Значение — `base64(SHA-256(DER
+  SubjectPublicKeyInfo))`; для самоподписанного сертификата, сгенерированного
+  сервером, источником служит строка SPKI-pin из лога daemon (§16.1 п. 8);
 - при `profile.tls_mode = "ca_file"` пустой `profile.ca_file` — ошибка запуска;
 - изменение любого ключа профиля применяется при следующем подключении; горячих
   ключей в профиле нет.
@@ -6014,8 +6240,12 @@ uploads.max_parallel_per_user  УДАЛЁН, заменён limits.max_parallel_
   конфигурации обязаны быть обновлены на `storage.data_root` в том же PR, что
   и deprecation ключа; иначе штатная установка из репозитория стартует с
   предупреждением;
-- в примерах конфигурации `tls.enabled = true` сопровождается заполненными
-  `cert_file`/`key_file`, иначе пример не проходит §19.4 п. 6.
+- секция `tls` в примерах конфигурации, `docker-compose.yml` и README до M14 не
+  появляется вовсе (§16.1 п. 7). С M14 пример с `tls.enabled = true` НЕ обязан
+  нести заполненные `cert_file`/`key_file` и не обязан класть сертификат в
+  образ: при отсутствии пары daemon генерирует её сам и печатает SPKI-pin
+  (§16.1 п. 8, §19.4 п. 6). Пример обязан оставаться работоспособным на чистой
+  установке.
 
 ### 19.8. Требования к реализации
 
@@ -6036,7 +6266,10 @@ uploads.max_parallel_per_user  УДАЛЁН, заменён limits.max_parallel_
    добавление в код без добавления в документ — тоже.
 4. Значения по умолчанию в `config.Default()` (`internal/config/settings.go:82`)
    обязаны совпадать со столбцом «значение по умолчанию» побайтно; тест
-   сравнивает их автоматически.
+   сравнивает их автоматически. Ключ с пометкой этапа (`(с M14)`) участвует в
+   этой сверке начиная с указанного этапа; до него его отсутствие в
+   `config.Default()` и в снапшоте — норма, а не расхождение, и тест обязан
+   отличать одно от другого по пометке, а не по списку исключений в коде.
 5. Секции `sync` и `profile` не читаются daemon'ом ни при каких условиях:
    попадание их в серверный `config.json` — неизвестные ключи с
    предупреждением.
@@ -6103,6 +6336,8 @@ remote_ip
 - выдача и отзыв transfer session token (только id и префикс хэша);
 - старт daemon в режиме `--insecure-no-auth` и в режиме
   `--insecure-allow-plaintext-v3`;
+- генерация самоподписанной пары TLS при старте: пути файлов и SPKI-pin нового
+  сертификата (§16.1 п. 8); приватный ключ в запись не попадает;
 - выполнение `--init-admin`, `--init-admin --force` и `--promote`;
 - отказ старта из-за отсутствия администратора с `state = 'active'`;
 - запуск `--restore` и `--fsck --apply`;
@@ -6388,7 +6623,7 @@ fshare-daemon --migrate-users users.json [--overwrite-existing]
 11   RATE_LIMITED           да                   §8.3, §12, §17.3
 12   SERVER_SHUTTING_DOWN   да                   §8.3, §12.2
 13   QUOTA_EXCEEDED         да (как резерв M13)  §8.2, §9.4, §10.2, §11.2
-14   CANCELLED              НЕТ (§22.2 п. 2)     §12.1, §12.2
+14   CANCELLED              да                   §12.1, §12.2
 ```
 
 Обязательные следствия:
@@ -6396,10 +6631,12 @@ fshare-daemon --migrate-users users.json [--overwrite-existing]
 1. `QUOTA_EXCEEDED = 13` УЖЕ существует (`internal/proto/proto.go:246`) и
    новым кодом не является. Дублировать его новым номером запрещено.
 2. `CANCELLED = 14` существует (`internal/proto/proto.go:249`) и активно
-   используется download-путём (`internal/server/download.go:97`), но не
-   задокументирован ни здесь, ни в `docs/tz/02-protocol-v2.md` §2.6. Задним
-   числом он обязан быть внесён в `docs/tz/02-protocol-v2.md` §2.6 отдельной
-   правкой в scope M12 (§26). Код остаётся валидным и для v3-передач.
+   используется download-путём (`internal/server/download.go:97`). Пробел в
+   документации закрыт правкой PR0 (§26): код описан в
+   `docs/tz/02-protocol-v2.md` §2.6 — когда отправляется, когда НЕ отправляется,
+   что делает клиент, `Retryable = 0`. Код остаётся валидным и для v3-передач
+   (§12.1, §12.2); в upload-пути v3 он не используется — там на `UPLOAD_CANCEL`
+   отвечают `UPLOAD_CANCEL_OK` (§22.4).
 3. `INVALID_ARGUMENT` НЕ вводится: для некорректных параметров используется
    существующий `BAD_REQUEST = 3` (`ErrBadRequest`). Введение синонима
    нарушило бы правило «один смысл — один код».
@@ -6785,6 +7022,17 @@ busy timeout, то есть случайными отказами штатных
 
 ### 23.2. DB transactions
 
+**Форма открытия транзакции.** Каждая транзакция, которая может выполнить
+запись, открывается как `BEGIN IMMEDIATE` (`_txlock=immediate` на пишущем handle
+либо явный `BEGIN IMMEDIATE`); читающие транзакции остаются `DEFERRED`. Правило
+нормативно и полностью изложено в §6.1: `busy_timeout` не спасает от
+`SQLITE_BUSY_SNAPSHOT`, который SQLite возвращает при апгрейде read-снапшота
+`DEFERRED`-транзакции до write-блокировки, поэтому «SELECT, затем INSERT» под
+конкурентной записью отваливается в 78–91% случаев независимо от величины
+таймаута. Прямое следствие для описанного ниже паттерна prepare/IO/commit:
+транзакция, которая перепроверяет revision и затем пишет, — пишущая с первого
+statement и обязана быть `IMMEDIATE`, хотя начинается с `SELECT`.
+
 Не держать write transaction во время:
 
 - загрузки чанков;
@@ -6920,6 +7168,17 @@ goroutine. Медленный клиент не блокирует broadcast д�
     но отсутствующий в таблице, — дефект.
 17. **Граф зависимостей пакетов.** Тест строит граф импортов и падает при
     появлении запрещённого ребра (§4.3). Обязателен с M12.
+18. **Обратная вычитка PRAGMA (fail-fast).** Конструктор пары handle'ов §6.1:
+    позитивный случай — на КАЖДОМ соединении обоих пулов (все `N` читающих
+    берутся через `db.Conn` одновременно, а не последовательно) вычитанные
+    `journal_mode`, `foreign_keys`, `busy_timeout`, `synchronous` равны
+    ожидаемым. Негативный случай обязателен и важнее позитивного: конструктору
+    подсовывается DSN с опечаткой в имени PRAGMA (`foreign_keyz`), с опечаткой в
+    имени параметра (`_pragmaa=`) и с мусорным значением (`busy_timeout(abc)`) —
+    каждый обязан дать ошибку старта с именем конкретного PRAGMA, ожидаемым и
+    фактическим значением. Тест, который проверяет только успешный DSN, дефектен:
+    сам драйвер все три опечатки принимает молча и `sql.Open` ошибки не
+    возвращает, поэтому без негативных случаев проверять нечего.
 
 ### 24.2. Integration tests
 
@@ -7150,11 +7409,24 @@ goroutine. Медленный клиент не блокирует broadcast д�
     передачи байт; понижение квоты ниже фактического `used_bytes` не удаляет
     данные и не отменяет уже принятых загрузок, а `used_bytes` остаётся равным
     пересчёту по §11.4.
+52. Чистая установка с дефолтным конфигом: каталога `certs/` нет,
+    `tls.enabled = true`, `tls.autogen_self_signed = true`. Daemon стартует,
+    создаёт пару, права файла ключа ровно 0600, в лог напечатан SPKI-pin в
+    формате §16.2; клиент с `profile.tls_mode = "tofu"` и этим пином
+    подключается, сертификат принимается. Повторный старт пару не
+    перегенерирует: pin в логе тот же, содержимое файлов не изменилось.
+    Удаление пары и старт заново дают ДРУГОЙ pin, и клиент со старым пином
+    соединение отвергает без auto-repin, а `fshare-sync` останавливается.
+    Отдельные ветки того же сценария: при `tls.autogen_self_signed = false` и
+    отсутствующей паре daemon не стартует; при каталоге, недоступном на запись,
+    и при наличии ровно одного файла из двух daemon не стартует и с
+    `tls.autogen_self_signed = true` — во всех трёх случаях с
+    `TLS_MATERIAL_UNAVAILABLE` (§16.1 п. 10, §19.4 п. 6).
 
 Привязка к этапам: 1, 12a, 18, 19, 20, 21, 31, 48, 49, 50 — M12; 2–6, 9, 16, 17,
-22, 23, 24, 25, 27a, 28, 51 — M13; 11, 12b, 32 — M14; 7, 8, 26, 27b, 29, 30, 46,
-47 — M15; 14, 33, 34, 35 — M16; 13, 15, 36–45 — M17; 10 — M12 в базовом виде и
-повторно в M18 на каталоге 1M записей.
+22, 23, 24, 25, 27a, 28, 51 — M13; 11, 12b, 32, 52 — M14; 7, 8, 26, 27b, 29, 30,
+46, 47 — M15; 14, 33, 34, 35 — M16; 13, 15, 36–45 — M17; 10 — M12 в базовом виде
+и повторно в M18 на каталоге 1M записей.
 
 ### 24.3. Race and fuzz
 
@@ -7498,6 +7770,7 @@ rehash соответствующего файла.
 - TLS 1.3;
 - system/custom CA and TOFU;
 - profile pin;
+- self-signed bootstrap certificate with SPKI-pin in the log;
 - TLS-required mode;
 - hardened Docker init;
 - transfer session tokens;
@@ -7529,10 +7802,28 @@ rehash соответствующего файла.
    записи паролей, токенов, полных URI и `Referer`.
 7. Удаляются ключи `server.share_root`, `checksum.cache_file`,
    `auth.users_file` и флаг `--share-root`.
+8. Секция `tls` вводится именно этим этапом: до M14 её в `config.json` нет, и
+   правила §19.4 п. 4–6 к отсутствующей секции не применяются. Вместе с секцией
+   вводится ключ `tls.autogen_self_signed` (bool, default `true`,
+   restart-only): при `tls.enabled = true` и отсутствующей паре
+   `cert_file`/`key_file` daemon генерирует самоподписанный сертификат (ключ
+   0600, атомарная запись) и печатает SPKI-pin в лог и audit; отсутствие
+   сертификата ошибкой конфигурации больше не считается. Строгое поведение
+   «нет сертификата — не стартуем» включается `autogen_self_signed = false`.
+   Ошибка старта — `TLS_MATERIAL_UNAVAILABLE` (§16.1 п. 7–10, §19.3, §19.4
+   п. 6).
 
 ### Definition of Done
 
 - packet capture shows no login/file content;
+- чистая установка с дефолтным конфигом и без заранее положенного сертификата
+  стартует: пара сгенерирована, права ключа ровно 0600, SPKI-pin напечатан в
+  логе, TOFU-клиент с этим пином подключается (сценарий 52 §24.2);
+- повторный старт pin не меняет; удаление пары меняет pin, и клиент со старым
+  пином соединение отвергает без auto-repin;
+- при `tls.autogen_self_signed = false` и отсутствующей паре, при неполной паре
+  и при каталоге, недоступном на запись, daemon не стартует с
+  `TLS_MATERIAL_UNAVAILABLE`;
 - changed certificate blocks TOFU client;
 - неинтерактивный клиент без заданного пина не стартует;
 - no-auth mode requires explicit flag;
@@ -7911,7 +8202,9 @@ type LockManager interface {
 
 ### Безопасность
 
-- [ ] TLS включён по умолчанию;
+- [ ] TLS включён по умолчанию и работает на чистой установке без ручной
+      подготовки сертификата: пара генерируется при первом старте, ключ 0600,
+      SPKI-pin напечатан в логе (§16.1);
 - [ ] нет неявного anonymous admin;
 - [ ] user roots физически изолированы;
 - [ ] изоляция пользователей соблюдается при ЛЮБОЙ версии протокола, включая
@@ -7990,7 +8283,12 @@ type LockManager interface {
 7. Restore version создаёт новую revision.
 8. Начиная с M14 control и transfer connections разделены; до M14
    `MaxParallelTransfer = 1`, и upload и download идут по control connection.
-9. TLS 1.3 включён по умолчанию.
+9. TLS 1.3 включён по умолчанию. Ключи `tls.*` вводятся этапом M14, до него
+   секции `tls` в конфиге нет. С M14 `tls.enabled = true` — дефолт, и
+   отсутствие файлов сертификата ошибкой конфигурации не является: daemon при
+   первом старте генерирует самоподписанную пару (ключ 0600) и печатает
+   SPKI-pin, который клиент пинит по TOFU (§16.1, §16.2). Строгий режим «нет
+   сертификата — не стартуем» включается `tls.autogen_self_signed = false`.
 10. Sync использует journal + периодический reconcile, не один fsnotify.
 11. Conflict никогда не разрешается silent overwrite.
 12. Public gateway хранит только hash token.
