@@ -24,6 +24,8 @@ import (
 
 	"github.com/vitikevich-landau/go_fileshare/internal/auth"
 	"github.com/vitikevich-landau/go_fileshare/internal/config"
+	"github.com/vitikevich-landau/go_fileshare/internal/db"
+	"github.com/vitikevich-landau/go_fileshare/internal/metadata"
 	"github.com/vitikevich-landau/go_fileshare/internal/server"
 	"github.com/vitikevich-landau/go_fileshare/internal/vfs"
 )
@@ -43,6 +45,7 @@ func main() {
 		addUser     = flag.String("add-user", "", "add/update a user with this login (prompts for password), then exit")
 		roleFlag    = flag.String("role", "user", "role for --add-user (user|admin)")
 		resetPw     = flag.String("reset-password", "", "reset this user's password (prompts), then exit")
+		migrateOnly = flag.Bool("migrate-only", false, "apply metadata database migrations and exit")
 	)
 	flag.Parse()
 
@@ -81,6 +84,13 @@ func main() {
 		return
 	}
 
+	if *migrateOnly {
+		if err := runMigrateOnly(cfg); err != nil {
+			fatalf("%v", err)
+		}
+		return
+	}
+
 	if err := run(cfg, *configPath); err != nil {
 		fatalf("%v", err)
 	}
@@ -95,6 +105,24 @@ func run(cfg config.Settings, configPath string) error {
 	if cfg.Auth.PBKDF2Iters < config.MinPBKDF2Iters {
 		logger.Warn("auth.pbkdf2_iters is below the recommended floor; raise it and re-create users with --reset-password",
 			"pbkdf2_iters", cfg.Auth.PBKDF2Iters, "recommended", config.MinPBKDF2Iters)
+	}
+
+	// Метабаза открывается и мигрируется ДО listener: §6.1 требует, чтобы
+	// forward-only миграции выполнялись до его открытия. Обработчиков поверх неё
+	// пока нет (репозитории — PR2 M12), но порядок и fail-fast на негодной базе
+	// вводятся здесь, а не задним числом.
+	meta, err := openMetadataDB(cfg)
+	if err != nil {
+		return err
+	}
+	if meta != nil {
+		defer meta.Close()
+		version, err := db.SchemaVersion(context.Background(), meta.Writer)
+		if err != nil {
+			return err
+		}
+		logger.Info("metadata database ready",
+			"path", cfg.Database.Path, "schema_version", version, "read_conns", meta.ReadConns())
 	}
 
 	v, err := vfs.New(cfg.Server.ShareRoot, cfg.Checksum.CacheFile)
@@ -169,10 +197,45 @@ func run(cfg config.Settings, configPath string) error {
 	return nil
 }
 
+// openMetadataDB открывает metadata DB и доводит схему до текущей версии.
+// Возвращает nil, nil при database.enabled = false — режим до M12, в котором
+// метабазы нет вовсе (§19.6 п. 1).
+func openMetadataDB(cfg config.Settings) (*db.DB, error) {
+	if !cfg.Database.Enabled {
+		return nil, nil
+	}
+	return db.Open(context.Background(), db.Config{
+		Path:          cfg.Database.Path,
+		BusyTimeoutMs: cfg.Database.BusyTimeoutMs,
+		Synchronous:   cfg.Database.Synchronous,
+	}, metadata.Migrations(metadata.SeedParams{AuthIters: cfg.Auth.PBKDF2Iters}))
+}
+
+// runMigrateOnly применяет миграции и выходит. Разовый режим нужен образу и CI:
+// он позволяет проверить схему, не поднимая listener (ADR 0001 §6.3), и даёт
+// оператору отделить миграцию от старта сервиса.
+func runMigrateOnly(cfg config.Settings) error {
+	if !cfg.Database.Enabled {
+		return fmt.Errorf("--migrate-only requires database.enabled = true")
+	}
+	meta, err := openMetadataDB(cfg)
+	if err != nil {
+		return err
+	}
+	defer meta.Close()
+
+	version, err := db.SchemaVersion(context.Background(), meta.Writer)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("metadata database %s is at schema version %d\n", cfg.Database.Path, version)
+	return nil
+}
+
 // runUserAdmin выполняет разовые сценарии --add-user / --reset-password и выходит
 // (спрашивает пароль в терминале, вычисляет StoredKey и пишет users.json).
 func runUserAdmin(cfg config.Settings, addLogin, roleStr, resetLogin string) error {
-	db, err := auth.Load(cfg.Auth.UsersFile)
+	users, err := auth.Load(cfg.Auth.UsersFile)
 	if err != nil {
 		return err
 	}
@@ -186,8 +249,8 @@ func runUserAdmin(cfg config.Settings, addLogin, roleStr, resetLogin string) err
 		if err != nil {
 			return err
 		}
-		db.SetUser(addLogin, role, pw, cfg.Auth.PBKDF2Iters)
-		if err := db.Save(); err != nil {
+		users.SetUser(addLogin, role, pw, cfg.Auth.PBKDF2Iters)
+		if err := users.Save(); err != nil {
 			return err
 		}
 		fmt.Printf("user %q (%s) written to %s\n", addLogin, roleStr, cfg.Auth.UsersFile)
@@ -196,10 +259,10 @@ func runUserAdmin(cfg config.Settings, addLogin, roleStr, resetLogin string) err
 		if err != nil {
 			return err
 		}
-		if err := db.SetPassword(resetLogin, pw, cfg.Auth.PBKDF2Iters); err != nil {
+		if err := users.SetPassword(resetLogin, pw, cfg.Auth.PBKDF2Iters); err != nil {
 			return err
 		}
-		if err := db.Save(); err != nil {
+		if err := users.Save(); err != nil {
 			return err
 		}
 		fmt.Printf("password for %q reset in %s\n", resetLogin, cfg.Auth.UsersFile)
@@ -264,6 +327,10 @@ func applyReload(hub *config.Hub, levelVar *slog.LevelVar, next config.Settings)
 	next.Checksum = cur.Checksum
 	next.Auth = cur.Auth
 	next.Events = cur.Events
+	// Секция database целиком restart-only (§19.3): пул и его PRAGMA строятся
+	// один раз при старте, поэтому SIGHUP не вправе подменить путь к базе или
+	// ожидаемые значения PRAGMA у уже открытых соединений.
+	next.Database = cur.Database
 	return hub.ApplyWith(next, func(s *config.Settings) {
 		if levelVar != nil {
 			levelVar.Set(levelFromString(s.Log.Level))

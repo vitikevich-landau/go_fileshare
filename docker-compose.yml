@@ -7,6 +7,8 @@ services:
     volumes:
       # ./data must contain a share/ directory to serve; config.json and
       # users.json are optional (defaults + no-auth bootstrap are used if absent).
+      # The daemon creates metadata.db here on first start (database.enabled
+      # defaults to true) — keep this on a local filesystem, not a network share.
       - ./data:/data
     restart: unless-stopped
     stop_grace_period: 90s # >= the daemon's graceful drain window
