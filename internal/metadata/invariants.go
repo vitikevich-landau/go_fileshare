@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/vitikevich-landau/go_fileshare/internal/domain"
 )
@@ -34,8 +35,7 @@ import (
 // расхождение значений МЕЖДУ ЗАПИСЯМИ, а не расхождение записи с конфигом;
 // оператор, поднявший auth.pbkdf2_iters и пересоздающий пользователей через
 // --reset-password, находится в законном состоянии, и отказ старта сломал бы
-// ровно этот сценарий. Сверка записей между собой станет возможна вместе с
-// репозиторием пользователей.
+// ровно этот сценарий. Сверка записей между собой — verifyAuthItersAgreement.
 func VerifyInvariants(ctx context.Context, r *sql.DB) error {
 	var errs []error
 	for _, check := range []func(context.Context, *sql.DB) error{
@@ -43,6 +43,7 @@ func VerifyInvariants(ctx context.Context, r *sql.DB) error {
 		verifyPublicRoot,
 		verifyPublicJournalState,
 		verifyServerSecrets,
+		verifyAuthItersAgreement,
 	} {
 		if err := check(ctx, r); err != nil {
 			errs = append(errs, err)
@@ -124,6 +125,82 @@ func verifyPublicJournalState(ctx context.Context, r *sql.DB) error {
 		return errors.New("journal_state.baseline_id for the /public stream is empty (§14.6)")
 	}
 	return nil
+}
+
+// verifyAuthItersAgreement проверяет §6.2 п. 3: до появления раунда AUTH_PARAMS
+// (M14) `users.auth_iters` обязан быть одинаков у ВСЕХ пользователей, и
+// расхождение значений между записями отклоняется при старте.
+//
+// Требование не бюрократическое. Сервер объявляет число итераций в `HELLO_OK`
+// ДО того, как узнал логин: логин приходит только в `AUTH_REQUEST` (§3.3).
+// Значит, объявлено может быть ровно одно число на всю установку, и
+// пользователь, у которого в записи лежит другое, посчитает ClientKey с чужим
+// числом итераций и не войдёт НИКОГДА — молча, с обычной ошибкой пароля.
+// Отказ старта заменяет этот необъяснимый отказ входа на понятное сообщение.
+//
+// Учитываются только записи с kdf_algo = 'pbkdf2-sha256': при argon2id колонка
+// не используется и хранит 0 (§6.2 п. 4), поэтому её значение сравнивать не с
+// чем.
+//
+// Системный аккаунт из проверки исключён. Его auth_iters проставляет миграция
+// из конфига (§6.2) и больше никогда не меняет, а обновить её нечем: команды
+// смены пароля у аккаунта, который «не может пройти аутентификацию ни при каких
+// данных», нет и быть не должно. Включи его в проверку — и первое же законное
+// повышение auth.pbkdf2_iters с пересозданием всех пользователей оставило бы
+// демон не поднимающимся навсегда. На вход это значение не влияет ни при каком
+// раскладе: системный аккаунт отклоняется до сравнения proof.
+func verifyAuthItersAgreement(ctx context.Context, r *sql.DB) error {
+	rows, err := r.QueryContext(ctx, `
+SELECT auth_iters, count(*), min(login), max(login)
+FROM users
+WHERE kdf_algo = ? AND id <> ?
+GROUP BY auth_iters
+ORDER BY count(*) DESC, auth_iters`,
+		string(domain.KDFPBKDF2SHA256), int64(domain.SystemUserID))
+	if err != nil {
+		return fmt.Errorf("read users.auth_iters: %w", err)
+	}
+	defer rows.Close()
+
+	type group struct {
+		iters       int64
+		count       int64
+		first, last string
+	}
+	var groups []group
+	for rows.Next() {
+		var g group
+		if err := rows.Scan(&g.iters, &g.count, &g.first, &g.last); err != nil {
+			return fmt.Errorf("scan users.auth_iters: %w", err)
+		}
+		groups = append(groups, g)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read users.auth_iters: %w", err)
+	}
+	if len(groups) <= 1 {
+		return nil
+	}
+
+	// Группы отсортированы по убыванию размера, поэтому первой идёт та, к
+	// которой нужно привести остальные: сообщение обязано называть меньшинство,
+	// а не просто констатировать факт расхождения.
+	var b strings.Builder
+	for i, g := range groups {
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		fmt.Fprintf(&b, "%d iterations: %d user(s), e.g. %q", g.iters, g.count, g.first)
+		if g.last != g.first {
+			fmt.Fprintf(&b, "…%q", g.last)
+		}
+	}
+	return fmt.Errorf(
+		"users.auth_iters differs between records (%s): until the AUTH_PARAMS round of M14 the server "+
+			"announces one iteration count in HELLO_OK before it knows the login (§3.3), so users outside "+
+			"the majority cannot authenticate at all; re-run the password reset for them or restore the "+
+			"previous auth.pbkdf2_iters (§6.2 п. 3)",
+		b.String())
 }
 
 func verifyServerSecrets(ctx context.Context, r *sql.DB) error {
