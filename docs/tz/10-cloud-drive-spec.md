@@ -1246,22 +1246,34 @@ rollback.
 
 ```go
 type RecoveryRecord struct {
-    OperationID  string
-    Kind         string
-    Phase        string
-    UserID       int64
-    ResourceID   string
-    NewRevision  uint64
-    UploadID     string
-    TempPath     string
-    FinalPath    string
-    BackupPath   string
-    ChecksumAlgo uint8
-    Checksum     [32]byte
-    SizeBytes    uint64
-    CreatedAtMs  int64
+    OperationID        string
+    Kind               string
+    Phase              string
+    UserID             int64
+    ResourceID         string
+    NewRevision        uint64
+    UploadID           string
+    TempPath           string
+    FinalPath          string
+    BackupPath         string
+    ChecksumAlgo       uint8
+    Checksum           [32]byte
+    SizeBytes          uint64
+    CreatedResourceIDs []string
+    CreatedAtMs        int64
 }
 ```
+
+`CreatedResourceIDs` заполняется только при `Kind=copy_tree` и перечисляет все
+ResourceID, которые операция намерена создать (раздел 9.4). Поле существует
+потому, что copy создаёт N blob по путям, выведенным из ResourceID, а строки
+`resources` пишет одной транзакцией уже после того, как все байты записаны:
+без списка откат не знает, какие blob удалять. Из этого следует, что ResourceID
+всех копий генерируются ДО первой FS-операции и попадают в маркер вместе с ней.
+Для остальных `Kind` поле пусто, а скалярные `ResourceID`, `TempPath`,
+`FinalPath`, `SizeBytes` и `Checksum` описывают единственный ресурс операции;
+при `Kind=copy_tree` они описывают только её корень. Шаги реконсиляции 4 и 5
+применяются для этого `Kind` поэлементно.
 
 `Kind` принимает одно из значений:
 
@@ -3141,10 +3153,11 @@ MOVE **с `overwrite=true`** — исключение: по модели пер�
 Требования:
 
 - копирование context-aware;
-- перед первой FS-операцией записывается recovery marker `Kind=copy_tree`,
-  содержащий список создаваемых ResourceID; маркер снимается после DB commit.
-  Rollback по маркеру удаляет созданные blob и не оставляет записей в
-  `resources`;
+- ResourceID всех создаваемых копий генерируются до первой FS-операции и
+  записываются в recovery marker `Kind=copy_tree` полем `CreatedResourceIDs`
+  (раздел 5.5); маркер снимается после DB commit. Rollback по маркеру удаляет
+  blob по путям, выведенным из перечисленных ResourceID, и не оставляет записей
+  в `resources` — записывать их было нечему, транзакция не начиналась;
 - квота резервируется до начала копирования по сумме размеров всех копируемых
   файлов (формула ниже);
 - копия в свободное имя получает новый ResourceID и `revision = 1`. При
