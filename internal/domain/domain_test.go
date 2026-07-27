@@ -396,3 +396,15 @@ func TestBaselineID(t *testing.T) {
 		t.Fatal("two baseline ids collided")
 	}
 }
+
+// TestMaxNameLenMatchesProto — domain.MaxNameLen и proto.MaxNameLen обязаны
+// совпадать (§5.3 п. 6). Значение объявлено дважды потому, что проверку имени
+// выполняет internal/metadata, а импортировать proto он не вправе (§4.3 п. 1);
+// расхождение объявлений означало бы, что сервер принимает имя, которое кадр не
+// способен передать, — и наоборот.
+func TestMaxNameLenMatchesProto(t *testing.T) {
+	if domain.MaxNameLen != proto.MaxNameLen {
+		t.Fatalf("domain.MaxNameLen = %d, proto.MaxNameLen = %d: значения разъехались",
+			domain.MaxNameLen, proto.MaxNameLen)
+	}
+}

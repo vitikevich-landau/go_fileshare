@@ -103,6 +103,25 @@ The driver is pure Go, so `CGO_ENABLED=0` builds keep working
 ([ADR 0001](docs/adr/0001-sqlite-driver.md)). Set `database.enabled` to `false`
 to run the pre-M12 model without a database.
 
+### Importing an existing `users.json`
+
+`--migrate-users` is a one-shot import of the legacy user file into the metadata
+database. It reads `auth.pbkdf2_iters` from the active config — that is the
+iteration count the stored keys in the file were computed with — and leaves the
+source file untouched:
+
+```bash
+./bin/fshare-daemon --config config.json --migrate-users users.json
+```
+
+Re-running it changes nothing: a login already imported with the same data is
+skipped. A login that exists in the database with *different* data aborts the
+whole import and names the fields that differ; add `--overwrite-existing` to
+replace those records with the values from the JSON instead.
+
+Authentication still reads `users.json` at this point — the switch to SQLite as
+the source of truth for logins lands with the user service.
+
 ## Docker
 
 ```bash

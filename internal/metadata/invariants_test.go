@@ -2,9 +2,11 @@ package metadata_test
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 	"testing"
 
+	"github.com/vitikevich-landau/go_fileshare/internal/domain"
 	"github.com/vitikevich-landau/go_fileshare/internal/metadata"
 )
 
@@ -135,5 +137,103 @@ func TestVerifyInvariantsUsesReadOnlyHandle(t *testing.T) {
 	_, err := d.Reader.ExecContext(context.Background(), `DELETE FROM server_secrets`)
 	if err == nil {
 		t.Fatal("the handle passed to VerifyInvariants can write")
+	}
+}
+
+// TestAuthItersAgreement — §6.2 п. 3: до раунда AUTH_PARAMS (M14) auth_iters
+// обязан быть одинаков у всех пользователей, расхождение отклоняется при старте.
+//
+// Проверка защищает от необъяснимого отказа входа: число итераций объявляется в
+// HELLO_OK ДО того, как сервер узнал логин (§3.3), поэтому запись с другим
+// значением означает пользователя, который не войдёт никогда — и увидит обычную
+// ошибку пароля.
+func TestAuthItersAgreement(t *testing.T) {
+	ctx := context.Background()
+	d := open(t, t.TempDir())
+	res := metadata.NewResources(d)
+	us := metadata.NewUsers(d, res)
+
+	add := func(login string, iters int) {
+		t.Helper()
+		if err := d.Write(ctx, func(tx *sql.Tx) error {
+			_, err := us.Create(ctx, tx, metadata.NewUser{
+				Login: login, Role: domain.RoleUser,
+				Secret: metadata.Secret{
+					KDFAlgo:   domain.KDFPBKDF2SHA256,
+					Salt:      domain.LegacySalt(login),
+					StoredKey: make([]byte, 32),
+					AuthIters: iters,
+				},
+			})
+			return err
+		}); err != nil {
+			t.Fatalf("создать %q: %v", login, err)
+		}
+	}
+
+	add("alice", testAuthIters)
+	add("bob", testAuthIters)
+	if err := metadata.VerifyInvariants(ctx, d.Reader); err != nil {
+		t.Fatalf("согласованные записи отклонены: %v", err)
+	}
+
+	add("mallory", testAuthIters/2)
+	err := metadata.VerifyInvariants(ctx, d.Reader)
+	if err == nil {
+		t.Fatal("расхождение auth_iters между записями не отклонено (§6.2 п. 3)")
+	}
+	// Сообщение обязано называть обе величины и хотя бы один логин из
+	// меньшинства: без этого оператор не поймёт, кого чинить.
+	for _, want := range []string{"mallory", "auth_iters"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("в сообщении нет %q: %v", want, err)
+		}
+	}
+}
+
+// TestAuthItersIgnoresSystemAccount — системный аккаунт из сверки исключён.
+//
+// Его auth_iters проставляет миграция и больше никогда не меняет, а обновить
+// нечем: смены пароля у аккаунта, который не может пройти аутентификацию ни при
+// каких данных, нет. Включи его в проверку — и первое же законное повышение
+// auth.pbkdf2_iters с пересозданием всех пользователей оставило бы демон не
+// поднимающимся навсегда.
+func TestAuthItersIgnoresSystemAccount(t *testing.T) {
+	ctx := context.Background()
+	d := open(t, t.TempDir())
+	res := metadata.NewResources(d)
+	us := metadata.NewUsers(d, res)
+
+	// Оператор поднял auth.pbkdf2_iters и завёл всех пользователей заново:
+	// значение у них общее, но с посеянным в миграции не совпадает.
+	const raised = testAuthIters * 2
+	for _, login := range []string{"alice", "bob"} {
+		if err := d.Write(ctx, func(tx *sql.Tx) error {
+			_, err := us.Create(ctx, tx, metadata.NewUser{
+				Login: login, Role: domain.RoleAdmin,
+				Secret: metadata.Secret{
+					KDFAlgo:   domain.KDFPBKDF2SHA256,
+					Salt:      domain.LegacySalt(login),
+					StoredKey: make([]byte, 32),
+					AuthIters: raised,
+				},
+			})
+			return err
+		}); err != nil {
+			t.Fatalf("создать %q: %v", login, err)
+		}
+	}
+
+	var systemIters int
+	if err := d.Reader.QueryRowContext(ctx, `SELECT auth_iters FROM users WHERE id = ?`,
+		int64(domain.SystemUserID)).Scan(&systemIters); err != nil {
+		t.Fatalf("читать auth_iters системного аккаунта: %v", err)
+	}
+	if systemIters == raised {
+		t.Fatalf("подготовка теста: у системного аккаунта уже %d, расхождения нет", raised)
+	}
+
+	if err := metadata.VerifyInvariants(ctx, d.Reader); err != nil {
+		t.Fatalf("старт отклонён из-за системного аккаунта: %v", err)
 	}
 }

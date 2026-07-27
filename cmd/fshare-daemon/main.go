@@ -46,6 +46,10 @@ func main() {
 		roleFlag    = flag.String("role", "user", "role for --add-user (user|admin)")
 		resetPw     = flag.String("reset-password", "", "reset this user's password (prompts), then exit")
 		migrateOnly = flag.Bool("migrate-only", false, "apply metadata database migrations and exit")
+		//nolint:lll // §21.4: одноразовый перенос users.json в metadata DB.
+		migrateUsers = flag.String("migrate-users", "", "import this users.json into the metadata database, then exit")
+		overwriteEx  = flag.Bool("overwrite-existing", false,
+			"for --migrate-users: replace a login that already exists in the database with the values from the JSON")
 	)
 	flag.Parse()
 
@@ -71,6 +75,27 @@ func main() {
 		fatalf("config invalid: %s", msg)
 	}
 
+	// Разовые режимы взаимоисключающи, и проверяется это ДО первой ветки.
+	//
+	// Ветки идут цепочкой, каждая заканчивается return, поэтому пара вроде
+	// `--migrate-only --migrate-users users.json` выполнила бы первую и молча
+	// пропустила вторую — с нулевым кодом возврата. Автоматика, которая
+	// переносит учётки одной командой, отрапортовала бы об успешной миграции,
+	// не перенеся ни одного пользователя. Порядок веток при этом ничей
+	// приоритет не выражает: он просто такой, какой есть.
+	if modes := requestedModes(*checkConfig, *addUser, *resetPw, *migrateOnly, *migrateUsers); len(modes) > 1 {
+		fatalf("one-shot modes are mutually exclusive, but %s were requested together; run them one at a time",
+			strings.Join(modes, " and "))
+	}
+	// Модификаторы проверяются ЗДЕСЬ ЖЕ, до первой ветки, и по той же причине:
+	// ветка своего режима завершается возвратом, поэтому проверка после неё
+	// срабатывает только когда режим не запрошен вовсе. `--check-config
+	// --overwrite-existing` печатал бы «config OK» и молча игнорировал флаг.
+	//
+	if err := checkModifiers(setFlags(), *addUser, *migrateUsers); err != nil {
+		fatalf("%v", err)
+	}
+
 	// Разовые режимы: проверить конфиг или поправить пользователей — и выйти.
 	if *checkConfig {
 		fmt.Println("config OK")
@@ -86,6 +111,13 @@ func main() {
 
 	if *migrateOnly {
 		if err := runMigrateOnly(cfg); err != nil {
+			fatalf("%v", err)
+		}
+		return
+	}
+
+	if *migrateUsers != "" {
+		if err := runMigrateUsers(cfg, *migrateUsers, *overwriteEx); err != nil {
 			fatalf("%v", err)
 		}
 		return
@@ -197,31 +229,46 @@ func run(cfg config.Settings, configPath string) error {
 	return nil
 }
 
-// openMetadataDB открывает metadata DB и доводит схему до текущей версии.
-// Возвращает nil, nil при database.enabled = false — режим до M12, в котором
-// метабазы нет вовсе (§19.6 п. 1).
+// openMetadataDB открывает metadata DB для ОБСЛУЖИВАНИЯ ЗАПРОСОВ: доводит схему
+// до текущей версии и отказывается отдавать базу, не прошедшую проверку
+// инвариантов. Возвращает nil, nil при database.enabled = false — режим до M12,
+// в котором метабазы нет вовсе (§19.6 п. 1).
 func openMetadataDB(cfg config.Settings) (*db.DB, error) {
-	if !cfg.Database.Enabled {
-		return nil, nil
-	}
-	ctx := context.Background()
-	meta, err := db.Open(ctx, db.Config{
-		Path:          cfg.Database.Path,
-		BusyTimeoutMs: cfg.Database.BusyTimeoutMs,
-		Synchronous:   cfg.Database.Synchronous,
-	}, metadata.Migrations(metadata.SeedParams{AuthIters: cfg.Auth.PBKDF2Iters}))
-	if err != nil {
-		return nil, err
+	meta, err := openMetadataDBForMaintenance(cfg)
+	if err != nil || meta == nil {
+		return meta, err
 	}
 	// Миграции идемпотентны, поэтому на уже мигрированной базе seed не
 	// выполняется вовсе. Проверка обязательных строк — отдельный шаг, иначе
 	// база с удалённой строкой поднялась бы молча и отказала позже, на первом
 	// запросе (§6.12).
-	if err := metadata.VerifyInvariants(ctx, meta.Reader); err != nil {
+	if err := metadata.VerifyInvariants(context.Background(), meta.Reader); err != nil {
 		meta.Close()
 		return nil, err
 	}
 	return meta, nil
+}
+
+// openMetadataDBForMaintenance открывает ту же базу БЕЗ проверки инвариантов.
+//
+// Разделение не косметическое. Команда, чья работа — привести базу в порядок, не
+// может требовать, чтобы база УЖЕ была в порядке: проверка перед импортом
+// сделала бы недостижимым единственный способ свести разъехавшиеся auth_iters
+// (перезапись всех секретов, §6.2 п. 3) — тот самый, на который ссылается
+// сообщение об ошибке. Ровно эта же дверь понадобится --fsck.
+//
+// Обратная сторона: такая база может обслуживать запросы только после
+// повторной проверки, поэтому вызывающий обязан выполнить VerifyInvariants сам
+// и сказать, если та не прошла.
+func openMetadataDBForMaintenance(cfg config.Settings) (*db.DB, error) {
+	if !cfg.Database.Enabled {
+		return nil, nil
+	}
+	return db.Open(context.Background(), db.Config{
+		Path:          cfg.Database.Path,
+		BusyTimeoutMs: cfg.Database.BusyTimeoutMs,
+		Synchronous:   cfg.Database.Synchronous,
+	}, metadata.Migrations(metadata.SeedParams{AuthIters: cfg.Auth.PBKDF2Iters}))
 }
 
 // runMigrateOnly применяет миграции и выходит. Разовый режим нужен образу и CI:
@@ -242,6 +289,149 @@ func runMigrateOnly(cfg config.Settings) error {
 		return err
 	}
 	fmt.Printf("metadata database %s is at schema version %d\n", cfg.Database.Path, version)
+	return nil
+}
+
+// requestedModes перечисляет запрошенные разовые режимы. Каждый из них
+// заканчивается выходом, поэтому запрошенных одновременно быть не должно.
+//
+// --add-user и --reset-password перечислены раздельно, хотя их обслуживает один
+// runUserAdmin: он выбирает между ними switch'ем и при обоих заданных флагах
+// выполняет только первый — то же молчаливое пропускание, только внутри одной
+// функции. Модификаторы (--role, --overwrite-existing) режимами не являются и
+// сюда не входят.
+func requestedModes(checkConfig bool, addUser, resetPw string, migrateOnly bool, migrateUsers string) []string {
+	var modes []string
+	for _, m := range []struct {
+		name   string
+		active bool
+	}{
+		{"--check-config", checkConfig},
+		{"--add-user", addUser != ""},
+		{"--reset-password", resetPw != ""},
+		{"--migrate-only", migrateOnly},
+		{"--migrate-users", migrateUsers != ""},
+	} {
+		if m.active {
+			modes = append(modes, m.name)
+		}
+	}
+	return modes
+}
+
+// setFlags возвращает имена флагов, заданных в командной строке явно.
+//
+// Именно заданных, а не отличающихся от умолчания: у --role умолчание непустое
+// («user»), и отличить «оператор написал --role user» от «не написал ничего»
+// сравнением значений нельзя.
+func setFlags() map[string]bool {
+	set := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	return set
+}
+
+// checkModifiers отвергает флаги-модификаторы, заданные без своего режима.
+//
+// Молча проигнорированный модификатор — это команда, сделавшая не то, что
+// просили, и отрапортовавшая об успехе: `--migrate-users users.json` без
+// `--overwrite-existing` и с ним — разные операции, и оператор, ошибшийся
+// режимом, обязан узнать об этом, а не получить нулевой код возврата.
+//
+// Набор заданных флагов передаётся аргументом, а не читается из flag.Visit
+// внутри: глобальный набор в тестовом бинарнике содержит флаги самого go test.
+func checkModifiers(set map[string]bool, addUser, migrateUsers string) error {
+	for _, m := range []struct {
+		modifier string
+		mode     string
+		active   bool
+	}{
+		{"overwrite-existing", "--migrate-users", migrateUsers != ""},
+		{"role", "--add-user", addUser != ""},
+	} {
+		if set[m.modifier] && !m.active {
+			return fmt.Errorf("--%s has no meaning without %s", m.modifier, m.mode)
+		}
+	}
+	return nil
+}
+
+// runMigrateUsers переносит users.json в metadata DB и выходит (§21.4).
+//
+// Исходный файл не удаляется и не изменяется: миграция обязана быть повторяемой,
+// а оператор — иметь возможность сверить результат с источником. Повторный
+// запуск идемпотентен, конфликт логина прерывает перенос целиком.
+func runMigrateUsers(cfg config.Settings, path string, overwriteExisting bool) error {
+	if !cfg.Database.Enabled {
+		return fmt.Errorf("--migrate-users requires database.enabled = true")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("--migrate-users: %w", err)
+	}
+	// База открывается БЕЗ проверки инвариантов: команда, приводящая базу в
+	// порядок, не может требовать, чтобы та уже была в порядке. Перезапись всех
+	// секретов — единственный способ свести разъехавшиеся auth_iters (§6.2 п. 3),
+	// и проверка перед импортом сделала бы его недостижимым.
+	meta, err := openMetadataDBForMaintenance(cfg)
+	if err != nil {
+		return err
+	}
+	defer meta.Close()
+
+	users := metadata.NewUsers(meta, metadata.NewResources(meta))
+	// auth.pbkdf2_iters берётся из ДЕЙСТВУЮЩЕГО конфига, потому что именно он
+	// описывает, с каким числом итераций посчитаны stored_key в переносимом
+	// файле: до раунда AUTH_PARAMS (M14) значение глобально (§3.3, §21.4).
+	report, err := metadata.ImportUsers(context.Background(), meta, users, data, metadata.ImportOptions{
+		AuthIters:         cfg.Auth.PBKDF2Iters,
+		OverwriteExisting: overwriteExisting,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("imported %s into %s: %d created, %d skipped, %d updated\n",
+		path, cfg.Database.Path, len(report.Created), len(report.Skipped), len(report.Updated))
+	if report.NoActiveAdmin {
+		// Формулировка описывает СЕГОДНЯШНЕЕ положение дел, а не целевое.
+		// Отказ старта без активного администратора и команда --promote — это
+		// §7.5, они приезжают вместе с secure bootstrap; аутентификация сейчас
+		// по-прежнему читает users_file, поэтому обещать «демон не стартует» и
+		// отсылать к несуществующему флагу значило бы соврать дважды.
+		//
+		// Импорт при этом не отклонён: множество активных администраторов было
+		// пустым и до него (см. metadata.ImportUsers).
+		fmt.Fprintf(os.Stderr,
+			"warning: the imported database has no user with role \"admin\" and state \"active\". "+
+				"Authentication still comes from %s, so serving is unaffected for now; "+
+				"once the daemon authenticates from the database it will refuse to start without one (§7.5)\n",
+			cfg.Auth.UsersFile)
+	}
+	for _, group := range []struct {
+		verb   string
+		logins []string
+	}{{"created", report.Created}, {"skipped", report.Skipped}, {"updated", report.Updated}} {
+		for _, login := range group.logins {
+			// %q, а не %s: логины приходят из чужого файла, и validateLogin
+			// пропускает категорию Cf сознательно — ZWNJ законно встречается в
+			// именах. Но U+202E RIGHT-TO-LEFT OVERRIDE из той же категории,
+			// напечатанный как есть, переворачивает строку прямо в терминале
+			// оператора и прячет соседние записи отчёта. Отказ в регистрации был
+			// бы неверным решением, экранирование при выводе — верное, и это то
+			// самое место вывода. strconv.IsPrint не считает Cf печатаемым,
+			// поэтому %q экранирует его и оставляет кириллицу читаемой.
+			fmt.Printf("  %-7s %q\n", group.verb, login)
+		}
+	}
+
+	// Проверка выполняется ПОСЛЕ импорта, раз до него она была пропущена.
+	// Импорт уже зафиксирован, поэтому это не отказ, а отчёт: база, не прошедшая
+	// проверку, обслуживать запросы не будет, и оператор обязан узнать это здесь,
+	// а не при следующем старте демона. Ненулевой код возврата — часть отчёта:
+	// работа не закончена.
+	if err := metadata.VerifyInvariants(context.Background(), meta.Reader); err != nil {
+		return fmt.Errorf("the import was committed, but the database still fails its invariants "+
+			"and the daemon will not open it: %w", err)
+	}
 	return nil
 }
 
