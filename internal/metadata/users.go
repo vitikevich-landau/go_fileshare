@@ -342,6 +342,12 @@ func (us *Users) SetQuota(ctx context.Context, tx *sql.Tx, id domain.UserID, quo
 // AUTH_PARAMS (M14) она обязана оставаться детерминированной
 // `"fileshare-v2:" || login`, потому что клиент выводит её сам, и случайная соль
 // сделала бы вход невозможным.
+//
+// Метод этого НЕ проверяет, и это осознанно: правило временное — оно действует
+// до M14 и там отменяется, — а такие правила репозиторий не держит по той же
+// причине, по какой не держит сверку auth_iters. Соблюдать §6.2 п. 1–2 обязан
+// UserService: он знает и логин, и то, какой этап на дворе. Здесь проверяется
+// только то, что верно всегда (validateSecret).
 func (us *Users) SetSecret(ctx context.Context, tx *sql.Tx, id domain.UserID, s Secret) error {
 	if err := validateSecret(s); err != nil {
 		return fmt.Errorf("metadata: set secret of user %d: %w", id, err)

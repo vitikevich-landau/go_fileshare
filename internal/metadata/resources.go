@@ -250,17 +250,38 @@ func (rs *Resources) Create(ctx context.Context, tx *sql.Tx, in NewResource, cas
 		return Resource{}, fmt.Errorf("metadata: create %q: kind %q is not in the §6.3 dictionary",
 			in.Name, in.Kind)
 	}
-	// CHECK (kind = 'file' OR size_bytes = 0): каталог не имеет размера.
-	if in.Kind == domain.KindDir && in.SizeBytes != 0 {
-		return Resource{}, fmt.Errorf("metadata: create dir %q: size_bytes = %d, must be 0 (§6.3)",
-			in.Name, in.SizeBytes)
-	}
 	if in.SizeBytes < 0 {
 		return Resource{}, fmt.Errorf("metadata: create %q: size_bytes = %d, must be >= 0",
 			in.Name, in.SizeBytes)
 	}
 	if err := validateChecksum(in.ChecksumAlgo, in.Checksum); err != nil {
 		return Resource{}, fmt.Errorf("metadata: create %q: %w", in.Name, err)
+	}
+	// Каталог создаётся ПУСТЫМ во всех трёх смыслах, относящихся к содержимому:
+	// без размера, без ревизии и без контрольной суммы.
+	//
+	// Схема ловит только первое: CHECK (kind = 'file' OR size_bytes = 0). Два
+	// других поля она с видом ресурса не связывает, и каталог с ревизией 7 и
+	// суммой SHA256 лёг бы в таблицу молча. Врал бы он ровно тому, кто обязан
+	// верить `resources` без оглядки: stat отдал бы клиенту сумму содержимого,
+	// которого нет, а проверка ExpectedRevision (§9.6 — она про мутации ФАЙЛА)
+	// получила бы величину, которую никто не увеличивает.
+	//
+	// Запрет относится к СОЗДАНИЮ. Что делать с ревизией каталога дальше —
+	// вопрос мутаций §9, и здесь он не решается.
+	if in.Kind == domain.KindDir {
+		switch {
+		case in.SizeBytes != 0:
+			return Resource{}, fmt.Errorf("metadata: create dir %q: size_bytes = %d, must be 0 (§6.3)",
+				in.Name, in.SizeBytes)
+		case in.Revision != domain.NoRevision:
+			return Resource{}, fmt.Errorf("metadata: create dir %q: current_revision = %d, must be %d: "+
+				"a directory has no content to revise", in.Name, in.Revision, domain.NoRevision)
+		case in.ChecksumAlgo != domain.ChecksumPending || len(in.Checksum) != 0:
+			return Resource{}, fmt.Errorf("metadata: create dir %q: checksum_algo = %q with %d byte(s) of "+
+				"checksum, both must be unset: a directory has no content to sum",
+				in.Name, in.ChecksumAlgo, len(in.Checksum))
+		}
 	}
 
 	parent, err := childrenParent(ctx, tx, in.ParentID)

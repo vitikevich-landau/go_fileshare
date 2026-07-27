@@ -457,3 +457,68 @@ func TestCreateHomeOwnerMustMatchRoot(t *testing.T) {
 		t.Errorf("ресурс в public с владельцем-создателем отвергнут: %v", err)
 	}
 }
+
+// TestCreateDirHasNoContentMetadata — каталог создаётся пустым во всех трёх
+// смыслах, относящихся к содержимому: без размера, без ревизии и без суммы.
+//
+// Схема ловит только размер: CHECK (kind = 'file' OR size_bytes = 0). Два
+// других поля она с видом ресурса не связывает, поэтому каталог с ревизией и
+// суммой лёг бы в таблицу молча — и соврал бы ровно тому, кто обязан верить
+// resources без оглядки.
+func TestCreateDirHasNoContentMetadata(t *testing.T) {
+	ctx := context.Background()
+	d := open(t, t.TempDir())
+	rs := metadata.NewResources(d)
+	root, err := rs.PublicRoot(ctx)
+	if err != nil {
+		t.Fatalf("PublicRoot: %v", err)
+	}
+
+	dir := metadata.NewResource{
+		OwnerUserID: domain.SystemUserID, ParentID: root.ID,
+		Namespace: domain.NamespacePublic, Name: "каталог", Kind: domain.KindDir,
+	}
+	cases := []struct {
+		why    string
+		mutate func(*metadata.NewResource)
+	}{
+		{"с размером", func(n *metadata.NewResource) { n.SizeBytes = 10 }},
+		{"с ревизией", func(n *metadata.NewResource) { n.Revision = 7 }},
+		{"с суммой", func(n *metadata.NewResource) {
+			n.ChecksumAlgo = domain.ChecksumSHA256
+			n.Checksum = make([]byte, 32)
+		}},
+		{"с суммой crc32", func(n *metadata.NewResource) {
+			n.ChecksumAlgo = domain.ChecksumCRC32
+			n.Checksum = make([]byte, 4)
+		}},
+	}
+	for _, tc := range cases {
+		in := dir
+		tc.mutate(&in)
+		if _, err := create(t, d, rs, in, true); err == nil {
+			t.Errorf("каталог %s принят", tc.why)
+		}
+	}
+
+	// Файлу всё это, разумеется, разрешено.
+	file := dir
+	file.Name = "файл.bin"
+	file.Kind = domain.KindFile
+	file.SizeBytes = 10
+	file.Revision = 7
+	file.ChecksumAlgo = domain.ChecksumSHA256
+	file.Checksum = make([]byte, 32)
+	if _, err := create(t, d, rs, file, true); err != nil {
+		t.Errorf("файл с размером, ревизией и суммой отвергнут: %v", err)
+	}
+
+	// И обычный каталог создаётся.
+	got, err := create(t, d, rs, dir, true)
+	if err != nil {
+		t.Fatalf("обычный каталог отвергнут: %v", err)
+	}
+	if got.Revision != domain.NoRevision || got.SizeBytes != 0 || got.ChecksumAlgo != domain.ChecksumPending {
+		t.Errorf("каталог создан с метаданными содержимого: %+v", got)
+	}
+}
