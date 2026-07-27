@@ -1,4 +1,5 @@
-# CI: сборка, vet и тесты (race detector) на трёх основных платформах.
+# CI: сборка, vet и тесты (race detector) на трёх основных платформах плюс
+# проверки, обязательные по ADR 0001 §6 (выбор драйвера SQLite).
 name: ci
 
 on:
@@ -20,8 +21,13 @@ jobs:
           go-version-file: go.mod
       - run: go build ./...
       - run: go vet ./...
+      # ADR 0001 §5.2: триггер пересмотра матрицы — go test -race дольше
+      # 5 минут на ubuntu-latest. До этого -race остаётся на всех целях.
       - run: go test -race ./...
 
+  # ADR 0001 §6.1 и §6.2: четыре обязательные цели §6.1 ТЗ собираются с
+  # CGO_ENABLED=0, cgo не просачивается в граф зависимостей демона, бинарник
+  # статический.
   cross-compile:
     runs-on: ubuntu-latest
     steps:
@@ -29,7 +35,67 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      # прочие цели обязаны собираться (fsnotify деградирует честно)
-      - run: GOOS=linux   GOARCH=amd64 go build ./...
-      - run: GOOS=windows GOARCH=amd64 go build ./...
-      - run: GOOS=darwin  GOARCH=arm64 go build ./...
+      - run: CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build ./...
+      - run: CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build ./...
+      - run: CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./...
+      - run: CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build ./...
+
+      # Защита от повторения истории с mattn/go-sqlite3: при CGO_ENABLED=0 он
+      # собирается и деградирует в stub, падая только в рантайме на первом
+      # запросе (ADR 0001 §3.8), то есть нарушение требования незаметно проходит
+      # сборку.
+      - name: cgo must not reach the daemon dependency graph
+        run: |
+          if CGO_ENABLED=0 go list -deps ./cmd/fshare-daemon | grep -qx 'runtime/cgo'; then
+            echo "runtime/cgo в графе зависимостей демона"; exit 1
+          fi
+
+      - name: daemon must be statically linked
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/fshare-daemon ./cmd/fshare-daemon
+          file /tmp/fshare-daemon | grep -q 'statically linked' || { echo "не статический"; exit 1; }
+          ! readelf -d /tmp/fshare-daemon | grep -q 'NEEDED'    || { echo "есть NEEDED"; exit 1; }
+          ! ldd     /tmp/fshare-daemon 2>&1 | grep -q '=>'      || { echo "есть .so"; exit 1; }
+          # Информационная метрика ADR 0001 §6.6. Порог включается тогда, когда
+          # драйвер вызывается из достижимого кода: до этого DCE выбрасывает
+          # почти весь SQLite и цифра ложно оптимистична (§5.3).
+          echo "fshare-daemon linux/amd64: $(stat -c%s /tmp/fshare-daemon) bytes"
+
+  # ADR 0001 §6.5: драйверо-специфичный импорт живёт ровно в одном файле.
+  # Именно этот запрет делает переход на запасной драйвер правкой двух строк.
+  driver-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: sqlite driver must be imported in internal/db/sqlite.go only
+        run: |
+          hits=$(grep -rln 'modernc.org/sqlite' --include='*.go' . | grep -v '^./internal/db/sqlite.go$' || true)
+          if [ -n "$hits" ]; then
+            echo "импорт драйвера вне internal/db/sqlite.go:"; echo "$hits"; exit 1
+          fi
+
+  # ADR 0001 §6.3: smoke-тест реального образа FROM scratch. В исследовании он
+  # был заменён на strace и прогоном в образе не проверялся, поэтому проверка
+  # обязана жить в CI.
+  #
+  # Наличие -wal критерием не является: SQLite удаляет его при закрытии
+  # последнего соединения, а --migrate-only завершается штатно. Проверяется то,
+  # что наблюдаемо после выхода: код возврата, файл БД и версия схемы, которую
+  # печатает сам демон.
+  docker-scratch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t fshare-daemon:ci .
+      - name: migrate in a scratch image
+        run: |
+          mkdir -p ci-data
+          out=$(docker run --rm -v "$PWD/ci-data:/data" fshare-daemon:ci --migrate-only)
+          echo "$out"
+          echo "$out" | grep -q 'schema version 1' || { echo "миграция не довела схему до версии 1"; exit 1; }
+          test -f ci-data/metadata.db || { echo "файл БД не создан"; exit 1; }
+      - name: migrations are idempotent
+        run: |
+          out=$(docker run --rm -v "$PWD/ci-data:/data" fshare-daemon:ci --migrate-only)
+          echo "$out"
+          echo "$out" | grep -q 'schema version 1' || { echo "повторный прогон изменил версию схемы"; exit 1; }

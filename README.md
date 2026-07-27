@@ -88,6 +88,21 @@ Add users (challenge/response auth) with:
 ./bin/fshare-daemon --config config.json --add-user vit --role admin   # prompts for a password
 ```
 
+### Metadata database
+
+Starting with M12 the daemon keeps its metadata in SQLite (`metadata.db` next to
+the working directory by default, `database.path` to move it). The schema is
+created on first start, before the listener opens; `--migrate-only` applies the
+migrations and exits without serving:
+
+```bash
+./bin/fshare-daemon --config config.json --migrate-only
+```
+
+The driver is pure Go, so `CGO_ENABLED=0` builds keep working
+([ADR 0001](docs/adr/0001-sqlite-driver.md)). Set `database.enabled` to `false`
+to run the pre-M12 model without a database.
+
 ## Docker
 
 ```bash
