@@ -544,3 +544,87 @@ func TestValidateLoginControlCharacters(t *testing.T) {
 		}
 	}
 }
+
+// TestSetStateKeepsFirstPendingDeleteMoment — §6.2 определяет
+// pending_delete_at_ms как момент перевода, то есть ПЕРВОГО перевода. Повторный
+// `user delete` — законная операция (UserService разрешает перевод в то же
+// состояние, чтобы заново применить таблицу §7.4 после прерванного отзыва), и
+// каждая такая попытка не имеет права отодвигать возраст записи.
+func TestSetStateKeepsFirstPendingDeleteMoment(t *testing.T) {
+	ctx := context.Background()
+	d, us, _ := repos(t)
+
+	u, err := createUser(t, d, us, newUser("alice", domain.RoleUser))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	setState := func(state domain.UserState) {
+		t.Helper()
+		if err := d.Write(ctx, func(tx *sql.Tx) error {
+			return us.SetState(ctx, tx, u.ID, state)
+		}); err != nil {
+			t.Fatalf("SetState(%q): %v", state, err)
+		}
+	}
+	pendingAt := func() domain.UnixMillis {
+		t.Helper()
+		got, err := us.ByID(ctx, u.ID)
+		if err != nil {
+			t.Fatalf("ByID: %v", err)
+		}
+		return got.PendingDeleteAt
+	}
+
+	setState(domain.UserPendingDelete)
+	first := pendingAt()
+	if first == 0 {
+		t.Fatal("момент перевода не записан")
+	}
+
+	// Часы теста не двигаются, поэтому повтор сверяется не «раньше/позже», а
+	// точным равенством: перезапись дала бы новое значение NowMillis, а оно почти
+	// наверняка отличается — и уж точно отличается после подмены строки вручную.
+	if err := d.Write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE users SET pending_delete_at_ms = ? WHERE id = ?`, 1_000, int64(u.ID))
+		return err
+	}); err != nil {
+		t.Fatalf("подмена момента: %v", err)
+	}
+
+	setState(domain.UserPendingDelete)
+	if got := pendingAt(); got != 1_000 {
+		t.Errorf("повторный перевод изменил момент: %d, ожидалось 1000", got)
+	}
+}
+
+// TestSetStateClearsPendingDeleteMomentOnReturn — колонка заполнена РОВНО тогда,
+// когда состояние равно pending_delete (CHECK схемы), поэтому возврат в active или
+// disabled её очищает. Сам возврат из pending_delete запрещает UserService
+// (состояние терминально), но репозиторий обязан оставаться согласованным со
+// схемой при любом вызове.
+func TestSetStateClearsPendingDeleteMomentOnReturn(t *testing.T) {
+	ctx := context.Background()
+	d, us, _ := repos(t)
+
+	u, err := createUser(t, d, us, newUser("alice", domain.RoleUser))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	for _, state := range []domain.UserState{domain.UserPendingDelete, domain.UserDisabled} {
+		if err := d.Write(ctx, func(tx *sql.Tx) error {
+			return us.SetState(ctx, tx, u.ID, state)
+		}); err != nil {
+			t.Fatalf("SetState(%q): %v", state, err)
+		}
+	}
+
+	got, err := us.ByID(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("ByID: %v", err)
+	}
+	if got.PendingDeleteAt != 0 {
+		t.Errorf("pending_delete_at_ms = %d при state = %q", got.PendingDeleteAt, got.State)
+	}
+}
