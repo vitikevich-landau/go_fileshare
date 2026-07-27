@@ -128,6 +128,31 @@ func ImportUsers(ctx context.Context, d *db.DB, us *Users, data []byte, opts Imp
 				adminsBefore, ErrLastAdminRequired)
 		}
 		rep.NoActiveAdmin = adminsAfter == 0
+
+		// §6.2 п. 3 проверяется здесь же, а не оставляется старту демона.
+		//
+		// Расхождение возникает буднично: в базе лежат пользователи, посчитанные
+		// со старым auth.pbkdf2_iters, конфиг с тех пор подняли, и импорт того же
+		// файла пропускает их как идентичные (auth_iters не входит в сверку
+		// §21.4), а новую запись создаёт уже с новым значением. Команда
+		// отрапортовала бы об успехе, демон не поднялся бы, и — что хуже всего —
+		// повторный импорт этого уже не чинит: пропуск остаётся пропуском.
+		//
+		// Отказ здесь и означает, что миграцию запустили с конфигом, который не
+		// соответствует переносимому файлу.
+		groups, err := authItersGroups(ctx, tx)
+		if err != nil {
+			return fmt.Errorf("metadata: import users: %w", err)
+		}
+		if len(groups) > 1 {
+			return fmt.Errorf(
+				"metadata: import users: the result would hold more than one PBKDF2 iteration count (%s); "+
+					"auth.pbkdf2_iters is %d now, but the stored keys already in the database were computed "+
+					"with another value, and a re-run cannot repair this because identical records are skipped "+
+					"by design (§21.4). Run the import with the auth.pbkdf2_iters that produced the JSON, or "+
+					"reset the passwords of the minority (§6.2 п. 3)",
+				describeAuthIters(groups), opts.AuthIters)
+		}
 		return nil
 	})
 	if err != nil {

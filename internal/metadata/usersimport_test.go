@@ -550,3 +550,83 @@ func TestImportRejectsSystemLogin(t *testing.T) {
 		}
 	}
 }
+
+// TestImportRejectsMixedAuthIters — импорт не оставляет в базе два разных
+// auth_iters (§6.2 п. 3).
+//
+// Сценарий будничный: пользователи посчитаны со старым auth.pbkdf2_iters,
+// конфиг подняли, тот же файл перезалили с новой записью. Старые пропускаются
+// как идентичные (auth_iters не входит в сверку §21.4), новая создаётся с новым
+// значением. Без этой проверки команда рапортует об успехе, демон не поднимается,
+// а повторный импорт уже ничего не чинит — пропуск остаётся пропуском.
+func TestImportRejectsMixedAuthIters(t *testing.T) {
+	ctx := context.Background()
+	d, us, _ := repos(t)
+
+	if _, err := metadata.ImportUsers(ctx, d, us,
+		usersJSON(rec("root", "admin", keyHex(1), true)), importOpts()); err != nil {
+		t.Fatalf("подготовка: %v", err)
+	}
+
+	// Конфиг подняли, в файле появился новый пользователь.
+	raised := metadata.ImportOptions{AuthIters: testAuthIters * 2}
+	body := rec("root", "admin", keyHex(1), true) + "," + rec("bob", "user", keyHex(2), true)
+	_, err := metadata.ImportUsers(ctx, d, us, usersJSON(body), raised)
+	if err == nil {
+		t.Fatal("импорт со смешанными auth_iters принят: демон с такой базой не стартует")
+	}
+	// Сообщение обязано назвать оба значения и текущий конфиг.
+	for _, want := range []string{"600000", "1200000", "auth.pbkdf2_iters"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("в сообщении нет %q: %v", want, err)
+		}
+	}
+
+	// Откат целиком: bob не появился, база по-прежнему стартует.
+	if _, err := us.ByLogin(ctx, "bob"); !errors.Is(err, metadata.ErrNotFound) {
+		t.Error("bob импортирован несмотря на отказ")
+	}
+	if err := metadata.VerifyInvariants(ctx, d.Reader); err != nil {
+		t.Errorf("база испорчена отклонённым импортом: %v", err)
+	}
+
+	// С правильным конфигом тот же файл проходит.
+	if _, err := metadata.ImportUsers(ctx, d, us, usersJSON(body), importOpts()); err != nil {
+		t.Fatalf("импорт с исходным auth.pbkdf2_iters: %v", err)
+	}
+	if err := metadata.VerifyInvariants(ctx, d.Reader); err != nil {
+		t.Errorf("после корректного импорта база не стартует: %v", err)
+	}
+}
+
+// TestImportRepairsMixedAuthIters — а перезапись ВСЕХ секретов остаётся
+// работающим путём: после неё значение снова одно, и проверка пропускает.
+func TestImportRepairsMixedAuthIters(t *testing.T) {
+	ctx := context.Background()
+	d, us, _ := repos(t)
+
+	body := rec("root", "admin", keyHex(1), true) + "," + rec("bob", "user", keyHex(2), true)
+	if _, err := metadata.ImportUsers(ctx, d, us, usersJSON(body), importOpts()); err != nil {
+		t.Fatalf("подготовка: %v", err)
+	}
+
+	// Все секреты в файле новые, конфиг новый — значит, все записи получают его.
+	const raised = testAuthIters * 2
+	opts := metadata.ImportOptions{AuthIters: raised, OverwriteExisting: true}
+	fresh := rec("root", "admin", keyHex(5), true) + "," + rec("bob", "user", keyHex(6), true)
+	if _, err := metadata.ImportUsers(ctx, d, us, usersJSON(fresh), opts); err != nil {
+		t.Fatalf("перезапись всех секретов отклонена: %v", err)
+	}
+	for _, login := range []string{"root", "bob"} {
+		u, err := us.ByLogin(ctx, login)
+		if err != nil {
+			t.Fatalf("ByLogin(%s): %v", login, err)
+		}
+		if u.Secret.AuthIters != raised {
+			t.Errorf("%s: auth_iters = %d, want %d", login, u.Secret.AuthIters, raised)
+		}
+	}
+	if err := metadata.VerifyInvariants(ctx, d.Reader); err != nil {
+		t.Errorf("после перезаписи всех секретов база не стартует: %v", err)
+	}
+}

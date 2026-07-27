@@ -150,7 +150,38 @@ func verifyPublicJournalState(ctx context.Context, r *sql.DB) error {
 // демон не поднимающимся навсегда. На вход это значение не влияет ни при каком
 // раскладе: системный аккаунт отклоняется до сравнения proof.
 func verifyAuthItersAgreement(ctx context.Context, r *sql.DB) error {
-	rows, err := r.QueryContext(ctx, `
+	groups, err := authItersGroups(ctx, r)
+	if err != nil {
+		return err
+	}
+	if len(groups) <= 1 {
+		return nil
+	}
+	return fmt.Errorf(
+		"users.auth_iters differs between records (%s): until the AUTH_PARAMS round of M14 the server "+
+			"announces one iteration count in HELLO_OK before it knows the login (§3.3), so users outside "+
+			"the majority cannot authenticate at all; re-run the password reset for them or restore the "+
+			"previous auth.pbkdf2_iters (§6.2 п. 3)",
+		describeAuthIters(groups))
+}
+
+// authItersGroup — одно значение auth_iters и записи, которые его держат.
+type authItersGroup struct {
+	iters       int64
+	count       int64
+	first, last string
+}
+
+// authItersGroups группирует пользователей по auth_iters, по убыванию размера
+// группы: первой идёт та, к которой нужно привести остальные.
+//
+// Помощник общий для двух точек контроля — старта демона и импорта users.json —
+// и принимает querier, а не *sql.DB, ровно поэтому: импорт обязан считать
+// группы ВНУТРИ своей транзакции, иначе отказ ничего не откатит. Правило
+// исключения (только pbkdf2, без системного аккаунта) обязано быть одним и тем
+// же в обеих точках, иначе импорт разрешит то, что старт отвергнет.
+func authItersGroups(ctx context.Context, q querier) ([]authItersGroup, error) {
+	rows, err := q.QueryContext(ctx, `
 SELECT auth_iters, count(*), min(login), max(login)
 FROM users
 WHERE kdf_algo = ? AND id <> ?
@@ -158,33 +189,27 @@ GROUP BY auth_iters
 ORDER BY count(*) DESC, auth_iters`,
 		string(domain.KDFPBKDF2SHA256), int64(domain.SystemUserID))
 	if err != nil {
-		return fmt.Errorf("read users.auth_iters: %w", err)
+		return nil, fmt.Errorf("read users.auth_iters: %w", err)
 	}
 	defer rows.Close()
 
-	type group struct {
-		iters       int64
-		count       int64
-		first, last string
-	}
-	var groups []group
+	var groups []authItersGroup
 	for rows.Next() {
-		var g group
+		var g authItersGroup
 		if err := rows.Scan(&g.iters, &g.count, &g.first, &g.last); err != nil {
-			return fmt.Errorf("scan users.auth_iters: %w", err)
+			return nil, fmt.Errorf("scan users.auth_iters: %w", err)
 		}
 		groups = append(groups, g)
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("read users.auth_iters: %w", err)
+		return nil, fmt.Errorf("read users.auth_iters: %w", err)
 	}
-	if len(groups) <= 1 {
-		return nil
-	}
+	return groups, nil
+}
 
-	// Группы отсортированы по убыванию размера, поэтому первой идёт та, к
-	// которой нужно привести остальные: сообщение обязано называть меньшинство,
-	// а не просто констатировать факт расхождения.
+// describeAuthIters печатает группы по-человечески: сообщение обязано называть
+// меньшинство поимённо, а не констатировать факт расхождения.
+func describeAuthIters(groups []authItersGroup) string {
 	var b strings.Builder
 	for i, g := range groups {
 		if i > 0 {
@@ -195,12 +220,13 @@ ORDER BY count(*) DESC, auth_iters`,
 			fmt.Fprintf(&b, "…%q", g.last)
 		}
 	}
-	return fmt.Errorf(
-		"users.auth_iters differs between records (%s): until the AUTH_PARAMS round of M14 the server "+
-			"announces one iteration count in HELLO_OK before it knows the login (§3.3), so users outside "+
-			"the majority cannot authenticate at all; re-run the password reset for them or restore the "+
-			"previous auth.pbkdf2_iters (§6.2 п. 3)",
-		b.String())
+	return b.String()
+}
+
+// querier — общее у *sql.DB и *sql.Tx. Нужен ровно для того, чтобы проверку
+// можно было выполнить и по читающему handle, и внутри открытой транзакции.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
 func verifyServerSecrets(ctx context.Context, r *sql.DB) error {
