@@ -87,6 +87,14 @@ func main() {
 		fatalf("one-shot modes are mutually exclusive, but %s were requested together; run them one at a time",
 			strings.Join(modes, " and "))
 	}
+	// Модификаторы проверяются ЗДЕСЬ ЖЕ, до первой ветки, и по той же причине:
+	// ветка своего режима завершается возвратом, поэтому проверка после неё
+	// срабатывает только когда режим не запрошен вовсе. `--check-config
+	// --overwrite-existing` печатал бы «config OK» и молча игнорировал флаг.
+	//
+	if err := checkModifiers(setFlags(), *addUser, *migrateUsers); err != nil {
+		fatalf("%v", err)
+	}
 
 	// Разовые режимы: проверить конфиг или поправить пользователей — и выйти.
 	if *checkConfig {
@@ -113,9 +121,6 @@ func main() {
 			fatalf("%v", err)
 		}
 		return
-	}
-	if *overwriteEx {
-		fatalf("--overwrite-existing has no meaning without --migrate-users")
 	}
 
 	if err := run(cfg, *configPath); err != nil {
@@ -312,6 +317,42 @@ func requestedModes(checkConfig bool, addUser, resetPw string, migrateOnly bool,
 		}
 	}
 	return modes
+}
+
+// setFlags возвращает имена флагов, заданных в командной строке явно.
+//
+// Именно заданных, а не отличающихся от умолчания: у --role умолчание непустое
+// («user»), и отличить «оператор написал --role user» от «не написал ничего»
+// сравнением значений нельзя.
+func setFlags() map[string]bool {
+	set := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	return set
+}
+
+// checkModifiers отвергает флаги-модификаторы, заданные без своего режима.
+//
+// Молча проигнорированный модификатор — это команда, сделавшая не то, что
+// просили, и отрапортовавшая об успехе: `--migrate-users users.json` без
+// `--overwrite-existing` и с ним — разные операции, и оператор, ошибшийся
+// режимом, обязан узнать об этом, а не получить нулевой код возврата.
+//
+// Набор заданных флагов передаётся аргументом, а не читается из flag.Visit
+// внутри: глобальный набор в тестовом бинарнике содержит флаги самого go test.
+func checkModifiers(set map[string]bool, addUser, migrateUsers string) error {
+	for _, m := range []struct {
+		modifier string
+		mode     string
+		active   bool
+	}{
+		{"overwrite-existing", "--migrate-users", migrateUsers != ""},
+		{"role", "--add-user", addUser != ""},
+	} {
+		if set[m.modifier] && !m.active {
+			return fmt.Errorf("--%s has no meaning without %s", m.modifier, m.mode)
+		}
+	}
+	return nil
 }
 
 // runMigrateUsers переносит users.json в metadata DB и выходит (§21.4).

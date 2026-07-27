@@ -261,3 +261,51 @@ func TestRunMigrateUsersReportsStillBrokenDatabase(t *testing.T) {
 		t.Errorf("в сообщении нет причины: %v", err)
 	}
 }
+
+// TestCheckModifiers — модификатор без своего режима отвергается, и проверка
+// обязана стоять ДО разовых веток: каждая завершается возвратом, поэтому
+// проверка после них срабатывала бы только когда режим не запрошен вовсе, и
+// `--check-config --overwrite-existing` печатал бы «config OK», молча
+// проигнорировав флаг.
+func TestCheckModifiers(t *testing.T) {
+	set := func(names ...string) map[string]bool {
+		m := make(map[string]bool, len(names))
+		for _, n := range names {
+			m[n] = true
+		}
+		return m
+	}
+
+	cases := []struct {
+		why          string
+		set          map[string]bool
+		addUser      string
+		migrateUsers string
+		wantErr      string
+	}{
+		{"ничего не задано", set(), "", "", ""},
+		{"модификатор со своим режимом", set("overwrite-existing"), "", "users.json", ""},
+		{"--role со своим режимом", set("role"), "vit", "", ""},
+		{
+			"--overwrite-existing без --migrate-users",
+			set("overwrite-existing"), "", "", "--overwrite-existing",
+		},
+		{
+			"--overwrite-existing при чужом режиме",
+			set("overwrite-existing"), "vit", "", "--overwrite-existing",
+		},
+		{"--role без --add-user", set("role"), "", "", "--role"},
+		{"--role при чужом режиме", set("role"), "", "users.json", "--role"},
+	}
+	for _, tc := range cases {
+		err := checkModifiers(tc.set, tc.addUser, tc.migrateUsers)
+		switch {
+		case tc.wantErr == "" && err != nil:
+			t.Errorf("%s: %v, ожидалось nil", tc.why, err)
+		case tc.wantErr != "" && err == nil:
+			t.Errorf("%s: nil, ожидалась ошибка про %s", tc.why, tc.wantErr)
+		case tc.wantErr != "" && err != nil && !strings.Contains(err.Error(), tc.wantErr):
+			t.Errorf("%s: в сообщении нет %q: %v", tc.why, tc.wantErr, err)
+		}
+	}
+}
