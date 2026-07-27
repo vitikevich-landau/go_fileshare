@@ -204,11 +204,24 @@ func openMetadataDB(cfg config.Settings) (*db.DB, error) {
 	if !cfg.Database.Enabled {
 		return nil, nil
 	}
-	return db.Open(context.Background(), db.Config{
+	ctx := context.Background()
+	meta, err := db.Open(ctx, db.Config{
 		Path:          cfg.Database.Path,
 		BusyTimeoutMs: cfg.Database.BusyTimeoutMs,
 		Synchronous:   cfg.Database.Synchronous,
 	}, metadata.Migrations(metadata.SeedParams{AuthIters: cfg.Auth.PBKDF2Iters}))
+	if err != nil {
+		return nil, err
+	}
+	// Миграции идемпотентны, поэтому на уже мигрированной базе seed не
+	// выполняется вовсе. Проверка обязательных строк — отдельный шаг, иначе
+	// база с удалённой строкой поднялась бы молча и отказала позже, на первом
+	// запросе (§6.12).
+	if err := metadata.VerifyInvariants(ctx, meta.Reader); err != nil {
+		meta.Close()
+		return nil, err
+	}
+	return meta, nil
 }
 
 // runMigrateOnly применяет миграции и выходит. Разовый режим нужен образу и CI:
