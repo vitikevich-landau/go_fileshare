@@ -75,6 +75,19 @@ func main() {
 		fatalf("config invalid: %s", msg)
 	}
 
+	// Разовые режимы взаимоисключающи, и проверяется это ДО первой ветки.
+	//
+	// Ветки идут цепочкой, каждая заканчивается return, поэтому пара вроде
+	// `--migrate-only --migrate-users users.json` выполнила бы первую и молча
+	// пропустила вторую — с нулевым кодом возврата. Автоматика, которая
+	// переносит учётки одной командой, отрапортовала бы об успешной миграции,
+	// не перенеся ни одного пользователя. Порядок веток при этом ничей
+	// приоритет не выражает: он просто такой, какой есть.
+	if modes := requestedModes(*checkConfig, *addUser, *resetPw, *migrateOnly, *migrateUsers); len(modes) > 1 {
+		fatalf("one-shot modes are mutually exclusive, but %s were requested together; run them one at a time",
+			strings.Join(modes, " and "))
+	}
+
 	// Разовые режимы: проверить конфиг или поправить пользователей — и выйти.
 	if *checkConfig {
 		fmt.Println("config OK")
@@ -259,6 +272,33 @@ func runMigrateOnly(cfg config.Settings) error {
 	return nil
 }
 
+// requestedModes перечисляет запрошенные разовые режимы. Каждый из них
+// заканчивается выходом, поэтому запрошенных одновременно быть не должно.
+//
+// --add-user и --reset-password перечислены раздельно, хотя их обслуживает один
+// runUserAdmin: он выбирает между ними switch'ем и при обоих заданных флагах
+// выполняет только первый — то же молчаливое пропускание, только внутри одной
+// функции. Модификаторы (--role, --overwrite-existing) режимами не являются и
+// сюда не входят.
+func requestedModes(checkConfig bool, addUser, resetPw string, migrateOnly bool, migrateUsers string) []string {
+	var modes []string
+	for _, m := range []struct {
+		name   string
+		active bool
+	}{
+		{"--check-config", checkConfig},
+		{"--add-user", addUser != ""},
+		{"--reset-password", resetPw != ""},
+		{"--migrate-only", migrateOnly},
+		{"--migrate-users", migrateUsers != ""},
+	} {
+		if m.active {
+			modes = append(modes, m.name)
+		}
+	}
+	return modes
+}
+
 // runMigrateUsers переносит users.json в metadata DB и выходит (§21.4).
 //
 // Исходный файл не удаляется и не изменяется: миграция обязана быть повторяемой,
@@ -305,7 +345,15 @@ func runMigrateUsers(cfg config.Settings, path string, overwriteExisting bool) e
 		logins []string
 	}{{"created", report.Created}, {"skipped", report.Skipped}, {"updated", report.Updated}} {
 		for _, login := range group.logins {
-			fmt.Printf("  %-7s %s\n", group.verb, login)
+			// %q, а не %s: логины приходят из чужого файла, и validateLogin
+			// пропускает категорию Cf сознательно — ZWNJ законно встречается в
+			// именах. Но U+202E RIGHT-TO-LEFT OVERRIDE из той же категории,
+			// напечатанный как есть, переворачивает строку прямо в терминале
+			// оператора и прячет соседние записи отчёта. Отказ в регистрации был
+			// бы неверным решением, экранирование при выводе — верное, и это то
+			// самое место вывода. strconv.IsPrint не считает Cf печатаемым,
+			// поэтому %q экранирует его и оставляет кириллицу читаемой.
+			fmt.Printf("  %-7s %q\n", group.verb, login)
 		}
 	}
 	return nil
