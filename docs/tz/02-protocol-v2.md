@@ -46,6 +46,18 @@
 | `AUTH_OK` | `0x13` | S→C | `role:u8` (1=user, 2=admin), `session_id:u64`, `motd:str` |
 | `AUTH_FAIL` | `0x14` | S→C | `reason:u16`, `message:str`; после 3 неудач — разрыв + временный бан IP (настройка) |
 
+Коды `reason` в `AUTH_FAIL` (`internal/proto/proto.go:293-297`; поле служебное,
+решение клиент принимает по нему, а `message` только показывает):
+
+```
+BAD_CREDENTIALS=1 (неверный логин или пароль), USER_DISABLED=2 (учётка
+отключена), BANNED=3 (IP временно забанен гардом), TOO_MANY_SESSIONS=4
+(превышен лимит сессий на пользователя), MALFORMED=5 (некорректный AUTH_REQUEST)
+```
+
+Неизвестный `reason` клиент обязан трактовать как «вход не удался» и показать
+`message`, а не падать.
+
 Состояния соединения: `CONNECTED → HELLO_RECEIVED → AUTHED(role)`.
 До `AUTHED` допускаются только `HELLO`, `AUTH_REQUEST`, `PING`. Таймаут handshake —
 `limits.handshake_timeout_s` (по умолчанию 10 с).
@@ -59,7 +71,7 @@
 | `STAT_REQUEST` | `0x22` | C→S | `path:str` |
 | `STAT_RESPONSE` | `0x23` | S→C | одна запись `DirEntry` |
 | `CHECKSUM_REQUEST` | `0x24` | C→S | `path:str` — checksum считается лениво, поэтому вынесен из листинга |
-| `CHECKSUM_RESPONSE` | `0x25` | S→C | `path:str`, `algo:u8` (1=CRC32, 2=SHA-256), `checksum:32 байта` |
+| `CHECKSUM_RESPONSE` | `0x25` | S→C | `path:str`, `algo:u8` (0=сумма ещё считается, 1=CRC32, 2=SHA-256), `checksum:32 байта` |
 
 Запись `DirEntry`:
 
@@ -91,6 +103,10 @@ name:str · kind:u8 (0=file, 1=dir) · size:u64 · mtime:u64 (unix, сек) · f
 - `DOWNLOAD_ACCEPT` устраняет неловкость v1, где размер был известен только из листинга.
 - Докачка по `offset` — как в v1 (сервер шлёт checksum всего файла; клиент при
   докачке дочитывает локальную часть для инкрементального хэша — логика v1 сохраняется).
+- Отмена — это обмен, а не разрыв: на `DOWNLOAD_CANCEL` сервер завершает поток
+  терминальным `ERROR(CANCELLED)` (§2.6) вместо `DOWNLOAD_DONE`, после чего
+  соединение снова пригодно для следующих запросов. Именно поэтому у передачи
+  ровно два терминальных кадра — `DOWNLOAD_DONE` и `ERROR(*)`.
 
 ### 2.4. События (server push)
 
@@ -118,20 +134,70 @@ name:str · kind:u8 (0=file, 1=dir) · size:u64 · mtime:u64 (unix, сек) · f
 | `ADMIN_GET_CONFIG` | `0x50` | пусто → `ADMIN_CONFIG` `0x51`: `json:str` (текущий эффективный конфиг) |
 | `ADMIN_SET` | `0x52` | `key:str`, `value:str` (JSON-значение) → `ADMIN_SET_RESULT` `0x53`: `ok:u8`, `message:str` |
 | `ADMIN_LIST_CLIENTS` | `0x54` | пусто → `ADMIN_CLIENTS` `0x55`: список сессий (id, login, ip, роль, что качает, байт передано, скорость) |
-| `ADMIN_KICK` | `0x56` | `session_id:u64` → результат |
-| `ADMIN_STATS` | `0x57` | пусто → `ADMIN_STATS_RESPONSE` `0x58`: аптайм, байт отдано, активные/завершённые закачки, соединения, версия, текущие лимиты |
-| `ADMIN_SHUTDOWN` | `0x59` | `grace_seconds:u32` — graceful shutdown с дренажом (логика v1 M5) |
+| `ADMIN_KICK` | `0x56` | `session_id:u64` → `ADMIN_KICK_RESULT` `0x57`: `ok:u8`, `message:str` |
+| `ADMIN_STATS` | `0x58` | пусто → `ADMIN_STATS_RESPONSE` `0x59`: аптайм, байт отдано, активные/завершённые закачки, соединения, версия, текущие лимиты |
+| `ADMIN_SHUTDOWN` | `0x5A` | `grace_seconds:u32` — graceful shutdown с дренажом (логика v1 M5) → `ADMIN_SHUTDOWN_RESULT` `0x5B`: `ok:u8`, `message:str` |
+| `ADMIN_RELOAD_USERS` | `0x5C` | пусто — перечитать `users.json` без перезапуска → `ADMIN_RELOAD_USERS_RESULT` `0x5D`: `ok:u8`, `message:str` |
+
+Коды ответов (`0x57`, `0x59`, `0x5B`, `0x5D`) и пара `ADMIN_RELOAD_USERS`/
+`ADMIN_RELOAD_USERS_RESULT` приведены по реализации
+(`internal/proto/proto.go:85-98`, таблица [09-go-port.md](09-go-port.md) §4.4):
+раньше эта таблица нумеровала `ADMIN_STATS`/`ADMIN_SHUTDOWN` на единицу меньше и
+сталкивала `ADMIN_STATS` с уже занятым `ADMIN_KICK_RESULT = 0x57`. Диапазон
+`0x5A–0x5F` занят и под `ADMIN_USER_*` не выделяется
+([10-cloud-drive-spec.md](10-cloud-drive-spec.md) §26).
 
 ### 2.6. Ошибки
 
-`ERROR` (`0x06`) сохраняется, коды расширяются:
+`ERROR` (`0x06`) сохраняется, payload — `code:u16`, `message:str`. Коды
+расширяются:
 
 ```
 OK=0, FILE_NOT_FOUND=1, UNSUPPORTED_OFFSET=2, BAD_REQUEST=3, INTERNAL_ERROR=4,
 UNSUPPORTED_VERSION=5, AUTH_REQUIRED=6, AUTH_FAILED=7, ACCESS_DENIED=8,
 NOT_A_DIRECTORY=9, IS_A_DIRECTORY=10, RATE_LIMITED=11, SERVER_SHUTTING_DOWN=12,
-QUOTA_EXCEEDED=13 (резерв под M13)
+QUOTA_EXCEEDED=13 (резерв под M13), CANCELLED=14
 ```
+
+Источник истины — `internal/proto/proto.go:233-249`; строковые имена совпадают с
+`ErrCode.String()`. Нумерация заморожена: значение никогда не переиспользуется
+под другой смысл, `0–14` занято v2, `15–99` зарезервировано под будущие коды v2,
+`100` и выше принадлежит протоколу v3
+([10-cloud-drive-spec.md](10-cloud-drive-spec.md) §22.1–§22.2). Клиент обязан
+пережить НЕИЗВЕСТНЫЙ код: показать `message`, считать ошибку неретраебельной и
+не рвать соединение. Массовый путь отправки (`sendErr`,
+`internal/server/conn.go:321-323`) кладёт в `message` само имя кода;
+человекочитаемое пояснение добавляют только места, собирающие `ERROR` вручную.
+
+**`CANCELLED = 14`** (`internal/proto/proto.go:249`) — терминальный кадр
+передачи, отменённой самим клиентом.
+
+- *Когда отправляется.* Только сервером и только по ходу активной закачки,
+  которую клиент попросил прервать `DOWNLOAD_CANCEL` (§2.3) с совпадающим
+  `transfer_id`. Сервер шлёт `ERROR(CANCELLED)` вместо `DOWNLOAD_DONE` в любой
+  точке, где отмена его застала: в цикле отдачи чанков, при пробуждении из
+  ожидания rate-лимитера, при прерванном подсчёте контрольной суммы и даже после
+  подсчёта суммы, но до `DOWNLOAD_DONE`
+  (`internal/server/download.go:97,121,166,182`). Отменённая передача никогда не
+  завершается успешным `DOWNLOAD_DONE`.
+- *Когда НЕ отправляется.* При сворачивании сессии (клиент отпал, idle-reaper,
+  kick, shutdown) стрим просто останавливается — отправлять уже некому.
+  `DOWNLOAD_CANCEL` с чужим или запоздавшим `transfer_id` игнорируется молча,
+  ошибкой на него не отвечают. Отказ на входе (нет файла, offset за пределами,
+  передача уже идёт) несёт свои коды, а не `CANCELLED`.
+- *Что делает клиент.* Трактует кадр как подтверждение отмены, а не как сбой:
+  соединение после него в согласованном состоянии и пригодно для следующих
+  запросов — ради этого код и введён вместо разрыва сокета. Клиент закрывает
+  `.part` и СОХРАНЯЕТ его для последующей докачки, файл на место не
+  переименовывает и об успехе не отчитывается; наружу отдаётся причина отмены (в
+  Go-клиенте — `ctx.Err()`, а не `RemoteError`,
+  `internal/client/client.go:552-560`).
+- *Retryable.* Нет. Код не порождается сбоем сервера, поэтому автоматический
+  повтор запрещён: новую попытку инициирует только пользователь — и это обычная
+  докачка с `offset`, равным размеру сохранённого `.part`.
+- *v3.* Значение сохраняется и для передач v3 (`DOWNLOAD_CANCEL_V3`); в
+  upload-пути v3 код не используется — там на `UPLOAD_CANCEL` отвечают
+  `UPLOAD_CANCEL_OK` ([10-cloud-drive-spec.md](10-cloud-drive-spec.md) §22.4).
 
 ## 3. План реализации протокола
 
