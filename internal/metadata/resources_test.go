@@ -384,3 +384,76 @@ func TestChildByFold(t *testing.T) {
 		t.Errorf("ChildByFold(несуществующее) = %v, want ErrNotFound", err)
 	}
 }
+
+// TestCreateHomeOwnerMustMatchRoot — §6.3 требует, чтобы в namespace home
+// владельцем ресурса был хозяин корня. Внешний ключ этого не ловит: он
+// проверяет лишь существование пользователя.
+//
+// Последствие подмены не косметическое. Физический путь blob — функция от
+// (owner_user_id, id) по §5.1, а квота списывается с владельца (§11.4). Строка
+// в home пользователя A с владельцем B положила бы содержимое под root
+// пользователя B и списала бы его квоту, оставаясь видимой в дереве A.
+func TestCreateHomeOwnerMustMatchRoot(t *testing.T) {
+	ctx := context.Background()
+	d, us, rs := repos(t)
+
+	mk := func(login string) metadata.User {
+		t.Helper()
+		u, err := createUser(t, d, us, newUser(login, domain.RoleUser))
+		if err != nil {
+			t.Fatalf("создать %q: %v", login, err)
+		}
+		return u
+	}
+	alice, bob := mk("alice"), mk("bob")
+
+	aliceHome, err := rs.HomeRoot(ctx, alice.ID)
+	if err != nil {
+		t.Fatalf("HomeRoot(alice): %v", err)
+	}
+
+	if _, err := create(t, d, rs, metadata.NewResource{
+		OwnerUserID: bob.ID, ParentID: aliceHome.ID,
+		Namespace: domain.NamespaceHome, Name: "steal.bin", Kind: domain.KindFile,
+	}, true); err == nil {
+		t.Error("ресурс с чужим owner_user_id принят в home другого пользователя")
+	}
+
+	own, err := create(t, d, rs, metadata.NewResource{
+		OwnerUserID: alice.ID, ParentID: aliceHome.ID,
+		Namespace: domain.NamespaceHome, Name: "own.bin", Kind: domain.KindFile,
+	}, true)
+	if err != nil {
+		t.Fatalf("собственный ресурс отвергнут: %v", err)
+	}
+	if own.OwnerUserID != alice.ID {
+		t.Errorf("owner = %d, want %d", own.OwnerUserID, alice.ID)
+	}
+
+	// Проверка индуктивна: подкаталог наследует то же ограничение.
+	dir, err := create(t, d, rs, metadata.NewResource{
+		OwnerUserID: alice.ID, ParentID: aliceHome.ID,
+		Namespace: domain.NamespaceHome, Name: "sub", Kind: domain.KindDir,
+	}, true)
+	if err != nil {
+		t.Fatalf("подкаталог: %v", err)
+	}
+	if _, err := create(t, d, rs, metadata.NewResource{
+		OwnerUserID: bob.ID, ParentID: dir.ID,
+		Namespace: domain.NamespaceHome, Name: "deep.bin", Kind: domain.KindFile,
+	}, true); err == nil {
+		t.Error("чужой владелец принят на второй уровень home")
+	}
+
+	// В public ограничения нет: владельцем становится создавший ресурс (§6.3).
+	public, err := rs.PublicRoot(ctx)
+	if err != nil {
+		t.Fatalf("PublicRoot: %v", err)
+	}
+	if _, err := create(t, d, rs, metadata.NewResource{
+		OwnerUserID: bob.ID, ParentID: public.ID,
+		Namespace: domain.NamespacePublic, Name: "shared.bin", Kind: domain.KindFile,
+	}, true); err != nil {
+		t.Errorf("ресурс в public с владельцем-создателем отвергнут: %v", err)
+	}
+}

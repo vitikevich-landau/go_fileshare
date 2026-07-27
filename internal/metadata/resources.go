@@ -277,6 +277,28 @@ func (rs *Resources) Create(ctx context.Context, tx *sql.Tx, in NewResource, cas
 		return Resource{}, fmt.Errorf("metadata: create %q: parent %s is in namespace %q, not %q",
 			in.Name, in.ParentID, parent.Namespace, in.Namespace)
 	}
+	// §6.3: «Для namespace = 'home' владелец — хозяин корня». Внешний ключ этого
+	// не ловит — он проверяет лишь существование пользователя.
+	//
+	// Последствие подмены владельца не косметическое. Физический путь blob —
+	// функция от (owner_user_id, id) по §5.1, а квота списывается с владельца
+	// (§11.4). Строка в home пользователя A, помеченная владельцем B, положила бы
+	// содержимое под root пользователя B и списала бы его квоту, оставаясь видимой
+	// в дереве A: это разом и пробой изоляции home (DoD M12), и порча учёта.
+	//
+	// Проверка против НЕПОСРЕДСТВЕННОГО родителя достаточна по индукции: корень
+	// создаётся с владельцем-пользователем, а каждая вставка ниже сверяется с уже
+	// проверенным родителем.
+	//
+	// Для namespace = 'public' ограничения нет сознательно: там владельцем
+	// становится создавший ресурс пользователь (§6.3), и его квота за
+	// public-контент и списывается.
+	if in.Namespace == domain.NamespaceHome && in.OwnerUserID != parent.OwnerUserID {
+		return Resource{}, fmt.Errorf(
+			"metadata: create %q: owner_user_id = %d, but the home tree of %s belongs to user %d; "+
+				"in the home namespace the owner is the owner of the root (§6.3)",
+			in.Name, in.OwnerUserID, in.ParentID, parent.OwnerUserID)
+	}
 
 	var exists int
 	err = tx.QueryRowContext(ctx, `SELECT 1 FROM resources

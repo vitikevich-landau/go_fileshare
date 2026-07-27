@@ -446,3 +446,51 @@ func TestListIncludesSystemAccount(t *testing.T) {
 		t.Errorf("второй записью ожидался frank, получено %+v", list[1])
 	}
 }
+
+// TestSecretStoredKeyLength — stored_key обязан быть ровно SHA256(ClientKey).
+//
+// Схема ширину BLOB не ограничивает, поэтому короткий верификатор лёг бы в базу
+// молча и дал бы пользователя, который не входит ни с каким паролем. Путь
+// импорта эту длину проверял с самого начала, а Create и SetSecret — нет.
+func TestSecretStoredKeyLength(t *testing.T) {
+	ctx := context.Background()
+	d, us, _ := repos(t)
+
+	short := metadata.Secret{
+		KDFAlgo:   domain.KDFPBKDF2SHA256,
+		Salt:      domain.LegacySalt("grace"),
+		StoredKey: []byte{1},
+		AuthIters: testAuthIters,
+	}
+	if _, err := createUser(t, d, us, metadata.NewUser{
+		Login: "grace", Role: domain.RoleUser, Secret: short,
+	}); err == nil {
+		t.Error("Create принял stored_key длиной 1 байт")
+	}
+
+	u, err := createUser(t, d, us, newUser("grace", domain.RoleUser))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := d.Write(ctx, func(tx *sql.Tx) error {
+		return us.SetSecret(ctx, tx, u.ID, short)
+	}); err == nil {
+		t.Error("SetSecret принял stored_key длиной 1 байт")
+	}
+
+	long := short
+	long.StoredKey = make([]byte, metadata.StoredKeyLen+1)
+	if err := d.Write(ctx, func(tx *sql.Tx) error {
+		return us.SetSecret(ctx, tx, u.ID, long)
+	}); err == nil {
+		t.Error("SetSecret принял stored_key длиннее нужного")
+	}
+
+	got, err := us.ByID(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("ByID: %v", err)
+	}
+	if len(got.Secret.StoredKey) != metadata.StoredKeyLen {
+		t.Errorf("len(stored_key) = %d, want %d", len(got.Secret.StoredKey), metadata.StoredKeyLen)
+	}
+}

@@ -14,22 +14,17 @@ import (
 	"github.com/vitikevich-landau/go_fileshare/internal/domain"
 )
 
-// storedKeyLen — длина StoredKey в байтах: это SHA256(ClientKey).
-//
-// Значение продублировано из proto.ChecksumLen сознательно: §4.3 п. 1 запрещает
-// metadata импортировать proto. Разъезд поймает первый же импорт реального
-// users.json — там лежат ровно 64 hex-символа.
-const storedKeyLen = 32
-
 // legacyFile — формат users.json (`{"users": [...]}`), из которого §21.4 берёт
 // пользователей.
 //
 // Структура объявлена здесь, а не переиспользована из internal/auth, по той же
-// причине, что и storedKeyLen: auth импортирует proto. Формат заморожен — это
+// причине, что и StoredKeyLen: auth импортирует proto. Формат заморожен — это
 // вход одноразовой миграции, а не живая модель, — поэтому дублирование четырёх
 // полей дешевле нарушения правила зависимостей.
 type legacyFile struct {
-	Users []legacyRecord `json:"users"`
+	// Указатель, чтобы отличить ОТСУТСТВУЮЩИЙ ключ от пустого массива: у
+	// значения-слайса оба случая дают nil.
+	Users *[]legacyRecord `json:"users"`
 }
 
 type legacyRecord struct {
@@ -143,14 +138,14 @@ func importOne(ctx context.Context, tx *sql.Tx, us *Users, rec legacyRecord, opt
 	// посчитан её stored_key, а конфиг с тех пор мог смениться. Взяв конфиг за
 	// истину, повторный запуск сломал бы вход тем, кого он не менял.
 	diff := diffFields(want, role, state, kdfAlgo, salt, storedKey)
-	if len(diff) == 0 {
+	if len(diff.fields) == 0 {
 		return actionSkipped, nil
 	}
 	if !opts.OverwriteExisting {
 		return 0, fmt.Errorf(
 			"metadata: import user %q: the database already holds this login with different data (%s); "+
 				"re-run with --overwrite-existing to replace the record with the values from the JSON (§21.4)",
-			rec.Login, strings.Join(diff, ", "))
+			rec.Login, strings.Join(diff.fields, ", "))
 	}
 
 	id, err := userIDByLogin(ctx, tx, rec.Login)
@@ -163,35 +158,55 @@ func importOne(ctx context.Context, tx *sql.Tx, us *Users, rec legacyRecord, opt
 	if err := us.SetState(ctx, tx, id, want.State); err != nil {
 		return 0, err
 	}
-	if err := us.SetSecret(ctx, tx, id, want.Secret); err != nil {
-		return 0, err
+	// Секрет переписывается ТОЛЬКО когда он и правда изменился. Иначе
+	// перезапись роли или состояния протащила бы в запись auth_iters из
+	// сегодняшнего конфига, оставив прежний stored_key, — то есть ровно то
+	// расхождение, ради недопущения которого auth_iters исключён из сверки
+	// выше. Пользователь после этого не вошёл бы вовсе, а следующий старт
+	// демона упёрся бы в проверку §6.2 п. 3.
+	if diff.secret {
+		if err := us.SetSecret(ctx, tx, id, want.Secret); err != nil {
+			return 0, err
+		}
 	}
 	return actionUpdated, nil
 }
 
-// diffFields перечисляет РАЗЛИЧАЮЩИЕСЯ поля по-человечески: §21.4 требует
-// «понятной ошибки с указанием логина и различающихся полей», а не констатации
-// факта расхождения. Значения secret в сообщение не попадают: stored_key — это
-// верификатор пароля, и его место не в логе оператора.
-func diffFields(want NewUser, role, state, kdfAlgo string, salt, storedKey []byte) []string {
-	var diff []string
+// recordDiff — что именно разошлось между записью в БД и записью в файле.
+type recordDiff struct {
+	// fields перечисляет расхождения по-человечески: §21.4 требует «понятной
+	// ошибки с указанием логина и различающихся полей», а не констатации факта.
+	fields []string
+	// secret сообщает, что разошлось хотя бы одно поле KDF-материала. От него
+	// зависит, трогать ли auth_iters.
+	secret bool
+}
+
+// diffFields сравнивает запись файла с записью БД. Значения секрета в
+// сообщение не попадают: stored_key — это верификатор пароля, и его место не в
+// логе оператора.
+func diffFields(want NewUser, role, state, kdfAlgo string, salt, storedKey []byte) recordDiff {
+	var d recordDiff
 	if role != string(want.Role) {
-		diff = append(diff, fmt.Sprintf("role: %q in the database, %q in the JSON", role, want.Role))
+		d.fields = append(d.fields, fmt.Sprintf("role: %q in the database, %q in the JSON", role, want.Role))
 	}
 	if state != string(want.State) {
-		diff = append(diff, fmt.Sprintf("state: %q in the database, %q in the JSON", state, want.State))
+		d.fields = append(d.fields, fmt.Sprintf("state: %q in the database, %q in the JSON", state, want.State))
 	}
 	if kdfAlgo != string(want.Secret.KDFAlgo) {
-		diff = append(diff, fmt.Sprintf("kdf_algo: %q in the database, %q in the JSON",
+		d.fields = append(d.fields, fmt.Sprintf("kdf_algo: %q in the database, %q in the JSON",
 			kdfAlgo, want.Secret.KDFAlgo))
+		d.secret = true
 	}
 	if string(salt) != string(want.Secret.Salt) {
-		diff = append(diff, "salt")
+		d.fields = append(d.fields, "salt")
+		d.secret = true
 	}
 	if string(storedKey) != string(want.Secret.StoredKey) {
-		diff = append(diff, "stored_key")
+		d.fields = append(d.fields, "stored_key")
+		d.secret = true
 	}
-	return diff
+	return d
 }
 
 func userIDByLogin(ctx context.Context, tx *sql.Tx, login string) (domain.UserID, error) {
@@ -240,9 +255,19 @@ func parseLegacyUsers(data []byte) ([]legacyRecord, error) {
 	if err := json.Unmarshal(data, &ff); err != nil {
 		return nil, fmt.Errorf("metadata: parse users.json: %w", err)
 	}
+	// Отсутствие ключа `users` — ошибка, а не пустой файл. Опечатка вроде
+	// `{"user":[…]}` разбирается без единой жалобы и даёт ноль записей, то есть
+	// одноразовая миграция отрапортовала бы об успехе и оставила базу пустой.
+	// Осознанно пустой массив при этом остаётся законным: `auth.Save` пишет
+	// `{"users":[]}`, когда пользователей не осталось.
+	if ff.Users == nil {
+		return nil, errors.New(`metadata: parse users.json: no top-level "users" array; ` +
+			`an empty import is spelled {"users": []}`)
+	}
 
-	seen := make(map[string]int, len(ff.Users))
-	for i, rec := range ff.Users {
+	users := *ff.Users
+	seen := make(map[string]int, len(users))
+	for i, rec := range users {
 		where := fmt.Sprintf("users[%d]", i)
 		if err := validateLogin(rec.Login); err != nil {
 			return nil, fmt.Errorf("metadata: parse users.json: %s: %w", where, err)
@@ -268,11 +293,11 @@ func parseLegacyUsers(data []byte) ([]legacyRecord, error) {
 			return nil, fmt.Errorf("metadata: parse users.json: %s (login %q): stored_key is not hex: %w",
 				where, rec.Login, err)
 		}
-		if len(raw) != storedKeyLen {
+		if len(raw) != StoredKeyLen {
 			return nil, fmt.Errorf(
 				"metadata: parse users.json: %s (login %q): stored_key is %d bytes, want %d",
-				where, rec.Login, len(raw), storedKeyLen)
+				where, rec.Login, len(raw), StoredKeyLen)
 		}
 	}
-	return ff.Users, nil
+	return users, nil
 }

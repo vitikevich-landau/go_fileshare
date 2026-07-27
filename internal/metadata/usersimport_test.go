@@ -326,3 +326,113 @@ func TestImportRequiresAuthIters(t *testing.T) {
 		t.Fatal("импорт с auth_iters = 0 принят")
 	}
 }
+
+// TestImportOverwriteKeepsAuthItersWhenSecretUnchanged — перезапись роли или
+// состояния НЕ трогает auth_iters, если сам секрет не изменился.
+//
+// Иначе перезапись протащила бы в запись значение из сегодняшнего конфига,
+// оставив прежний stored_key: пользователь не вошёл бы вовсе, а следующий старт
+// демона упёрся бы в сверку §6.2 п. 3. Это ровно то расхождение, ради
+// недопущения которого auth_iters исключён из перечня полей сверки.
+func TestImportOverwriteKeepsAuthItersWhenSecretUnchanged(t *testing.T) {
+	ctx := context.Background()
+	d, us, _ := repos(t)
+
+	if _, err := metadata.ImportUsers(ctx, d, us,
+		usersJSON(rec("alice", "user", keyHex(1), true)), importOpts()); err != nil {
+		t.Fatalf("подготовка: %v", err)
+	}
+
+	// Конфиг сменился, а в файле у alice поменялась только роль.
+	opts := metadata.ImportOptions{AuthIters: testAuthIters * 2, OverwriteExisting: true}
+	report, err := metadata.ImportUsers(ctx, d, us,
+		usersJSON(rec("alice", "admin", keyHex(1), true)), opts)
+	if err != nil {
+		t.Fatalf("перезапись роли: %v", err)
+	}
+	if len(report.Updated) != 1 {
+		t.Fatalf("Updated = %v, ожидалась alice", report.Updated)
+	}
+
+	alice, err := us.ByLogin(ctx, "alice")
+	if err != nil {
+		t.Fatalf("ByLogin: %v", err)
+	}
+	if alice.Role != domain.RoleAdmin {
+		t.Errorf("role = %q, want admin: перезапись не применилась", alice.Role)
+	}
+	if alice.Secret.AuthIters != testAuthIters {
+		t.Errorf("auth_iters = %d, ожидалось прежнее %d: stored_key не менялся",
+			alice.Secret.AuthIters, testAuthIters)
+	}
+	// И база остаётся пригодной к старту: сверка §6.2 п. 3 не должна сработать.
+	if err := metadata.VerifyInvariants(ctx, d.Reader); err != nil {
+		t.Errorf("после перезаписи база не проходит инварианты: %v", err)
+	}
+}
+
+// TestImportOverwriteUpdatesAuthItersWithSecret — а когда меняется сам секрет,
+// auth_iters берётся из конфига: новый stored_key посчитан именно с ним.
+func TestImportOverwriteUpdatesAuthItersWithSecret(t *testing.T) {
+	ctx := context.Background()
+	d, us, _ := repos(t)
+
+	if _, err := metadata.ImportUsers(ctx, d, us,
+		usersJSON(rec("alice", "user", keyHex(1), true)), importOpts()); err != nil {
+		t.Fatalf("подготовка: %v", err)
+	}
+
+	const raised = testAuthIters * 2
+	opts := metadata.ImportOptions{AuthIters: raised, OverwriteExisting: true}
+	if _, err := metadata.ImportUsers(ctx, d, us,
+		usersJSON(rec("alice", "user", keyHex(9), true)), opts); err != nil {
+		t.Fatalf("перезапись секрета: %v", err)
+	}
+
+	alice, err := us.ByLogin(ctx, "alice")
+	if err != nil {
+		t.Fatalf("ByLogin: %v", err)
+	}
+	if hex.EncodeToString(alice.Secret.StoredKey) != keyHex(9) {
+		t.Error("stored_key не перезаписан")
+	}
+	if alice.Secret.AuthIters != raised {
+		t.Errorf("auth_iters = %d, want %d: новый stored_key посчитан с ним",
+			alice.Secret.AuthIters, raised)
+	}
+}
+
+// TestImportRequiresUsersArray — отсутствие ключа users прерывает миграцию.
+//
+// Опечатка в имени ключа разбирается без единой жалобы и даёт ноль записей:
+// одноразовая миграция отрапортовала бы об успехе и оставила базу пустой.
+func TestImportRequiresUsersArray(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct{ why, body string }{
+		{"опечатка в имени ключа", `{"user":[]}`},
+		{"ключа нет вовсе", `{}`},
+		{"users равен null", `{"users":null}`},
+	} {
+		d, us, _ := repos(t)
+		_, err := metadata.ImportUsers(ctx, d, us, []byte(tc.body), importOpts())
+		if err == nil {
+			t.Errorf("%s: импорт принят молча", tc.why)
+			continue
+		}
+		if !strings.Contains(err.Error(), "users") {
+			t.Errorf("%s: в сообщении нет упоминания ключа: %v", tc.why, err)
+		}
+	}
+
+	// Осознанно пустой массив остаётся законным: именно так auth.Save пишет
+	// файл, когда пользователей не осталось.
+	d, us, _ := repos(t)
+	report, err := metadata.ImportUsers(ctx, d, us, []byte(`{"users":[]}`), importOpts())
+	if err != nil {
+		t.Fatalf("пустой массив отклонён: %v", err)
+	}
+	if len(report.Created)+len(report.Skipped)+len(report.Updated) != 0 {
+		t.Errorf("пустой массив что-то изменил: %+v", report)
+	}
+}

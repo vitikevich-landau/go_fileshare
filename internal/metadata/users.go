@@ -64,6 +64,14 @@ type User struct {
 // proof.
 func (u User) IsSystem() bool { return u.ID == domain.SystemUserID }
 
+// StoredKeyLen — длина stored_key в байтах. §6.2 определяет колонку как
+// SHA256(ClientKey), и это верно при ЛЮБОМ kdf_algo: алгоритм влияет на то, как
+// из пароля выводится SaltedPassword, а не на ширину итогового хэша.
+//
+// Значение продублировано из proto.ChecksumLen сознательно: §4.3 п. 1 запрещает
+// metadata импортировать proto.
+const StoredKeyLen = 32
+
 // Secret — KDF-материал пользователя: колонки kdf_algo, salt, stored_key,
 // auth_iters и kdf_params (§6.2).
 type Secret struct {
@@ -405,8 +413,12 @@ func validateSecret(s Secret) error {
 	if len(s.Salt) == 0 {
 		return errors.New("salt is empty (§6.2)")
 	}
-	if len(s.StoredKey) == 0 {
-		return errors.New("stored_key is empty (§6.2)")
+	// Длина проверяется точно, а не «не пусто»: схема ширину BLOB не
+	// ограничивает, поэтому короткий верификатор лёг бы в базу молча и дал бы
+	// пользователя, который не входит ни с каким паролем.
+	if len(s.StoredKey) != StoredKeyLen {
+		return fmt.Errorf("stored_key is %d bytes, want %d: the column is SHA256(ClientKey) (§6.2)",
+			len(s.StoredKey), StoredKeyLen)
 	}
 	switch s.KDFAlgo {
 	case domain.KDFPBKDF2SHA256:
