@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -433,5 +435,78 @@ func TestReaderRequiresExistingDatabase(t *testing.T) {
 	cfg := testConfig(t)
 	if _, err := openReader(context.Background(), cfg); err == nil {
 		t.Fatal("reader opened a database that does not exist")
+	}
+}
+
+// TestDatabaseFilesArePrivate — metadata.db хранит верификаторы паролей
+// (users.stored_key) и ключевой материал server_secrets (§6.12), поэтому файл
+// не должен создаваться доступным на чтение группе и остальным. Сам SQLite
+// создаёт базу режимом 0644 под umask процесса, то есть при обычном umask 022 —
+// читаемой всем; в Docker это ещё и bind-mount каталога /data на хост.
+//
+// -wal и -shm проверяются отдельно: SQLite создаёт журнальные файлы с режимом
+// самого файла БД, и это свойство здесь фиксируется, а не предполагается.
+func TestDatabaseFilesArePrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("на Windows режим файла в POSIX-смысле не выражается: доступ задаётся ACL")
+	}
+	cfg := testConfig(t)
+	d := openScratch(t, cfg)
+
+	// Записываем, чтобы -wal и -shm гарантированно существовали к моменту
+	// проверки: соединения ещё открыты, поэтому checkpoint их не удалит.
+	if _, err := d.Writer.ExecContext(context.Background(),
+		`INSERT INTO items (name, seq_ms) VALUES ('perm', 0)`); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	fi, err := os.Stat(cfg.Path)
+	if err != nil {
+		t.Fatalf("stat database: %v", err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Errorf("%s mode = %#o, want 0600", cfg.Path, got)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		path := cfg.Path + suffix
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Errorf("stat %s: %v", path, err)
+			continue
+		}
+		if got := fi.Mode().Perm(); got&0o077 != 0 {
+			t.Errorf("%s mode = %#o, want no group/other access", path, got)
+		}
+	}
+}
+
+// TestExistingDatabaseKeepsItsMode — режим существующего файла остаётся
+// решением оператора: молча ужесточать его при обновлении значило бы ломать
+// работающую установку, где к базе намеренно допущена группа.
+func TestExistingDatabaseKeepsItsMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("на Windows режим файла в POSIX-смысле не выражается")
+	}
+	cfg := testConfig(t)
+	d := openScratch(t, cfg)
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := os.Chmod(cfg.Path, 0o640); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	reopened, err := Open(context.Background(), cfg, []Migration{scratchSchema})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	fi, err := os.Stat(cfg.Path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got := fi.Mode().Perm(); got != 0o640 {
+		t.Errorf("mode = %#o after reopen, want the operator's 0640", got)
 	}
 }

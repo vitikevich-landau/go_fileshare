@@ -25,6 +25,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -79,6 +80,9 @@ func Open(ctx context.Context, cfg Config, migrations []Migration) (*DB, error) 
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			return nil, fmt.Errorf("db: create directory for %s: %w", cfg.Path, err)
 		}
+	}
+	if err := ensurePrivateFile(cfg.Path); err != nil {
+		return nil, err
 	}
 
 	writer, err := openWriter(ctx, cfg)
@@ -176,6 +180,42 @@ func (c Config) readConns() int {
 		return n
 	}
 	return 4
+}
+
+// ensurePrivateFile создаёт файл БД пустым и с правами 0600 ДО того, как его
+// создаст драйвер.
+//
+// Сам SQLite создаёт базу с режимом 0644, урезанным umask процесса, то есть при
+// обычном umask 022 — доступной на чтение всем. В metadata.db лежат
+// `users.stored_key` (верификаторы паролей) и `server_secrets` (ключ подписи
+// page token и корень серверных HMAC, §6.12), поэтому мировое чтение — это
+// раздача ключевого материала локальным пользователям хоста, а в Docker ещё и
+// через bind-mount каталога /data.
+//
+// Права распространяются на -wal и -shm без дополнительных действий: SQLite
+// создаёт журнальные файлы с режимом самого файла БД, а не с собственным
+// умолчанием.
+//
+// Существующий файл НЕ трогается: его режим — решение оператора (например,
+// группа для процесса backup), и молча его ужесточать значило бы ломать
+// работающую установку при обновлении.
+//
+// На Windows режим файла в POSIX-смысле не выражается: Go отображает его лишь в
+// флаг «только чтение», а разграничение доступа задаётся ACL. Вызов остаётся
+// безвредным, а защита там обеспечивается правами каталога данных.
+func ensurePrivateFile(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, fs.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("db: create %s: %w", path, err)
+	}
+	// Нулевой длины файл — валидная пустая база SQLite; миграции наполнят её.
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("db: create %s: %w", path, err)
+	}
+	return nil
 }
 
 func openWriter(ctx context.Context, cfg Config) (*sql.DB, error) {
