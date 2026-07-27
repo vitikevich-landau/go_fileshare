@@ -1794,7 +1794,7 @@ CREATE TABLE uploads (
     target_parent_id       TEXT NOT NULL,
     target_name            TEXT NOT NULL,
     target_name_fold       TEXT NOT NULL,
-    expected_size          INTEGER NOT NULL,
+    expected_size_bytes    INTEGER NOT NULL,
     expected_checksum_algo TEXT NOT NULL
                                CHECK (expected_checksum_algo IN ('crc32','sha256')),
     expected_checksum      BLOB NOT NULL,
@@ -1814,7 +1814,7 @@ CREATE TABLE uploads (
     FOREIGN KEY(user_id)          REFERENCES users(id)     ON DELETE RESTRICT,
     FOREIGN KEY(target_parent_id) REFERENCES resources(id) ON DELETE RESTRICT,
     CHECK (synced_bytes <= received_bytes),
-    CHECK (received_bytes <= expected_size)
+    CHECK (received_bytes <= expected_size_bytes)
 ) STRICT;
 
 CREATE UNIQUE INDEX uploads_client_key
@@ -1826,16 +1826,33 @@ CREATE UNIQUE INDEX uploads_active_target
     WHERE state IN ('created','receiving','verifying','committing');
 
 CREATE INDEX uploads_expiry ON uploads(state, expires_at_ms);
+
+CREATE INDEX uploads_retention ON uploads(state, updated_at_ms);
 ```
 
-Допустимые states:
+Допустимые переходы (перечень исчерпывающий; §21 п. 6 тестирует именно его):
 
 ```text
+happy path:
 created -> receiving -> verifying -> committing -> completed
-                  \-> cancelled
-                  \-> failed
-                  \-> expired
+
+обратные переходы:
+verifying  -> receiving   размер staging меньше expected_size_bytes,
+                          OFFSET_MISMATCH (§8.4)
+verifying  -> receiving   после рестарта живого recovery marker нет (§5.5)
+committing -> receiving   после рестарта живого recovery marker нет (§5.5)
+
+из ЛЮБОГО нетерминального состояния
+(created, receiving, verifying, committing):
+-> cancelled   UPLOAD_CANCEL (§8.5)
+-> expired     cleaner по TTL (§8.5)
+-> failed      checksum mismatch (§8.4); отсутствующий staging (§21.3)
 ```
+
+`completed`, `cancelled`, `failed` и `expired` терминальны и необратимы. Прежняя
+редакция этого блока рисовала только happy path и уводила `cancelled`/`failed`/
+`expired` из одного `receiving`, из-за чего переходы, которых требуют §5.5, §8.4
+и §21.3, формально оказывались запрещены.
 
 `client_upload_key` — прямое отражение `ClientUploadKey` из §8.1: 16 байт,
 сгенерированных клиентом. Правила:
@@ -1892,10 +1909,13 @@ staging-файла с периодичностью `uploads.checkpoint_bytes` и
 staging-каталога, а строка `uploads` обязана пережить её изменение и остаться
 пригодной для cleaner и для `fsck`.
 
-`uploads_expiry` — индекс под cleaner §8.5 и под удаление терминальных строк:
-записи в состояниях `completed`/`cancelled`/`failed`/`expired` удаляются
-cleaner'ом по истечении `uploads.ttl_hours` от `updated_at_ms`. Без этого индекса
-обе задачи вырождаются в full scan таблицы, которая растёт с каждой загрузкой.
+`uploads_expiry` — индекс под cleaner §8.5: он ищет нетерминальные загрузки с
+истёкшим `expires_at_ms`. `uploads_retention` — индекс под удаление терминальных
+строк: записи в состояниях `completed`/`cancelled`/`failed`/`expired` удаляются
+cleaner'ом по истечении `uploads.ttl_hours` от `updated_at_ms`. Индексов именно
+два, потому что задачи фильтруют по разным колонкам: `uploads_expiry` не
+покрывает предикат по `updated_at_ms` и на второй задаче выродился бы в скан
+всех терминальных строк, а таблица растёт с каждой загрузкой.
 
 `target_parent_id` защищён внешним ключом: загрузка не может ссылаться на
 несуществующий каталог, а `RESTRICT` не даёт purge удалить каталог, в который
@@ -2791,7 +2811,7 @@ staging за этой границей truncate-ится до ответа кл�
 Проверка на Begin:
 
 ```text
-reservation := expected_size
+reservation := expected_size_bytes
 QUOTA_EXCEEDED, если quota_bytes != 0 и
     used_bytes + reserved_bytes + reservation > quota_bytes
 ```
@@ -2800,7 +2820,7 @@ QUOTA_EXCEEDED, если quota_bytes != 0 и
 резервирование под сохраняемую предыдущую ревизию: `old_size` уже учтён в
 `used_bytes` как текущее содержимое, и при overwrite он там и остаётся, перейдя
 в version blob. Тем самым проверяется, что квоты хватает на новый файл ВМЕСТЕ с
-сохраняемой версией (`old_size + expected_size`), а не только на новый файл.
+сохраняемой версией (`old_size + expected_size_bytes`), а не только на новый файл.
 
 Из этого следуют два обязательных правила:
 
@@ -2809,7 +2829,7 @@ QUOTA_EXCEEDED, если quota_bytes != 0 и
   байт. Молча отказаться от создания версии запрещено: это тихая потеря
   предыдущего содержимого (раздел 29, п. 11);
 - при `versions.enabled = false` старое содержимое не сохраняется, но резерв
-  всё равно равен `expected_size`, и `old_size` вычитается только в
+  всё равно равен `expected_size_bytes`, и `old_size` вычитается только в
   commit-транзакции. Занижать резерв на `old_size` запрещено: два параллельных
   overwrite одного файла иначе превысили бы квоту, нарушив инвариант 8.
 
@@ -2894,7 +2914,7 @@ type UploadChunk struct {
   `uploads.user_id` не совпадает с UserID сессии. Ответ не различает «чужой» и
   «несуществующий» upload;
 - `Offset` должен быть равен текущему `received_bytes`; иначе `OFFSET_MISMATCH`;
-- запись за пределы `expected_size` отвергается `BAD_REQUEST`;
+- запись за пределы `expected_size_bytes` отвергается `BAD_REQUEST`;
 - размер data не превышает negotiated ChunkSize;
 - после записи chunk staging-файл не обязан fsync-иться каждый раз;
 - сервер обязан вызвать `Sync()` staging-файла не реже, чем каждые
@@ -2965,7 +2985,7 @@ type UploadStatus struct {
 2. переводит state в `verifying` compare-and-swap update из `receiving`; любое
    другое состояние даёт `UPLOAD_NOT_FOUND` или `UPLOAD_EXPIRED`;
 3. выполняет `Sync()` staging-файла и проверяет фактический размер: меньше
-   `expected_size` — `OFFSET_MISMATCH`, upload возвращается в `receiving` и
+   `expected_size_bytes` — `OFFSET_MISMATCH`, upload возвращается в `receiving` и
    остаётся возобновляемым;
 4. вычисляет checksum с context cancellation — вне транзакции и без keyed lock
    (раздел 23.2);
@@ -2982,7 +3002,7 @@ type UploadStatus struct {
    транзакции, раздел 5.4) и выполняет одну transaction:
    - upsert resource;
    - increment revision;
-   - `used_bytes += expected_size`;
+   - `used_bytes += expected_size_bytes`;
    - `used_bytes -= old_size`, ТОЛЬКО если version не создаётся (цель
      существовала, а `versions.enabled = false`); если version создан, старый
      размер остаётся учтённым, так как перешёл в version blob;
