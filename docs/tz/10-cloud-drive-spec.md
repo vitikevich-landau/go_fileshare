@@ -2208,7 +2208,8 @@ CREATE TABLE blob_gc (
     size_bytes         INTEGER NOT NULL,
     owner_user_id      INTEGER,
     reason             TEXT NOT NULL CHECK (reason IN ('purge','version_expired',
-                                                       'upload_expired','fsck')),
+                                                       'upload_expired','fsck',
+                                                       'overwrite_source')),
     enqueued_at_ms     INTEGER NOT NULL,
     next_attempt_at_ms INTEGER NOT NULL,
     attempts           INTEGER NOT NULL DEFAULT 0,
@@ -3293,8 +3294,11 @@ Restore — точная обратная операция к §10.1 и выпо
    содержимое цели получает строку в `versions`, а ResourceID восстанавливаемого
    ресурса перестаёт существовать — шаги 4–5 к нему не применяются, его строка
    удаляется вместе с trash-записью, и клиент видит одну запись `update`, а не
-   пару delete+create. Затирание непустого каталога запрещено так же, как при
-   MOVE (§9.3);
+   пару delete+create. Вместе с этой строкой каскадно исчезает история версий
+   восстанавливаемого ресурса, поэтому дельта `used_bytes` считается по формуле
+   §11.4 (строки `restore из корзины поверх существующего`), а blob его версий
+   ставятся в `blob_gc` с `reason = 'overwrite_source'`. Затирание непустого
+   каталога запрещено так же, как при MOVE (§9.3);
 4. корень поддерева получает `parent_id := <целевой каталог>`,
    `name := <целевое имя>`, `deleted_at_ms := NULL`, `trashed_root_id := NULL`;
 5. все потомки одним рекурсивным UPDATE по `trashed_root_id` получают
@@ -3498,22 +3502,35 @@ upload commit, overwrite, versions=false     used += new_size - old_size
 copy в свободное имя                         used += size копии
 copy overwrite, versions=true                used += size копии        (содержимое цели перешло в versions)
 copy overwrite, versions=false               used += size копии - old_size цели
-move в пределах одного владельца             без изменений
+move в свободное имя (один владелец)         без изменений
 move overwrite (один владелец),
-                        versions=true        без изменений             (содержимое цели перешло в versions)
+                        versions=true        used -= V(источник)       (содержимое цели перешло в versions)
 move overwrite (один владелец),
-                        versions=false       used -= old_size цели
+                        versions=false       used -= old_size цели + V(источник)
 delete в корзину                             без изменений
 restore из корзины в свободное имя           без изменений
 restore из корзины поверх существующего,
-                        versions=true        без изменений             (содержимое цели перешло в versions)
+                        versions=true        used -= V(источник)       (содержимое цели перешло в versions)
 restore из корзины поверх существующего,
-                        versions=false       used -= old_size цели
+                        versions=false       used -= old_size цели + V(источник)
 purge поддерева                              used -= (current content поддерева + все его версии)
 VERSION_DELETE / version cleaner             used -= version.size_bytes
 VERSION_RESTORE                              used += size восстановленной версии
 user delete --purge                          used обнуляется вместе с записью пользователя
 ```
+
+`V(источник)` — сумма `versions.size_bytes` по всем версиям **источника**
+операции: `SUM(versions.size_bytes) WHERE resource_id = <ResourceID источника>`.
+Величина входит в дельту потому, что при overwrite ResourceID источника
+перестаёт существовать вместе со своей строкой в `resources` (§9.3, §10.2), а
+`versions` ссылается на неё `ON DELETE CASCADE` (§6.5) — история версий
+источника исчезает в той же транзакции. Перенести её на цель нельзя: PK
+`(resource_id, revision)` столкнулся бы с ревизиями цели. Поэтому операция
+обязана, по общему правилу §6.5 и §6.11, до `DELETE` прочитать список версий
+источника, поставить их blob в очередь `blob_gc` с `reason = 'overwrite_source'`
+(§6.10) и уменьшить `used_bytes` на `V(источник)` — всё в одной транзакции.
+Для источника без истории версий `V(источник) = 0`, и строки таблицы
+вырождаются в прежние «без изменений» и «`used -= old_size` цели».
 
 Строки таблицы дают дельту, зафиксированную коммитом. Там, где содержимое,
 затираемое при overwrite, уже было учтено за тем же владельцем (move из его же
