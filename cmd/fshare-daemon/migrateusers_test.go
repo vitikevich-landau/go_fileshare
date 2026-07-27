@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"io"
 	"os"
 	"path/filepath"
@@ -169,4 +170,94 @@ func captureStdout(t *testing.T, fn func()) string {
 	w.Close()
 	os.Stdout = saved
 	return <-done
+}
+
+// TestRunMigrateUsersRepairsBrokenDatabase — команда обязана открывать базу,
+// НЕ прошедшую проверку инвариантов.
+//
+// Иначе единственный способ свести разъехавшиеся auth_iters (перезапись всех
+// секретов, §6.2 п. 3) недостижим: openMetadataDB отказал бы до импорта, и
+// сообщение об ошибке отсылало бы к операции, которую нельзя выполнить.
+func TestRunMigrateUsersRepairsBrokenDatabase(t *testing.T) {
+	cfg := daemonConfig(t)
+	body := `{"users":[` +
+		`{"login":"root","role":"admin","stored_key":"` + strings.Repeat("a", 64) + `","enabled":true},` +
+		`{"login":"bob","role":"user","stored_key":"` + strings.Repeat("b", 64) + `","enabled":true}]}`
+	if err := runMigrateUsers(cfg, writeUsersFile(t, body), false); err != nil {
+		t.Fatalf("подготовка: %v", err)
+	}
+
+	// Разводим auth_iters руками — ни один путь репозитория этого больше не
+	// делает, так расхождение и появляется в жизни.
+	meta, err := openMetadataDBForMaintenance(cfg)
+	if err != nil {
+		t.Fatalf("открыть базу: %v", err)
+	}
+	err = meta.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(context.Background(),
+			`UPDATE users SET auth_iters = 111 WHERE login = ?`, "bob")
+		return err
+	})
+	if err != nil {
+		t.Fatalf("развести auth_iters: %v", err)
+	}
+	brokenErr := metadata.VerifyInvariants(context.Background(), meta.Reader)
+	meta.Close()
+	if brokenErr == nil {
+		t.Fatal("подготовка теста: база с разными auth_iters проходит проверку")
+	}
+
+	// Обычный старт такую базу не берёт.
+	if serving, err := openMetadataDB(cfg); err == nil {
+		serving.Close()
+		t.Error("openMetadataDB принял базу, не прошедшую проверку")
+	}
+
+	// А починка через перезапись всех секретов проходит.
+	fresh := `{"users":[` +
+		`{"login":"root","role":"admin","stored_key":"` + strings.Repeat("c", 64) + `","enabled":true},` +
+		`{"login":"bob","role":"user","stored_key":"` + strings.Repeat("d", 64) + `","enabled":true}]}`
+	if err := runMigrateUsers(cfg, writeUsersFile(t, fresh), true); err != nil {
+		t.Fatalf("починка через --overwrite-existing отклонена: %v", err)
+	}
+	serving, err := openMetadataDB(cfg)
+	if err != nil {
+		t.Fatalf("после починки база по-прежнему не открывается: %v", err)
+	}
+	serving.Close()
+}
+
+// TestRunMigrateUsersReportsStillBrokenDatabase — если после импорта база всё
+// ещё не проходит проверку, команда обязана сказать об этом и завершиться
+// ненулевым кодом: импорт зафиксирован, но работа не закончена.
+func TestRunMigrateUsersReportsStillBrokenDatabase(t *testing.T) {
+	cfg := daemonConfig(t)
+	if err := runMigrateUsers(cfg, writeUsersFile(t, legacyUsers), false); err != nil {
+		t.Fatalf("подготовка: %v", err)
+	}
+
+	meta, err := openMetadataDBForMaintenance(cfg)
+	if err != nil {
+		t.Fatalf("открыть базу: %v", err)
+	}
+	// Уносим строку, которую §6.12 требует иметь всегда: импорт её не
+	// восстанавливает и не должен.
+	err = meta.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(context.Background(), `DELETE FROM server_secrets`)
+		return err
+	})
+	meta.Close()
+	if err != nil {
+		t.Fatalf("испортить базу: %v", err)
+	}
+
+	// Импорт того же файла идемпотентен и проходит, но команда обязана
+	// пожаловаться на оставшееся расхождение.
+	err = runMigrateUsers(cfg, writeUsersFile(t, legacyUsers), false)
+	if err == nil {
+		t.Fatal("команда промолчала о базе, которую демон не откроет")
+	}
+	if !strings.Contains(err.Error(), "server_secrets") {
+		t.Errorf("в сообщении нет причины: %v", err)
+	}
 }

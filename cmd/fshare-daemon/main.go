@@ -224,31 +224,46 @@ func run(cfg config.Settings, configPath string) error {
 	return nil
 }
 
-// openMetadataDB открывает metadata DB и доводит схему до текущей версии.
-// Возвращает nil, nil при database.enabled = false — режим до M12, в котором
-// метабазы нет вовсе (§19.6 п. 1).
+// openMetadataDB открывает metadata DB для ОБСЛУЖИВАНИЯ ЗАПРОСОВ: доводит схему
+// до текущей версии и отказывается отдавать базу, не прошедшую проверку
+// инвариантов. Возвращает nil, nil при database.enabled = false — режим до M12,
+// в котором метабазы нет вовсе (§19.6 п. 1).
 func openMetadataDB(cfg config.Settings) (*db.DB, error) {
-	if !cfg.Database.Enabled {
-		return nil, nil
-	}
-	ctx := context.Background()
-	meta, err := db.Open(ctx, db.Config{
-		Path:          cfg.Database.Path,
-		BusyTimeoutMs: cfg.Database.BusyTimeoutMs,
-		Synchronous:   cfg.Database.Synchronous,
-	}, metadata.Migrations(metadata.SeedParams{AuthIters: cfg.Auth.PBKDF2Iters}))
-	if err != nil {
-		return nil, err
+	meta, err := openMetadataDBForMaintenance(cfg)
+	if err != nil || meta == nil {
+		return meta, err
 	}
 	// Миграции идемпотентны, поэтому на уже мигрированной базе seed не
 	// выполняется вовсе. Проверка обязательных строк — отдельный шаг, иначе
 	// база с удалённой строкой поднялась бы молча и отказала позже, на первом
 	// запросе (§6.12).
-	if err := metadata.VerifyInvariants(ctx, meta.Reader); err != nil {
+	if err := metadata.VerifyInvariants(context.Background(), meta.Reader); err != nil {
 		meta.Close()
 		return nil, err
 	}
 	return meta, nil
+}
+
+// openMetadataDBForMaintenance открывает ту же базу БЕЗ проверки инвариантов.
+//
+// Разделение не косметическое. Команда, чья работа — привести базу в порядок, не
+// может требовать, чтобы база УЖЕ была в порядке: проверка перед импортом
+// сделала бы недостижимым единственный способ свести разъехавшиеся auth_iters
+// (перезапись всех секретов, §6.2 п. 3) — тот самый, на который ссылается
+// сообщение об ошибке. Ровно эта же дверь понадобится --fsck.
+//
+// Обратная сторона: такая база может обслуживать запросы только после
+// повторной проверки, поэтому вызывающий обязан выполнить VerifyInvariants сам
+// и сказать, если та не прошла.
+func openMetadataDBForMaintenance(cfg config.Settings) (*db.DB, error) {
+	if !cfg.Database.Enabled {
+		return nil, nil
+	}
+	return db.Open(context.Background(), db.Config{
+		Path:          cfg.Database.Path,
+		BusyTimeoutMs: cfg.Database.BusyTimeoutMs,
+		Synchronous:   cfg.Database.Synchronous,
+	}, metadata.Migrations(metadata.SeedParams{AuthIters: cfg.Auth.PBKDF2Iters}))
 }
 
 // runMigrateOnly применяет миграции и выходит. Разовый режим нужен образу и CI:
@@ -312,7 +327,11 @@ func runMigrateUsers(cfg config.Settings, path string, overwriteExisting bool) e
 	if err != nil {
 		return fmt.Errorf("--migrate-users: %w", err)
 	}
-	meta, err := openMetadataDB(cfg)
+	// База открывается БЕЗ проверки инвариантов: команда, приводящая базу в
+	// порядок, не может требовать, чтобы та уже была в порядке. Перезапись всех
+	// секретов — единственный способ свести разъехавшиеся auth_iters (§6.2 п. 3),
+	// и проверка перед импортом сделала бы его недостижимым.
+	meta, err := openMetadataDBForMaintenance(cfg)
 	if err != nil {
 		return err
 	}
@@ -332,13 +351,19 @@ func runMigrateUsers(cfg config.Settings, path string, overwriteExisting bool) e
 	fmt.Printf("imported %s into %s: %d created, %d skipped, %d updated\n",
 		path, cfg.Database.Path, len(report.Created), len(report.Skipped), len(report.Updated))
 	if report.NoActiveAdmin {
+		// Формулировка описывает СЕГОДНЯШНЕЕ положение дел, а не целевое.
+		// Отказ старта без активного администратора и команда --promote — это
+		// §7.5, они приезжают вместе с secure bootstrap; аутентификация сейчас
+		// по-прежнему читает users_file, поэтому обещать «демон не стартует» и
+		// отсылать к несуществующему флагу значило бы соврать дважды.
+		//
 		// Импорт при этом не отклонён: множество активных администраторов было
-		// пустым и до него, а восстановительный путь §7.5 (`--promote <login>`)
-		// работает именно по импортированным записям. Молчать нельзя — с такой
-		// базой daemon не стартует.
+		// пустым и до него (см. metadata.ImportUsers).
 		fmt.Fprintf(os.Stderr,
-			"warning: the database has no user with role \"admin\" and state \"active\"; "+
-				"the daemon will not serve with it — promote one of the imported logins (§7.5)\n")
+			"warning: the imported database has no user with role \"admin\" and state \"active\". "+
+				"Authentication still comes from %s, so serving is unaffected for now; "+
+				"once the daemon authenticates from the database it will refuse to start without one (§7.5)\n",
+			cfg.Auth.UsersFile)
 	}
 	for _, group := range []struct {
 		verb   string
@@ -355,6 +380,16 @@ func runMigrateUsers(cfg config.Settings, path string, overwriteExisting bool) e
 			// поэтому %q экранирует его и оставляет кириллицу читаемой.
 			fmt.Printf("  %-7s %q\n", group.verb, login)
 		}
+	}
+
+	// Проверка выполняется ПОСЛЕ импорта, раз до него она была пропущена.
+	// Импорт уже зафиксирован, поэтому это не отказ, а отчёт: база, не прошедшая
+	// проверку, обслуживать запросы не будет, и оператор обязан узнать это здесь,
+	// а не при следующем старте демона. Ненулевой код возврата — часть отчёта:
+	// работа не закончена.
+	if err := metadata.VerifyInvariants(context.Background(), meta.Reader); err != nil {
+		return fmt.Errorf("the import was committed, but the database still fails its invariants "+
+			"and the daemon will not open it: %w", err)
 	}
 	return nil
 }

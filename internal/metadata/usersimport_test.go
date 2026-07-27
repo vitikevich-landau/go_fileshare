@@ -2,6 +2,7 @@ package metadata_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"reflect"
@@ -599,8 +600,13 @@ func TestImportRejectsMixedAuthIters(t *testing.T) {
 	}
 }
 
-// TestImportRepairsMixedAuthIters — а перезапись ВСЕХ секретов остаётся
-// работающим путём: после неё значение снова одно, и проверка пропускает.
+// TestImportRepairsMixedAuthIters — перезапись ВСЕХ секретов сводит уже
+// разъехавшиеся auth_iters обратно к одному значению.
+//
+// База готовится прямым UPDATE, а не импортом: после проверки, добавленной
+// выше, ни один путь репозитория расхождения больше не создаёт, и получить его
+// можно только правкой руками — то есть ровно так, как оно и появляется в
+// жизни. Тест, который «чинил» бы однородную базу, не проверял бы починку.
 func TestImportRepairsMixedAuthIters(t *testing.T) {
 	ctx := context.Background()
 	d, us, _ := repos(t)
@@ -608,6 +614,16 @@ func TestImportRepairsMixedAuthIters(t *testing.T) {
 	body := rec("root", "admin", keyHex(1), true) + "," + rec("bob", "user", keyHex(2), true)
 	if _, err := metadata.ImportUsers(ctx, d, us, usersJSON(body), importOpts()); err != nil {
 		t.Fatalf("подготовка: %v", err)
+	}
+	if err := d.Write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE users SET auth_iters = ? WHERE login = ?`, testAuthIters/2, "bob")
+		return err
+	}); err != nil {
+		t.Fatalf("развести auth_iters: %v", err)
+	}
+	if err := metadata.VerifyInvariants(ctx, d.Reader); err == nil {
+		t.Fatal("подготовка теста: база с разными auth_iters проходит проверку")
 	}
 
 	// Все секреты в файле новые, конфиг новый — значит, все записи получают его.
