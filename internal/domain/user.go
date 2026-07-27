@@ -86,6 +86,44 @@ func AllUserStates() []UserState {
 	return []UserState{UserActive, UserDisabled, UserPendingDelete}
 }
 
+// userStateTransitions — ИСЧЕРПЫВАЮЩИЙ перечень допустимых переходов
+// `users.state` (§6.2, §7.4). Перечень тестируется §24.1 п. 6.
+//
+// pending_delete — терминальное состояние: §7.4 делает удаление двухфазным
+// (disable → revoke → mark → purge) и обратной команды не вводит. Возврат из
+// него был бы не «отменой удаления», а восстановлением учётки, чьи shares уже
+// отозваны ОКОНЧАТЕЛЬНО (§17.4) и чьи данные могли быть удалены командой purge:
+// пользователь вернулся бы в состояние, которое ничем не отличается от активного,
+// но без части своих ресурсов и ссылок.
+//
+// Перехода «в себя» в перечне нет, потому что это не переход. Идемпотентность
+// повторного `user disable` обеспечивает вызывающий, и обеспечивает сознательно:
+// повтор обязан заново применить таблицу §7.4, чтобы прерванная на полпути
+// операция доводилась повторным запуском.
+var userStateTransitions = map[UserState][]UserState{
+	UserActive:   {UserDisabled, UserPendingDelete},
+	UserDisabled: {UserActive, UserPendingDelete},
+}
+
+// CanTransitionUserState сообщает, допустим ли переход from → to по §6.2.
+// Переход из терминального состояния не допускается никуда, включая само себя.
+func CanTransitionUserState(from, to UserState) bool {
+	for _, allowed := range userStateTransitions[from] {
+		if allowed == to {
+			return true
+		}
+	}
+	return false
+}
+
+// AllowedUserStates возвращает состояния, достижимые из from (§6.2).
+func AllowedUserStates(from UserState) []UserState {
+	src := userStateTransitions[from]
+	out := make([]UserState, len(src))
+	copy(out, src)
+	return out
+}
+
 // KDFAlgo — алгоритм вывода ключа, колонка `users.kdf_algo` (§6.2).
 type KDFAlgo string
 

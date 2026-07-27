@@ -140,6 +140,27 @@ func (us *Users) ByID(ctx context.Context, id domain.UserID) (User, error) {
 	return u, err
 }
 
+// ByIDTx возвращает пользователя ПО ТОЙ ЖЕ транзакции, в которой его затем
+// меняют.
+//
+// Метод существует по той же причине, что и CountActiveAdmins с параметром tx:
+// §23.2 требует выполнять мутацию и проверку её предусловий в ОДНОЙ транзакции.
+// Операции §7.4 без этого невыразимы — «в какое состояние переводим» зависит от
+// того, в каком пользователь был, а прочитанное мимо транзакции значение к
+// моменту UPDATE уже могло устареть.
+//
+// Читающий handle для этой роли не годится принципиально: он открыт как mode=ro
+// на своём снапшоте WAL и изменений, сделанных внутри чужой незакоммиченной
+// транзакции, не видит вовсе.
+func (us *Users) ByIDTx(ctx context.Context, tx *sql.Tx, id domain.UserID) (User, error) {
+	row := tx.QueryRowContext(ctx, `SELECT `+userColumns+` FROM users WHERE id = ?`, int64(id))
+	u, err := scanUser(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return User{}, fmt.Errorf("%w: user %d", ErrNotFound, id)
+	}
+	return u, err
+}
+
 // ByLogin возвращает пользователя по логину. Регистр логина значим: сравнение
 // побайтовое, как и UNIQUE-индекс схемы.
 func (us *Users) ByLogin(ctx context.Context, login string) (User, error) {
