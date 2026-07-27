@@ -47,7 +47,8 @@ fileshare-daemon --config /etc/fileshare/config.json
 }
 ```
 
-`users.json` (до перехода на SQLite в M13):
+`users.json` (до перехода на SQLite в M12 — см.
+[10-cloud-drive-spec.md](10-cloud-drive-spec.md) §6 и §21.4):
 
 ```jsonc
 {

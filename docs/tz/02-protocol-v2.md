@@ -41,7 +41,7 @@
 | Сообщение | Код | Направление | Payload |
 |---|---|---|---|
 | `HELLO` | `0x10` | C→S | `proto_ver:u16`, `client_name:str` |
-| `HELLO_OK` | `0x11` | S→C | `proto_ver:u16`, `server_name:str`, `auth_mode:u8` (0=none, 1=challenge), `challenge:16 байт`, `salt_login_hint:u8` (0/1 — см. §6 security) |
+| `HELLO_OK` | `0x11` | S→C | `proto_ver:u16`, `server_name:str`, `auth_mode:u8` (0=none, 1=challenge), `challenge:16 байт`, `pbkdf2_iters:u32` (число итераций PBKDF2, см. [06-security.md](06-security.md) §2) |
 | `AUTH_REQUEST` | `0x12` | C→S | `login:str`, `proof:32 байта` (HMAC-SHA-256, см. [06-security.md](06-security.md)) |
 | `AUTH_OK` | `0x13` | S→C | `role:u8` (1=user, 2=admin), `session_id:u64`, `motd:str` |
 | `AUTH_FAIL` | `0x14` | S→C | `reason:u16`, `message:str`; после 3 неудач — разрыв + временный бан IP (настройка) |
@@ -57,6 +57,17 @@ BAD_CREDENTIALS=1 (неверный логин или пароль), USER_DISABL
 
 Неизвестный `reason` клиент обязан трактовать как «вход не удался» и показать
 `message`, а не падать.
+
+Соль по сети не передаётся вовсе: клиент выводит её из логина
+детерминированно — `"fileshare-v2:" || login`
+(`internal/auth/scram.go:27-29`), — поэтому в `HELLO_OK` из параметров KDF
+достаточно числа итераций. Прежняя редакция таблицы объявляла здесь поле
+`salt_login_hint:u8`, которого в кадре нет: реализация пишет и читает
+`pbkdf2_iters` как `u32` (`internal/proto/messages.go:243-258`,
+`internal/server/conn.go:64-70`, `internal/client/client.go:131`), и то же
+самое даёт таблица [09-go-port.md](09-go-port.md) §4.4. Случайная соль и раунд
+доставки параметров появляются только в v3
+([10-cloud-drive-spec.md](10-cloud-drive-spec.md) §3.3).
 
 Состояния соединения: `CONNECTED → HELLO_RECEIVED → AUTHED(role)`.
 До `AUTHED` допускаются только `HELLO`, `AUTH_REQUEST`, `PING`. Таймаут handshake —
