@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/vitikevich-landau/go_fileshare/internal/db"
@@ -394,6 +395,23 @@ func execOne(ctx context.Context, tx *sql.Tx, id domain.UserID, query string, ar
 // Управляющие символы запрещены отдельно от прочего: логин попадает в строки
 // аудита (§20.2) и в текстовые логи, и переводом строки внутри логина можно
 // подделать соседнюю запись.
+//
+// Запрещается ВЕСЬ Cc, а не диапазон U+0000–U+001F с U+007F: категория включает
+// ещё и C1 (U+0080–U+009F), где лежат U+0085 NEXT LINE, который многие
+// обработчики текста считают переводом строки, и U+009B — восьмибитная форма
+// CSI, то есть та же инъекция escape-последовательности, от которой защищает
+// запрет U+001B. Вместе с ними отвергаются Zl и Zp (U+2028 и U+2029): их тоже
+// показывают как разрыв строки. Половинчатая защита от подделки соседней записи
+// защитой не является.
+//
+// Категория Cf (bidi-override U+202E, ZWJ, ZWNJ) сознательно НЕ запрещается,
+// хотя невидимый символ в логине — тоже способ обмануть читателя лога. ZWNJ
+// законно встречается в письменностях, где он меняет форму слова, и запрет
+// отрезал бы носителям этих языков собственное имя. Обман через Cf ловится
+// экранированием при выводе, а не отказом в регистрации.
+//
+// В ValidateName (§5.3 п. 3) сделано иначе — там перечень диапазонов задан
+// документом закрытым списком, и расширять его на своё усмотрение нельзя.
 func validateLogin(login string) error {
 	if login == "" {
 		return fmt.Errorf("%w: login is empty", ErrInvalidLogin)
@@ -405,8 +423,11 @@ func validateLogin(login string) error {
 		return fmt.Errorf("%w: login is %d bytes, limit is %d", ErrInvalidLogin, len(login), MaxLoginLen)
 	}
 	for _, r := range login {
-		if r <= 0x1F || r == 0x7F {
+		switch {
+		case unicode.IsControl(r):
 			return fmt.Errorf("%w: login contains control character U+%04X", ErrInvalidLogin, r)
+		case unicode.In(r, unicode.Zl, unicode.Zp):
+			return fmt.Errorf("%w: login contains line separator U+%04X", ErrInvalidLogin, r)
 		}
 	}
 	return nil

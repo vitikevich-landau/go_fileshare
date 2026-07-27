@@ -494,3 +494,53 @@ func TestSecretStoredKeyLength(t *testing.T) {
 		t.Errorf("len(stored_key) = %d, want %d", len(got.Secret.StoredKey), metadata.StoredKeyLen)
 	}
 }
+
+// TestValidateLoginControlCharacters — логин, способный подделать соседнюю
+// строку лога или аудита, отвергается целиком, а не по диапазону ASCII.
+//
+// Категория Cc включает не только U+0000–U+001F и U+007F, но и C1: там лежат
+// U+0085 NEXT LINE, который многие обработчики текста считают переводом строки,
+// и U+009B — восьмибитная форма CSI, то есть та же инъекция
+// escape-последовательности, от которой защищает запрет U+001B.
+func TestValidateLoginControlCharacters(t *testing.T) {
+	d, us, _ := repos(t)
+
+	rejected := []struct {
+		why   string
+		login string
+	}{
+		{"U+000A LINE FEED", "a\nb"},
+		{"U+001B ESC", "a\x1bb"},
+		{"U+007F DELETE", "a\x7fb"},
+		{"U+0085 NEXT LINE", "a\u0085b"},
+		{"U+009B CSI, восьмибитная форма", "a\u009bb"},
+		{"U+2028 LINE SEPARATOR", "a\u2028b"},
+		{"U+2029 PARAGRAPH SEPARATOR", "a\u2029b"},
+	}
+	for _, tc := range rejected {
+		_, err := createUser(t, d, us, metadata.NewUser{
+			Login: tc.login, Role: domain.RoleUser, Secret: secretFor(tc.login),
+		})
+		if !errors.Is(err, metadata.ErrInvalidLogin) {
+			t.Errorf("%s: %v, want ErrInvalidLogin", tc.why, err)
+		}
+	}
+
+	// А законные логины остаются законными: ZWNJ (U+200C) меняет форму слова в
+	// письменностях, где он употребляется, и запрет отрезал бы носителям этих
+	// языков собственное имя. Обман через невидимый символ ловится
+	// экранированием при выводе, а не отказом в регистрации.
+	accepted := []struct{ why, login string }{
+		{"обычный ASCII", "alice"},
+		{"кириллица", "пользователь"},
+		{"пробел внутри", "john doe"},
+		{"ZWNJ", "عبد\u200cالله"},
+	}
+	for _, tc := range accepted {
+		if _, err := createUser(t, d, us, metadata.NewUser{
+			Login: tc.login, Role: domain.RoleUser, Secret: secretFor(tc.login),
+		}); err != nil {
+			t.Errorf("%s: логин %q отвергнут: %v", tc.why, tc.login, err)
+		}
+	}
+}
