@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/vitikevich-landau/go_fileshare/internal/domain"
@@ -64,6 +65,40 @@ func (us *Users) UserReferences(ctx context.Context, tx *sql.Tx, id domain.UserI
 	return out, nil
 }
 
+// AddUsedBytes изменяет счётчик used_bytes на delta (§11.4).
+//
+// Метод узкий сознательно: формулы §11.4 принадлежат QuotaService, и репозиторий
+// их не воспроизводит. Но одна дельта из исчерпывающей таблицы §11.4 приходится
+// на операцию, которая сдаётся РАНЬШЕ QuotaService, — передачу public-ресурсов
+// системному аккаунту при purge, — а отложить её нельзя: строка прежнего
+// владельца исчезает в той же транзакции вместе со своим used_bytes, и незачтённые
+// байты перестают учитываться за кем-либо навсегда.
+//
+// Отрицательный результат отвергается. Схема его не запрещает, но used_bytes —
+// сумма размеров (§11.4), и уход ниже нуля означает не «мало места», а ошибку
+// учёта, которую нельзя записывать в базу: дальше она поедет в каждый ответ о
+// квоте, а пересчёт §21.3 класс 10 покажет расхождение, не сказав, когда оно
+// возникло.
+func (us *Users) AddUsedBytes(ctx context.Context, tx *sql.Tx, id domain.UserID, delta int64) error {
+	if delta == 0 {
+		return nil
+	}
+	var used int64
+	err := tx.QueryRowContext(ctx, `SELECT used_bytes FROM users WHERE id = ?`, int64(id)).Scan(&used)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: user %d", ErrNotFound, id)
+	}
+	if err != nil {
+		return fmt.Errorf("metadata: read used_bytes of user %d: %w", id, err)
+	}
+	if used+delta < 0 {
+		return fmt.Errorf("metadata: used_bytes of user %d would become %d: used_bytes is a sum of sizes "+
+			"and cannot be negative (§11.4)", id, used+delta)
+	}
+	return execOne(ctx, tx, id, `UPDATE users SET used_bytes = used_bytes + ?, updated_at_ms = ?
+WHERE id = ?`, delta, int64(domain.NowMillis()), int64(id))
+}
+
 // Delete удаляет строку пользователя (`user purge`, §7.4).
 //
 // Ссылочную целостность держит схема: RESTRICT на users(id) не даст удалить
@@ -79,38 +114,63 @@ func (us *Users) Delete(ctx context.Context, tx *sql.Tx, id domain.UserID) error
 	return execOne(ctx, tx, id, `DELETE FROM users WHERE id = ?`, int64(id))
 }
 
-// TransferOwnership переводит ресурсы namespace от одного владельца к другому и
-// возвращает число перенесённых строк.
+// Transferred — результат передачи владения: сколько строк переехало и сколько
+// байт вместе с ними обязано переехать в счётчик used_bytes приёмника (§11.4).
+type Transferred struct {
+	Rows int
+	// Bytes — сумма size_bytes переданных ФАЙЛОВ, живых и лежащих в корзине:
+	// §11.4 считает в used_bytes и то и другое. Каталоги в сумму не входят по
+	// построению (CHECK держит их size_bytes нулевым).
+	Bytes int64
+}
+
+// TransferOwnership переводит ресурсы namespace от одного владельца к другому.
 //
 // Единственный вызывающий — purge: §7.3 и §7.4 требуют передать public-ресурсы
 // удаляемого пользователя системному аккаунту, а не удалять их. Ограничение
 // namespace обязательно: тот же UPDATE без него унёс бы и home пользователя,
 // то есть отдал бы его личное дерево системному аккаунту вместо удаления.
 //
-// Что метод НЕ делает: не переносит квоту. §11.4 списывает public-контент с его
-// владельца, значит, после передачи те же байты обязаны считаться за приёмником,
-// но исчерпывающая таблица дельт §11.4 операции «передача владения при purge» не
-// содержит вовсе — есть только строка «user delete --purge: used обнуляется
-// вместе с записью пользователя». Пока файлов не существует (upload сдаётся в
-// M13), расхождение нулевое; арифметику обязан внести QuotaService вместе с
-// пересчётом used_bytes (§21.3 класс 10).
+// Байты считаются ДО обновления и возвращаются вызывающему, потому что §11.4
+// требует зачесть их приёмнику: квота public-контента списывается с владельца
+// (§6.3), а строка прежнего владельца исчезает вместе с его used_bytes, то есть
+// незачтённые байты не «потеряются на время» — они перестанут учитываться за кем
+// либо навсегда, и обнаружит это только пересчёт §21.3 класс 10 у аккаунта, у
+// которого нет ни сессий, ни владельца, способного о нём сообщить.
+//
+// Версии переданных ресурсов в сумму не входят, хотя §11.4 их называет: их
+// перенос — это не только строка `versions`, но и физическое перемещение blob из
+// versions/<прежний>/ в versions/<системный>/ (§5.1), а это работа этапа версий.
+// До него purge с существующими версиями отклоняется проверкой §6.11
+// (Users.UserReferences), поэтому недосчёта здесь возникнуть не может.
 func (rs *Resources) TransferOwnership(
 	ctx context.Context, tx *sql.Tx, ns domain.Namespace, from, to domain.UserID,
-) (int, error) {
+) (Transferred, error) {
 	if !ns.Valid() {
-		return 0, fmt.Errorf("metadata: transfer ownership: namespace %q is not in the §6.3 dictionary", ns)
+		return Transferred{}, fmt.Errorf(
+			"metadata: transfer ownership: namespace %q is not in the §6.3 dictionary", ns)
 	}
+
+	var bytes sql.NullInt64
+	err := tx.QueryRowContext(ctx, `SELECT sum(size_bytes) FROM resources
+WHERE namespace = ? AND owner_user_id = ? AND kind = ?`,
+		string(ns), int64(from), string(domain.KindFile)).Scan(&bytes)
+	if err != nil {
+		return Transferred{}, fmt.Errorf("metadata: sum %s resources of user %d: %w", ns, from, err)
+	}
+
 	res, err := tx.ExecContext(ctx, `UPDATE resources SET owner_user_id = ?, updated_at_ms = ?
 WHERE namespace = ? AND owner_user_id = ?`,
 		int64(to), int64(domain.NowMillis()), string(ns), int64(from))
 	if err != nil {
-		return 0, fmt.Errorf("metadata: transfer %s resources of user %d to %d: %w", ns, from, to, err)
+		return Transferred{}, fmt.Errorf("metadata: transfer %s resources of user %d to %d: %w",
+			ns, from, to, err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return 0, fmt.Errorf("metadata: transfer %s resources of user %d: %w", ns, from, err)
+		return Transferred{}, fmt.Errorf("metadata: transfer %s resources of user %d: %w", ns, from, err)
 	}
-	return int(n), nil
+	return Transferred{Rows: int(n), Bytes: bytes.Int64}, nil
 }
 
 // DeleteOwned удаляет ВСЕ ресурсы владельца и возвращает их число.

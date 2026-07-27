@@ -67,8 +67,19 @@ func (s *Service) Purge(ctx context.Context, userID domain.UserID) error {
 		// §7.3, §7.4: public-ресурсы передаются системному аккаунту, а не
 		// удаляются. Шаг обязан быть первым: после него DeleteOwned видит только
 		// home пользователя.
-		if _, err := s.res.TransferOwnership(ctx, tx, domain.NamespacePublic,
-			userID, domain.SystemUserID); err != nil {
+		//
+		// Вместе с владением переезжает и учёт (§11.4): квота public-контента
+		// списывается с владельца, а строка прежнего владельца исчезает в этой же
+		// транзакции вместе со своим used_bytes. Не зачесть байты приёмнику здесь
+		// значит не зачесть их никогда — обнаружил бы это только пересчёт §21.3
+		// класс 10, причём у аккаунта, у которого нет ни сессий, ни владельца,
+		// способного о расхождении сообщить.
+		moved, err := s.res.TransferOwnership(ctx, tx, domain.NamespacePublic,
+			userID, domain.SystemUserID)
+		if err != nil {
+			return err
+		}
+		if err := s.users.AddUsedBytes(ctx, tx, domain.SystemUserID, moved.Bytes); err != nil {
 			return err
 		}
 

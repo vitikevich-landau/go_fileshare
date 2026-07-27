@@ -314,3 +314,137 @@ func countRows(t *testing.T, e *env, query string, args ...any) int {
 	}
 	return n
 }
+
+// publicFile создаёт public-ФАЙЛ ненулевого размера. Загрузок на этом этапе нет,
+// поэтому строка кладётся репозиторием напрямую: проверять учёт байт иначе нечем,
+// а сама передача владения существует уже сейчас.
+func (e *env) publicFile(t *testing.T, owner domain.UserID, name string, size int64) metadata.Resource {
+	t.Helper()
+	ctx := context.Background()
+	root, err := e.res.PublicRoot(ctx)
+	if err != nil {
+		t.Fatalf("PublicRoot: %v", err)
+	}
+	var out metadata.Resource
+	err = e.db.Write(ctx, func(tx *sql.Tx) error {
+		r, err := e.res.Create(ctx, tx, metadata.NewResource{
+			OwnerUserID:  owner,
+			ParentID:     root.ID,
+			Namespace:    domain.NamespacePublic,
+			Name:         name,
+			Kind:         domain.KindFile,
+			Revision:     1,
+			SizeBytes:    size,
+			ChecksumAlgo: domain.ChecksumSHA256,
+			Checksum:     make([]byte, 32),
+		}, true)
+		out = r
+		return err
+	})
+	if err != nil {
+		t.Fatalf("создание public-файла %q: %v", name, err)
+	}
+	return out
+}
+
+func (e *env) usedBytes(t *testing.T, id domain.UserID) int64 {
+	t.Helper()
+	u, err := e.repo.ByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("ByID(%d): %v", id, err)
+	}
+	return u.UsedBytes
+}
+
+// TestPurgeChargesTransferredPublicBytesToSystem — §11.4: вместе с владением
+// переезжает и учёт.
+//
+// Без этого байты переданных public-ресурсов перестают учитываться за кем-либо
+// НАВСЕГДА: строка прежнего владельца исчезает в той же транзакции вместе со
+// своим used_bytes, а приёмнику ничего не добавлено. Ошибка не проявляется ни
+// одной ошибкой во время работы — её нашёл бы только пересчёт §21.3 класс 10, и
+// нашёл бы у системного аккаунта, у которого нет ни сессий, ни владельца,
+// способного о расхождении сообщить.
+func TestPurgeChargesTransferredPublicBytesToSystem(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	e.admin(t, "root")
+	u := e.member(t, "alice", "pw")
+
+	const size = 4096
+	shared := e.publicFile(t, u.ID, "shared.bin", size)
+	// used_bytes самого пользователя здесь не важен: его строка исчезнет, и §11.4
+	// обнуляет счётчик вместе с ней. Важно, что было у приёмника ДО передачи.
+	before := e.usedBytes(t, domain.SystemUserID)
+
+	e.delete(t, u.ID)
+	if err := e.svc.Purge(ctx, u.ID); err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+
+	got, err := e.res.ByID(ctx, shared.ID)
+	if err != nil {
+		t.Fatalf("public-файл удалён вместе с пользователем: %v", err)
+	}
+	if got.OwnerUserID != domain.SystemUserID {
+		t.Fatalf("владелец файла = %d, ожидался системный аккаунт", got.OwnerUserID)
+	}
+	if after := e.usedBytes(t, domain.SystemUserID); after != before+size {
+		t.Errorf("used_bytes системного аккаунта = %d, ожидалось %d: переданные байты не зачтены (§11.4)",
+			after, before+size)
+	}
+}
+
+// TestPurgeWithoutPublicContentLeavesSystemAccounting — обратная сторона того же
+// правила: пользователь без public-ресурсов ничего приёмнику не добавляет.
+// Проверяется потому, что «прибавить на всякий случай» тут так же неверно, как не
+// прибавить: лишние байты у системного аккаунта — то же расхождение с §11.4, только
+// в другую сторону.
+func TestPurgeWithoutPublicContentLeavesSystemAccounting(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	e.admin(t, "root")
+	u := e.member(t, "alice", "pw")
+	before := e.usedBytes(t, domain.SystemUserID)
+
+	e.delete(t, u.ID)
+	if err := e.svc.Purge(ctx, u.ID); err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	if after := e.usedBytes(t, domain.SystemUserID); after != before {
+		t.Errorf("used_bytes системного аккаунта изменился с %d на %d", before, after)
+	}
+}
+
+// TestPurgeDoesNotChargeDirectories — каталоги квоту не занимают (§11.4,
+// CHECK size_bytes = 0 в §6.3), поэтому передача пустого каталога не меняет учёт.
+func TestPurgeDoesNotChargeDirectories(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	e.admin(t, "root")
+	u := e.member(t, "alice", "pw")
+
+	publicRoot, err := e.res.PublicRoot(ctx)
+	if err != nil {
+		t.Fatalf("PublicRoot: %v", err)
+	}
+	err = e.db.Write(ctx, func(tx *sql.Tx) error {
+		_, err := e.res.Create(ctx, tx, metadata.NewResource{
+			OwnerUserID: u.ID, ParentID: publicRoot.ID, Namespace: domain.NamespacePublic,
+			Name: "folder", Kind: domain.KindDir,
+		}, true)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("создание каталога: %v", err)
+	}
+	before := e.usedBytes(t, domain.SystemUserID)
+
+	e.delete(t, u.ID)
+	if err := e.svc.Purge(ctx, u.ID); err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	if after := e.usedBytes(t, domain.SystemUserID); after != before {
+		t.Errorf("каталог зачтён в квоту: used_bytes %d -> %d", before, after)
+	}
+}

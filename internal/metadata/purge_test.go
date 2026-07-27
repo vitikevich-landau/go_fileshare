@@ -112,7 +112,7 @@ func TestTransferOwnershipIsScopedToNamespace(t *testing.T) {
 		t.Fatalf("HomeRoot: %v", err)
 	}
 
-	var moved int
+	var moved metadata.Transferred
 	err = d.Write(ctx, func(tx *sql.Tx) error {
 		moved, err = res.TransferOwnership(ctx, tx, domain.NamespacePublic, u.ID, domain.SystemUserID)
 		return err
@@ -120,8 +120,8 @@ func TestTransferOwnershipIsScopedToNamespace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TransferOwnership: %v", err)
 	}
-	if moved != 0 {
-		t.Errorf("перенесено %d строк, а public-ресурсов у пользователя нет", moved)
+	if moved.Rows != 0 || moved.Bytes != 0 {
+		t.Errorf("перенесено %+v, а public-ресурсов у пользователя нет", moved)
 	}
 
 	after, err := res.ByID(ctx, home.ID)
