@@ -8177,8 +8177,14 @@ PR10 adversarial/fault/load hardening
   `ADMIN_SHUTDOWN`/`ADMIN_RELOAD_USERS` (`internal/proto/proto.go:95-98`);
 - `08-roadmap.md` M12–M14 заменяются ссылкой на §25 настоящего документа,
   добавляются M15–M18;
-- `10-cloud-drive-spec.md` вносится в таблицу документов `docs/tz/README.md`;
-- `02-protocol-v2.md` дополняется кодом `CANCELLED = 14` (текст даёт §22).
+- `10-cloud-drive-spec.md` вносится в таблицу документов `docs/tz/README.md`, а
+  строка `08-roadmap.md` в той же таблице получает диапазон M7–M18;
+- `02-protocol-v2.md` дополняется кодом `CANCELLED = 14` (текст даёт §22);
+- `03-server-daemon.md` и `09-go-port.md` перестают относить SQLite к M13 и
+  ссылаться на трёхэтапную перспективу M12–M14;
+- `docs/interactive/index.html` — таблица роадмапа доводится до семи этапов:
+  это единственный документ вне `docs/tz`, который перечисляет этапы
+  самостоятельно, и он ссылается из обоих README.
 
 ---
 
