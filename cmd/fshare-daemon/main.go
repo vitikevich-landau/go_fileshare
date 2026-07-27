@@ -46,6 +46,10 @@ func main() {
 		roleFlag    = flag.String("role", "user", "role for --add-user (user|admin)")
 		resetPw     = flag.String("reset-password", "", "reset this user's password (prompts), then exit")
 		migrateOnly = flag.Bool("migrate-only", false, "apply metadata database migrations and exit")
+		//nolint:lll // §21.4: одноразовый перенос users.json в metadata DB.
+		migrateUsers = flag.String("migrate-users", "", "import this users.json into the metadata database, then exit")
+		overwriteEx  = flag.Bool("overwrite-existing", false,
+			"for --migrate-users: replace a login that already exists in the database with the values from the JSON")
 	)
 	flag.Parse()
 
@@ -89,6 +93,16 @@ func main() {
 			fatalf("%v", err)
 		}
 		return
+	}
+
+	if *migrateUsers != "" {
+		if err := runMigrateUsers(cfg, *migrateUsers, *overwriteEx); err != nil {
+			fatalf("%v", err)
+		}
+		return
+	}
+	if *overwriteEx {
+		fatalf("--overwrite-existing has no meaning without --migrate-users")
 	}
 
 	if err := run(cfg, *configPath); err != nil {
@@ -242,6 +256,49 @@ func runMigrateOnly(cfg config.Settings) error {
 		return err
 	}
 	fmt.Printf("metadata database %s is at schema version %d\n", cfg.Database.Path, version)
+	return nil
+}
+
+// runMigrateUsers переносит users.json в metadata DB и выходит (§21.4).
+//
+// Исходный файл не удаляется и не изменяется: миграция обязана быть повторяемой,
+// а оператор — иметь возможность сверить результат с источником. Повторный
+// запуск идемпотентен, конфликт логина прерывает перенос целиком.
+func runMigrateUsers(cfg config.Settings, path string, overwriteExisting bool) error {
+	if !cfg.Database.Enabled {
+		return fmt.Errorf("--migrate-users requires database.enabled = true")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("--migrate-users: %w", err)
+	}
+	meta, err := openMetadataDB(cfg)
+	if err != nil {
+		return err
+	}
+	defer meta.Close()
+
+	users := metadata.NewUsers(meta, metadata.NewResources(meta))
+	// auth.pbkdf2_iters берётся из ДЕЙСТВУЮЩЕГО конфига, потому что именно он
+	// описывает, с каким числом итераций посчитаны stored_key в переносимом
+	// файле: до раунда AUTH_PARAMS (M14) значение глобально (§3.3, §21.4).
+	report, err := metadata.ImportUsers(context.Background(), meta, users, data, metadata.ImportOptions{
+		AuthIters:         cfg.Auth.PBKDF2Iters,
+		OverwriteExisting: overwriteExisting,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("imported %s into %s: %d created, %d skipped, %d updated\n",
+		path, cfg.Database.Path, len(report.Created), len(report.Skipped), len(report.Updated))
+	for _, group := range []struct {
+		verb   string
+		logins []string
+	}{{"created", report.Created}, {"skipped", report.Skipped}, {"updated", report.Updated}} {
+		for _, login := range group.logins {
+			fmt.Printf("  %-7s %s\n", group.verb, login)
+		}
+	}
 	return nil
 }
 
