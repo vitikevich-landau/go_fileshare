@@ -28,9 +28,14 @@ and vice-versa.
 
 ## Scope
 
-Ports **M7–M11** of the roadmap (foundation + auth + TUI + live events + admin).
-M12–M14 (multi-user/quotas, upload, TLS) are future work; data models leave room
-for them.
+The current implementation covers **M7–M11** of the roadmap (foundation + auth
++ TUI + live events + admin). It is a complete read-only v2 file-sharing system.
+
+The detailed path from the current state to a multi-user console cloud drive is
+specified in [`docs/tz/10-cloud-drive-spec.md`](docs/tz/10-cloud-drive-spec.md):
+M12–M18 cover isolated user homes, SQLite metadata, resumable upload, mutations,
+quotas, TLS, trash, versions, public links, a durable change journal and a sync
+client while preserving byte-for-byte v2 compatibility.
 
 ## Status
 
@@ -42,8 +47,8 @@ for them.
 - **M10** — live `EVENT_FS` (fsnotify), heartbeats, auto-reconnect
 - **M11** — live rate limiting + admin channel (config/kick/stats/shutdown) + admin panel (F9)
 
-M12–M14 (multi-user/quotas, upload, TLS) are future work. Every package ships
-tests run under `go test -race`.
+M12–M18 are future work described by the cloud-drive specification. Every
+current package ships tests run under `go test -race`.
 
 ### Post-M11 hardening
 
@@ -107,7 +112,7 @@ internal/ratelimit     per-client + global token bucket
 internal/watcher       fs events (fsnotify) -> EVENT_FS
 internal/client        blocking client transport
 internal/tui           Bubble Tea model/update/view + connection bridge
-docs/tz                the specification this port follows
+docs/tz                current port specification + future cloud-drive roadmap
 docs/interactive       single-page interactive architecture doc (open in a browser)
 ```
 
