@@ -4,7 +4,10 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # Ветки этапов (feat/mNN) — интеграционные: PR-ы шагов вливаются в них
+    # merge-коммитом, и без этого шаблона состояние этапа после мерджа не
+    # проверялось бы вообще, потому что pull_request покрывает только head PR-а.
+    branches: [main, 'feat/**']
   pull_request:
 
 jobs:
