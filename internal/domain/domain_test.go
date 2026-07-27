@@ -368,3 +368,31 @@ func TestSystemAccountConstants(t *testing.T) {
 		t.Fatalf("LegacySalt = %q, want %q", got, want)
 	}
 }
+
+// TestBaselineID — §6.7, §14.6: идентификатор baseline непрозрачен и имеет ту
+// же каноническую форму, что прочие идентификаторы §2.1, потому что уходит
+// клиенту в CURSOR_EXPIRED.Details, где допустимы только короткие ASCII-строки.
+func TestBaselineID(t *testing.T) {
+	id, err := domain.NewBaselineID()
+	if err != nil {
+		t.Fatalf("NewBaselineID: %v", err)
+	}
+	if !id.Valid() {
+		t.Fatalf("NewBaselineID produced %q, which is not canonical", id)
+	}
+	if len(id) != 32 {
+		t.Fatalf("len(%q) = %d, want 32", id, len(id))
+	}
+	for _, bad := range []domain.BaselineID{"", "not-hex", "0123456789ABCDEF0123456789ABCDEF"} {
+		if bad.Valid() {
+			t.Errorf("%q accepted as a baseline id", bad)
+		}
+	}
+	other, err := domain.NewBaselineID()
+	if err != nil {
+		t.Fatalf("NewBaselineID: %v", err)
+	}
+	if other == id {
+		t.Fatal("two baseline ids collided")
+	}
+}

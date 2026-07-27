@@ -328,6 +328,53 @@ FROM resources WHERE namespace = 'public' AND deleted_at_ms IS NULL`).
 	}
 }
 
+// TestSeedPublicJournalState — §6.7 и §14.6: строка journal_state есть у
+// каждого потока, поток /public учитывается строкой с user_id = 0. Начальные
+// значения нормативны: §14.6 фиксирует min_retained_seq = 0 «пока compaction не
+// включена».
+//
+// Отсутствие строки не выражалось бы ни в одной ошибке: compaction §14.6
+// шаг 3 — это UPDATE … WHERE user_id = :stream, и на пустой выборке SQLite
+// обновит ноль строк молча.
+func TestSeedPublicJournalState(t *testing.T) {
+	ctx := context.Background()
+	d := open(t, t.TempDir())
+
+	var (
+		minRetained, baselineSeq, createdAtMs int64
+		baselineID                            string
+	)
+	err := d.Reader.QueryRowContext(ctx, `
+SELECT min_retained_seq, baseline_id, baseline_seq, baseline_created_at_ms
+FROM journal_state WHERE user_id = ?`, int64(domain.SystemUserID)).
+		Scan(&minRetained, &baselineID, &baselineSeq, &createdAtMs)
+	if err != nil {
+		t.Fatalf("public journal state: %v", err)
+	}
+	if minRetained != 0 {
+		t.Errorf("min_retained_seq = %d, want 0 while compaction is off (§14.6)", minRetained)
+	}
+	if baselineSeq != 0 {
+		t.Errorf("baseline_seq = %d, want 0 on a fresh journal", baselineSeq)
+	}
+	if !domain.BaselineID(baselineID).Valid() {
+		t.Errorf("baseline_id = %q, want a canonical opaque id", baselineID)
+	}
+	if createdAtMs <= 0 {
+		t.Errorf("baseline_created_at_ms = %d, want epoch milliseconds", createdAtMs)
+	}
+
+	// Ровно одна строка: собственные потоки пользователей заводятся вместе с
+	// пользователями (PR3), а не миграцией.
+	var count int
+	if err := d.Reader.QueryRowContext(ctx, `SELECT count(*) FROM journal_state`).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("journal_state rows = %d, want exactly the /public stream", count)
+	}
+}
+
 // TestSeedServerSecrets — §6.12: обе строки создаются миграцией, по 32 байта.
 func TestSeedServerSecrets(t *testing.T) {
 	ctx := context.Background()
@@ -378,11 +425,15 @@ func TestMigrationIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 
-	snapshot := func(d *db.DB) (rootID string, secrets map[string]string) {
+	snapshot := func(d *db.DB) (rootID, baselineID string, secrets map[string]string) {
 		secrets = map[string]string{}
 		if err := d.Reader.QueryRowContext(ctx,
 			`SELECT id FROM resources WHERE namespace = 'public'`).Scan(&rootID); err != nil {
 			t.Fatalf("public root: %v", err)
+		}
+		if err := d.Reader.QueryRowContext(ctx,
+			`SELECT baseline_id FROM journal_state WHERE user_id = 0`).Scan(&baselineID); err != nil {
+			t.Fatalf("public journal state: %v", err)
 		}
 		rows, err := d.Reader.QueryContext(ctx, `SELECT name, hex(value) FROM server_secrets`)
 		if err != nil {
@@ -399,11 +450,11 @@ func TestMigrationIsIdempotent(t *testing.T) {
 		if err := rows.Err(); err != nil {
 			t.Fatalf("secrets: %v", err)
 		}
-		return rootID, secrets
+		return rootID, baselineID, secrets
 	}
 
 	first := open(t, dir)
-	rootBefore, secretsBefore := snapshot(first)
+	rootBefore, baselineBefore, secretsBefore := snapshot(first)
 	var appliedAt int64
 	if err := first.Reader.QueryRowContext(ctx,
 		`SELECT applied_at_ms FROM schema_migrations WHERE version = 1`).Scan(&appliedAt); err != nil {
@@ -414,10 +465,16 @@ func TestMigrationIsIdempotent(t *testing.T) {
 	}
 
 	second := open(t, dir)
-	rootAfter, secretsAfter := snapshot(second)
+	rootAfter, baselineAfter, secretsAfter := snapshot(second)
 
 	if rootAfter != rootBefore {
 		t.Errorf("public root id changed on reopen: %s -> %s", rootBefore, rootAfter)
+	}
+	// baseline_id меняется ТОЛЬКО при compaction (§14.6); рестарт демона к ней
+	// отношения не имеет, а смена id отправила бы всех клиентов потока /public
+	// на повторное чтение baseline.
+	if baselineAfter != baselineBefore {
+		t.Errorf("public baseline_id changed on reopen: %s -> %s", baselineBefore, baselineAfter)
 	}
 	for name, before := range secretsBefore {
 		if secretsAfter[name] != before {

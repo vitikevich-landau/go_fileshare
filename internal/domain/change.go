@@ -7,6 +7,30 @@ import "fmt"
 // (§14.1).
 type ChangeSeq int64
 
+// BaselineID — непрозрачный идентификатор baseline snapshot, колонка
+// `journal_state.baseline_id` (§6.7, §14.6). Меняется при каждой compaction и
+// уходит клиенту в `CHANGES_RESPONSE` и в `CURSOR_EXPIRED.Details`.
+//
+// Формат — те же 32 символа нижнего регистра hex, что и у прочих непрозрачных
+// идентификаторов §2.1: значение попадает в `Details`, где допустимы только
+// короткие ASCII-строки (§3.9).
+type BaselineID string
+
+// NewBaselineID выдаёт новый случайный идентификатор baseline.
+func NewBaselineID() (BaselineID, error) {
+	raw, err := newRawID()
+	if err != nil {
+		return "", err
+	}
+	return BaselineID(formatRawID(raw)), nil
+}
+
+// Valid сообщает, что значение имеет каноническую форму §2.1.
+func (b BaselineID) Valid() bool {
+	_, err := parseRawID(string(b))
+	return err == nil
+}
+
 // ChangeOp — операция в журнале изменений, колонка `changes.operation` (§6.7).
 // Словарь совпадает один в один с проводным enum ChangeOp* (§14.3).
 type ChangeOp string

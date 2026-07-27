@@ -66,6 +66,9 @@ func applySchema0001(ctx context.Context, tx *sql.Tx, p SeedParams) error {
 	if err := seedPublicRoot(ctx, tx); err != nil {
 		return err
 	}
+	if err := seedPublicJournalState(ctx, tx); err != nil {
+		return err
+	}
 	return seedServerSecrets(ctx, tx)
 }
 
@@ -133,6 +136,39 @@ VALUES (?, ?, ?, ?, '', '', ?, 0, 0, NULL, NULL, ?, ?, NULL, NULL)`,
 	)
 	if err != nil {
 		return fmt.Errorf("seed public root: %w", err)
+	}
+	return nil
+}
+
+// seedPublicJournalState создаёт строку журнального состояния потока /public
+// (§6.7, §14.6): «строка journal_state есть у каждого потока; поток /public
+// учитывается строкой с user_id = 0». Системный аккаунт заведён в том числе
+// ради владения ею (§6.2), поэтому строка создаётся здесь же, а не на этапе
+// журнала: собственных потоков у пользователей ещё нет, а поток /public
+// существует с первой секунды вместе со своим корнем.
+//
+// Пропустить её до M17 нельзя не по формальной причине: compaction §14.6
+// шаг 3 — это UPDATE … WHERE user_id = :stream. При отсутствующей строке SQLite
+// обновит НОЛЬ строк и не сообщит об ошибке, то есть журнал потока молча
+// перестанет ужиматься.
+//
+// Начальные значения нормативны, а не выбраны: §14.6 фиксирует
+// «пока compaction не включена, min_retained_seq = 0, и CURSOR_EXPIRED не
+// возникает», а baseline_seq = 0 описывает состояние дерева на нулевом seq —
+// то есть пустой журнал сразу после установки. Строки этого состояния в
+// changes ещё нет, и baseline_id именует именно его.
+func seedPublicJournalState(ctx context.Context, tx *sql.Tx) error {
+	baselineID, err := domain.NewBaselineID()
+	if err != nil {
+		return fmt.Errorf("seed public journal state: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO journal_state (user_id, min_retained_seq, baseline_id, baseline_seq,
+                           baseline_created_at_ms)
+VALUES (?, 0, ?, 0, ?)`,
+		int64(domain.SystemUserID), string(baselineID), int64(domain.NowMillis()))
+	if err != nil {
+		return fmt.Errorf("seed public journal state: %w", err)
 	}
 	return nil
 }
