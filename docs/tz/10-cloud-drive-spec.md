@@ -2587,8 +2587,12 @@ v2-сессии и активные передачи. «Пересчёт UserCon
    reservations не отзываются; если новая квота меньше `used_bytes +
    reserved_bytes`, новые резервирования отклоняются `QUOTA_EXCEEDED`, а
    существующие upload'ы доводятся до конца.
-6. `user passwd` пересчитывает `stored_key` с новой случайной солью и
-   записывает действующий `kdf_algo`. Задать этому пользователю индивидуальное
+6. `user passwd` пересчитывает `stored_key` и записывает действующий
+   `kdf_algo`. Соль берётся по правилам §6.2 п. 1–2, а не выбирается этой
+   операцией: до появления раунда `AUTH_PARAMS` (M14) она остаётся
+   детерминированной `"fileshare-v2:" || login`, потому что на M12–M13 клиент
+   выводит её сам и случайная соль сделала бы вход невозможным; с M14 — 16 байт
+   из `crypto/rand`, новых при каждой смене пароля. Задать этому пользователю индивидуальное
    `auth_iters` нельзя до появления раунда `AUTH_PARAMS` в M14: до M14 значение
    одинаково у всех пользователей и меняется только глобально (§21.4).
 7. Каждая операция из таблицы пишет audit-запись (§20.2).
@@ -6919,7 +6923,7 @@ UPLOAD_BEGIN (§8.1-8.2)    BAD_REQUEST, INVALID_NAME, FILE_NOT_FOUND,
                            OPERATION_IN_PROGRESS, ACCESS_DENIED,
                            FEATURE_UNSUPPORTED, TLS_REQUIRED
 UPLOAD_CHUNK (§8.3)        BAD_REQUEST, UPLOAD_NOT_FOUND, UPLOAD_EXPIRED,
-                           OFFSET_MISMATCH, DISK_FULL, QUOTA_EXCEEDED,
+                           OFFSET_MISMATCH, DISK_FULL,
                            RATE_LIMITED, ACCESS_DENIED, SERVER_SHUTTING_DOWN
 UPLOAD_COMMIT (§8.4)       UPLOAD_NOT_FOUND, UPLOAD_EXPIRED, OFFSET_MISMATCH,
                            CHECKSUM_MISMATCH, REVISION_CONFLICT,
