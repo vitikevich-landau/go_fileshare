@@ -197,7 +197,6 @@ type Config struct {
 	DB        *db.DB
 	Users     *metadata.Users
 	Resources *metadata.Resources
-	Secrets   *metadata.Secrets
 	Layout    storage.Layout
 
 	// AuthIters — действующее auth.pbkdf2_iters (§19.3). Значение ОДНО на всю
@@ -239,13 +238,6 @@ type Service struct {
 	shares   Shares
 
 	authIters int
-
-	// serverSecret прочитан один раз при сборке. §6.12 разрешает менять его
-	// только локальной командой ОСТАНОВЛЕННОГО daemon (--rotate-secret), поэтому
-	// перечитывать его на каждом рукопожатии нечего; зато отсутствие строки
-	// становится ошибкой СТАРТА, как §6.12 и требует, вместо ошибки первого
-	// входа несуществующего пользователя.
-	serverSecret []byte
 }
 
 // New собирает сервис и проверяет, что собран он полностью.
@@ -257,8 +249,6 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		return nil, errors.New("users: Config.Users is nil")
 	case cfg.Resources == nil:
 		return nil, errors.New("users: Config.Resources is nil")
-	case cfg.Secrets == nil:
-		return nil, errors.New("users: Config.Secrets is nil")
 	case cfg.Layout.Root() == "":
 		return nil, errors.New("users: Config.Layout is not initialized")
 	case cfg.AuthIters <= 0:
@@ -269,21 +259,23 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 			"для локальных команд остановленного daemon задайте AllowNoSessions")
 	}
 
-	secret, err := cfg.Secrets.Value(ctx, domain.SecretServerSecret)
-	if err != nil {
+	// §6.2 п. 3 и §19.4 п. 19: действующее auth.pbkdf2_iters обязано совпадать с
+	// колонкой всех записей. Разошлись — не входит никто, а ответ сервера при этом
+	// не отличается от ответа на неверный пароль, поэтому сбой обязан случиться
+	// здесь, на сборке, а не на первом входе.
+	if err := cfg.Users.VerifyAuthIters(ctx, cfg.AuthIters); err != nil {
 		return nil, fmt.Errorf("users: %w", err)
 	}
 
 	s := &Service{
-		db:           cfg.DB,
-		users:        cfg.Users,
-		res:          cfg.Resources,
-		layout:       cfg.Layout,
-		sessions:     cfg.Sessions,
-		tokens:       cfg.Tokens,
-		shares:       cfg.Shares,
-		authIters:    cfg.AuthIters,
-		serverSecret: secret,
+		db:        cfg.DB,
+		users:     cfg.Users,
+		res:       cfg.Resources,
+		layout:    cfg.Layout,
+		sessions:  cfg.Sessions,
+		tokens:    cfg.Tokens,
+		shares:    cfg.Shares,
+		authIters: cfg.AuthIters,
 	}
 	if s.sessions == nil {
 		s.sessions = noSessions{}

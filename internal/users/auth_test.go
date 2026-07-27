@@ -102,11 +102,53 @@ func TestAuthParamsRealSaltIsDeterministic(t *testing.T) {
 	}
 }
 
-// TestAuthParamsFakeSaltIsDeterministicAndPerLogin — §3.3 п. 1: фиктивная соль
-// несуществующего логина выводится от логина и server_secret. Отсюда два
-// требования, и оба проверяются: одинаковый логин даёт одинаковую соль (иначе
-// повторный запрос выдал бы, что пользователя нет), разные логины — разные соли
-// (иначе одна соль на всех выдала бы то же самое).
+// TestAuthParamsFakeSaltIsIndistinguishable — правило перехода §3.3 п. 1: пока
+// установка хранит детерминированные соли, фиктивная соль обязана иметь ТУ ЖЕ
+// форму.
+//
+// Проверяется не форма ради формы, а свойство: ответ на несуществующий логин
+// побайтово таков, каким был бы ответ на существующий с тем же логином, — значит,
+// по ответу нельзя узнать, есть ли учётная запись. Формула §3.3 п. 1
+// (HMAC от server_secret) дала бы здесь 16 случайных байт против производной от
+// логина и сама отвечала бы на этот вопрос; она вводится вместе со случайными
+// солями в M14.
+func TestAuthParamsFakeSaltIsIndistinguishable(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	e.seed(t, metadata.NewUser{Login: "alice", Role: domain.RoleUser, Secret: secretFor("alice", "pw")})
+
+	real, err := e.svc.AuthParams(ctx, "alice")
+	if err != nil {
+		t.Fatalf("AuthParams(alice): %v", err)
+	}
+	fake, err := e.svc.AuthParams(ctx, "ghost")
+	if err != nil {
+		t.Fatalf("AuthParams(ghost): %v", err)
+	}
+
+	if !bytes.Equal(fake.Salt, domain.LegacySalt("ghost")) {
+		t.Errorf("фиктивная соль = %q, want %q (§3.3 п. 1, §6.2 п. 2)",
+			fake.Salt, domain.LegacySalt("ghost"))
+	}
+	if !bytes.Equal(real.Salt, domain.LegacySalt("alice")) {
+		t.Errorf("настоящая соль = %q, want %q (§6.2 п. 2)", real.Salt, domain.LegacySalt("alice"))
+	}
+	// Всё, кроме соли и challenge, обязано совпадать: иначе различие переезжает в
+	// другое поле того же ответа.
+	if real.KdfAlgo != fake.KdfAlgo || real.AuthIters != fake.AuthIters || real.KdfParams != fake.KdfParams {
+		t.Errorf("ответы различимы вне соли: %+v против %+v", real, fake)
+	}
+	// Длина соли — тоже наблюдаемая величина, и на логинах одной длины она обязана
+	// совпадать.
+	if len(real.Salt) != len(fake.Salt) {
+		t.Errorf("длина соли выдаёт существование записи: %d против %d", len(real.Salt), len(fake.Salt))
+	}
+}
+
+// TestAuthParamsFakeSaltIsDeterministicAndPerLogin — соль несуществующего логина
+// детерминирована (иначе повторный запрос выдал бы отсутствие записи) и зависит
+// от логина (иначе одна соль на всех выдала бы то же самое). После M14 это
+// обеспечивает server_secret; до M14 — производная от логина.
 func TestAuthParamsFakeSaltIsDeterministicAndPerLogin(t *testing.T) {
 	ctx := context.Background()
 	e := newEnv(t)
@@ -122,9 +164,6 @@ func TestAuthParamsFakeSaltIsDeterministicAndPerLogin(t *testing.T) {
 	if !bytes.Equal(first.Salt, second.Salt) {
 		t.Error("фиктивная соль не детерминирована: повторный запрос выдаёт отсутствие пользователя")
 	}
-	if len(first.Salt) != domain.RandomSaltLen {
-		t.Errorf("фиктивная соль %d байт, want %d (§3.3 п. 1)", len(first.Salt), domain.RandomSaltLen)
-	}
 
 	other, err := e.svc.AuthParams(ctx, "ghost2")
 	if err != nil {
@@ -132,43 +171,6 @@ func TestAuthParamsFakeSaltIsDeterministicAndPerLogin(t *testing.T) {
 	}
 	if bytes.Equal(first.Salt, other.Salt) {
 		t.Error("фиктивная соль одинакова для разных логинов")
-	}
-}
-
-// TestAuthParamsFakeSaltSurvivesRestart — §6.12: server_secret создаётся
-// миграцией и не регенерируется, поэтому фиктивная соль обязана быть той же
-// после рестарта. Иначе клиент, дважды спросивший параметры одного и того же
-// несуществующего логина, увидел бы разные соли — то есть узнал бы, что
-// пользователя нет.
-func TestAuthParamsFakeSaltSurvivesRestart(t *testing.T) {
-	ctx := context.Background()
-	e := newEnv(t)
-
-	before, err := e.svc.AuthParams(ctx, "ghost")
-	if err != nil {
-		t.Fatalf("AuthParams: %v", err)
-	}
-
-	// Второй сервис поверх той же базы — то же, что перезапуск daemon: секрет
-	// читается заново из metadata.db.
-	restarted, err := users.New(ctx, users.Config{
-		DB:        e.db,
-		Users:     e.repo,
-		Resources: e.res,
-		Secrets:   metadata.NewSecrets(e.db),
-		Layout:    e.layout,
-		AuthIters: testAuthIters,
-		Sessions:  e.spy,
-	})
-	if err != nil {
-		t.Fatalf("users.New: %v", err)
-	}
-	after, err := restarted.AuthParams(ctx, "ghost")
-	if err != nil {
-		t.Fatalf("AuthParams после рестарта: %v", err)
-	}
-	if !bytes.Equal(before.Salt, after.Salt) {
-		t.Error("фиктивная соль изменилась после рестарта (§3.3 п. 1, §6.12)")
 	}
 }
 

@@ -107,7 +107,6 @@ func newEnv(t *testing.T) *env {
 		DB:        d,
 		Users:     repo,
 		Resources: res,
-		Secrets:   metadata.NewSecrets(d),
 		Layout:    layout,
 		AuthIters: testAuthIters,
 		Sessions:  sp,
@@ -172,7 +171,6 @@ func TestNewRejectsIncompleteConfig(t *testing.T) {
 			DB:        full.db,
 			Users:     full.repo,
 			Resources: full.res,
-			Secrets:   metadata.NewSecrets(full.db),
 			Layout:    full.layout,
 			AuthIters: testAuthIters,
 			Sessions:  full.spy,
@@ -183,7 +181,6 @@ func TestNewRejectsIncompleteConfig(t *testing.T) {
 		"без DB":          func(c *users.Config) { c.DB = nil },
 		"без репозитория": func(c *users.Config) { c.Users = nil },
 		"без resources":   func(c *users.Config) { c.Resources = nil },
-		"без secrets":     func(c *users.Config) { c.Secrets = nil },
 		"без раскладки":   func(c *users.Config) { c.Layout = storage.Layout{} },
 		"без auth_iters":  func(c *users.Config) { c.AuthIters = 0 },
 		"auth_iters < 0":  func(c *users.Config) { c.AuthIters = -1 },
@@ -210,32 +207,57 @@ func TestNewRejectsIncompleteConfig(t *testing.T) {
 	}
 }
 
-// TestNewRequiresServerSecret — §6.12: отсутствие строки server_secrets —
-// фатальная ошибка. Сервис читает секрет при сборке именно поэтому: сбой обязан
-// случиться на старте, а не при первом входе несуществующего пользователя.
-func TestNewRequiresServerSecret(t *testing.T) {
-	e := newEnv(t)
+// TestNewRejectsAuthItersDivergedFromConfig — §6.2 п. 3, §19.4 п. 19: повышение
+// auth.pbkdf2_iters на непустой БД до M14 запрещено, и сборка сервиса обязана
+// отказать.
+//
+// Проверять это иначе нечем. Расхождение не даёт ни одной наблюдаемой ошибки во
+// время работы: клиент выводит ключ по значению из HELLO_OK, сервер сверяет его с
+// верификатором, посчитанным по колонке, не сходится — и отвечает AUTH_FAIL, тем
+// же ответом, что и на неверный пароль. Ни один пользователь не входит, и ни одна
+// запись в логе не говорит почему.
+func TestNewRejectsAuthItersDivergedFromConfig(t *testing.T) {
 	ctx := context.Background()
+	e := newEnv(t)
+	e.seed(t, metadata.NewUser{Login: "alice", Role: domain.RoleUser, Secret: secretFor("alice", "pw")})
 
-	err := e.db.Write(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `DELETE FROM server_secrets WHERE name = ?`,
-			string(domain.SecretServerSecret))
-		return err
-	})
-	if err != nil {
-		t.Fatalf("удаление секрета: %v", err)
-	}
-
-	_, err = users.New(ctx, users.Config{
+	cfg := users.Config{
 		DB:        e.db,
 		Users:     e.repo,
 		Resources: e.res,
-		Secrets:   metadata.NewSecrets(e.db),
 		Layout:    e.layout,
-		AuthIters: testAuthIters,
+		AuthIters: testAuthIters * 2, // оператор поднял значение в конфиге
+		Sessions:  e.spy,
+	}
+	if _, err := users.New(ctx, cfg); err == nil {
+		t.Fatal("сервис собран на базе, чьи записи посчитаны с другим числом итераций")
+	}
+
+	// Прежнее значение — рабочее: правило запрещает расхождение, а не саму
+	// величину.
+	cfg.AuthIters = testAuthIters
+	if _, err := users.New(ctx, cfg); err != nil {
+		t.Fatalf("сборка с совпадающим значением: %v", err)
+	}
+}
+
+// TestNewAllowsAnyItersOnFreshDatabase — свежая установка до --init-admin
+// содержит только системный аккаунт, чьё значение проставила миграция и обновить
+// нечем (§6.2). Требовать совпадения с ним значило бы запретить выбор
+// auth.pbkdf2_iters на пустой базе — то есть при первой же установке.
+func TestNewAllowsAnyItersOnFreshDatabase(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+
+	_, err := users.New(ctx, users.Config{
+		DB:        e.db,
+		Users:     e.repo,
+		Resources: e.res,
+		Layout:    e.layout,
+		AuthIters: testAuthIters * 3,
 		Sessions:  e.spy,
 	})
-	if err == nil {
-		t.Fatal("сервис собран без server_secret")
+	if err != nil {
+		t.Fatalf("сборка на пустой базе: %v", err)
 	}
 }
