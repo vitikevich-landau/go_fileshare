@@ -23,8 +23,9 @@ const testAuthIters = 4096
 // потому что таблица §7.4 требует не только «что сделано», но и «до того, как
 // команда вернёт успех».
 type spy struct {
-	mu    sync.Mutex
-	calls []string
+	mu        sync.Mutex
+	calls     []string
+	sharesErr error
 }
 
 func (s *spy) record(call string) {
@@ -60,9 +61,25 @@ func (s *spy) RevokeUser(_ context.Context, _ domain.UserID) int {
 	return 1
 }
 
-func (s *spy) SetUserShares(_ context.Context, _ domain.UserID, state users.ShareState) int {
+// sharesErr, будучи непустым, заставляет порт ссылок отказать: §6.8 держит
+// ссылки в SQLite, и отменённый контекст, занятая база или ошибка ввода-вывода —
+// это его штатные исходы, а не гипотеза.
+func (s *spy) SetUserShares(_ context.Context, _ domain.UserID, state users.ShareState) (int, error) {
 	s.record("shares." + string(state))
-	return 1
+	s.mu.Lock()
+	failure := s.sharesErr
+	s.mu.Unlock()
+	if failure != nil {
+		return 0, failure
+	}
+	return 1, nil
+}
+
+// failShares включает и выключает отказ порта ссылок.
+func (s *spy) failShares(err error) {
+	s.mu.Lock()
+	s.sharesErr = err
+	s.mu.Unlock()
 }
 
 // env — сервис поверх свежей базы и пустого data root.

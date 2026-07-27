@@ -135,8 +135,7 @@ func (s *Service) SetState(ctx context.Context, userID domain.UserID, state doma
 		return translate(err)
 	}
 
-	s.applyRevocation(ctx, opForState(state), userID)
-	return nil
+	return s.applyRevocation(ctx, opForState(state), userID)
 }
 
 // SetRole меняет роль (`user role`, §7.4).
@@ -145,11 +144,14 @@ func (s *Service) SetState(ctx context.Context, userID domain.UserID, state doma
 // и проверка выполняется В ТОЙ ЖЕ транзакции (§7.4): два параллельных понижения,
 // каждое из которых видит двух администраторов, иначе сняли бы обоих.
 //
-// Запрет «kick самого себя, в том числе до изменения роли» (§7.4, docs/tz/05-admin.md
-// §3) здесь НЕ реализуется: сервис не знает, кто его вызвал, — §27 не передаёт
-// актора ни одному методу. Правило принадлежит границе админ-команды, где актор
-// известен, и там же ему место, потому что там же живёт и запрет самому себе
-// сделать kick.
+// Запрет «kick самого себя, в том числе до изменения роли» (§7.4,
+// docs/tz/05-admin.md §3) здесь ещё НЕ реализован, и место ему именно здесь:
+// §27 п. 9 закрепил, что проверка принадлежит сервису, а не границе команды, —
+// команд, понижающих собственную роль, больше одной (`user role`,
+// `user disable`, `user delete`, deprecated-алиас `--role`), и на границе её
+// пришлось бы повторить в каждой. Не хватает единственного: актора, который
+// вводится вместе с таблицей audit_events, потому что раньше его принимать
+// некому (§27 п. 9, §20.2).
 func (s *Service) SetRole(ctx context.Context, userID domain.UserID, role domain.Role) error {
 	if userID == domain.SystemUserID {
 		return fmt.Errorf("%w: role of the system account is fixed (§6.2)", ErrSystemAccount)
@@ -170,8 +172,7 @@ func (s *Service) SetRole(ctx context.Context, userID domain.UserID, role domain
 
 	// Сессия сохраняется, но обязана перечитать роль до следующей операции, а
 	// подписки на админские события снимаются немедленно (§7.4 п. 3–4).
-	s.applyRevocation(ctx, opRole, userID)
-	return nil
+	return s.applyRevocation(ctx, opRole, userID)
 }
 
 // SetPassword меняет пароль (`user passwd`, §7.4 п. 6).
@@ -202,8 +203,7 @@ func (s *Service) SetPassword(ctx context.Context, userID domain.UserID, in NewS
 		return translate(err)
 	}
 
-	s.applyRevocation(ctx, opPasswd, userID)
-	return nil
+	return s.applyRevocation(ctx, opPasswd, userID)
 }
 
 // SetQuota меняет квоту (`user quota`, §7.4). Ноль означает unlimited (§6.2).
@@ -233,8 +233,7 @@ func (s *Service) SetQuota(ctx context.Context, userID domain.UserID, quotaBytes
 
 	// Новая квота применяется к следующему резервированию, поэтому сессия
 	// сохраняется и лишь перечитывает UserContext (§7.4 п. 3, п. 5).
-	s.applyRevocation(ctx, opQuota, userID)
-	return nil
+	return s.applyRevocation(ctx, opQuota, userID)
 }
 
 // Quota возвращает счётчики квоты (§27). Читается на каждый вызов: §27 п. 5

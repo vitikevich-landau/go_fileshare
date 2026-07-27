@@ -94,8 +94,7 @@ func (s *Service) Purge(ctx context.Context, userID domain.UserID) error {
 	if err := s.layout.RemoveUserData(userID); err != nil {
 		return fmt.Errorf("users: purge of user %d committed, but its directories remain: %w", userID, err)
 	}
-	s.applyRevocation(ctx, opPurge, userID)
-	return nil
+	return s.applyRevocation(ctx, opPurge, userID)
 }
 
 // assertPurgeable проверяет, что у пользователя не осталось объектов, которые

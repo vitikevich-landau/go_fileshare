@@ -595,3 +595,71 @@ func TestListIncludesSystemAccount(t *testing.T) {
 		}
 	}
 }
+
+// TestRevocationFailureIsNotSuccess — §7.4 требует привести ссылки в соответствие
+// ДО того, как команда вернёт успех. Порт ссылок пишет в SQLite (§6.8), то есть
+// может отказать; значит, `user disable` не вправе ответить успехом, оставив
+// публичные ссылки работающими.
+//
+// Проверяется и то, что состояние при этом ЗАФИКСИРОВАНО: отзыв идёт после
+// commit, поэтому отказ порта не откатывает изменение — он делает его неполным, и
+// ровно об этом обязана сообщить ошибка.
+func TestRevocationFailureIsNotSuccess(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	e.admin(t, "root")
+	u := e.member(t, "alice", "pw")
+
+	e.spy.failShares(errors.New("database is locked"))
+	err := e.svc.SetState(ctx, u.ID, domain.UserDisabled)
+	if !errors.Is(err, users.ErrRevocationIncomplete) {
+		t.Fatalf("SetState вернул %v, ожидалась ErrRevocationIncomplete", err)
+	}
+
+	if got := e.state(t, u.ID); got != domain.UserDisabled {
+		t.Errorf("состояние = %q: отзыв идёт после commit, изменение обязано остаться", got)
+	}
+	// Способный отказать порт вызывается последним, поэтому к моменту отказа
+	// сессии закрыты и токены отозваны — выполнено всё выполнимое.
+	want := []string{"sessions.close", "tokens.revoke", "shares.suspended"}
+	if got := e.spy.log(); !slices.Equal(got, want) {
+		t.Errorf("вызовы реестров = %v, ожидалось %v", got, want)
+	}
+
+	// Восстановление — повтор той же команды: перевод в то же состояние разрешён
+	// именно для этого и заново применяет таблицу §7.4.
+	e.spy.failShares(nil)
+	e.spy.reset()
+	if err := e.svc.SetState(ctx, u.ID, domain.UserDisabled); err != nil {
+		t.Fatalf("повтор после восстановления порта: %v", err)
+	}
+	if got := e.spy.log(); !slices.Equal(got, want) {
+		t.Errorf("повтор вызвал %v, ожидалось %v", got, want)
+	}
+}
+
+// TestRevocationFailureOnOperationsWithoutShares — операции, у которых в колонке
+// shares прочерк (§7.4: passwd, role, quota), отказом порта ссылок не задеваются:
+// они его не вызывают вовсе.
+func TestRevocationFailureOnOperationsWithoutShares(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	e.admin(t, "root")
+	u := e.member(t, "alice", "pw")
+	e.spy.failShares(errors.New("database is locked"))
+
+	tests := map[string]func() error{
+		"user passwd": func() error {
+			return e.svc.SetPassword(ctx, u.ID, users.NewSecret{Password: "new-password"})
+		},
+		"user role":  func() error { return e.svc.SetRole(ctx, u.ID, domain.RoleAdmin) },
+		"user quota": func() error { return e.svc.SetQuota(ctx, u.ID, 1<<30) },
+	}
+	for name, op := range tests {
+		t.Run(name, func(t *testing.T) {
+			if err := op(); err != nil {
+				t.Fatalf("%s вернула %v, хотя ссылок не касается", name, err)
+			}
+		})
+	}
+}

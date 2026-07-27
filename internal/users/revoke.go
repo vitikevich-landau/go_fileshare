@@ -2,6 +2,7 @@ package users
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/vitikevich-landau/go_fileshare/internal/domain"
 )
@@ -97,13 +98,16 @@ func allOperations() []operation {
 //     что зафиксировано. Пользователь, ставший disabled, войти не может; после
 //     passwd не подойдёт прежний пароль.
 //
-// Функция не возвращает ошибку, и это следствие устройства портов, а не
-// упущение: все три реализации работают с памятью процесса (реестр сессий,
-// реестр токенов) либо с БД в собственной транзакции, и «частично отозвано» для
-// них не существует. Появится порт, который может отказать, — сигнатура обязана
-// поменяться вместе с ним, потому что таблица §7.4 требует НЕ вернуть успех, если
-// отзыв не выполнен.
-func (s *Service) applyRevocation(ctx context.Context, op operation, userID domain.UserID) {
+// Ошибка означает, что состояние зафиксировано, а отзыв выполнен не полностью, и
+// операция обязана вернуть её вместо успеха (§7.4). Отказать может ровно один
+// порт — Shares, потому что он пишет в БД; сессии и токены суть состояние
+// процесса (см. объявления портов).
+//
+// Порядок шагов подобран так, что способный отказать порт вызывается ПОСЛЕДНИМ: к
+// моменту отказа сессии уже закрыты, а токены отозваны, то есть выполнено всё
+// выполнимое. Колонки таблицы §7.4 независимы, и отказ перевода ссылок не причина
+// оставить пользователю живые сессии.
+func (s *Service) applyRevocation(ctx context.Context, op operation, userID domain.UserID) error {
 	row, ok := revocationTable[op]
 	if !ok {
 		// Недостижимо: операции — константы этого пакета. Паника здесь лучше
@@ -123,8 +127,12 @@ func (s *Service) applyRevocation(ctx context.Context, op operation, userID doma
 		s.tokens.RevokeUser(ctx, userID)
 	}
 	if row.shares != "" {
-		s.shares.SetUserShares(ctx, userID, row.shares)
+		if _, err := s.shares.SetUserShares(ctx, userID, row.shares); err != nil {
+			return fmt.Errorf("%w: %s left shares of user %d out of state %q: %w",
+				ErrRevocationIncomplete, op, userID, row.shares, err)
+		}
 	}
+	return nil
 }
 
 // opForState возвращает операцию §7.4, которой соответствует перевод в state.
