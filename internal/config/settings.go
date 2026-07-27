@@ -57,6 +57,27 @@ type LogSettings struct {
 	Level string `json:"level"` // hot: debug|info|warn|error
 }
 
+// DatabaseSettings — metadata DB (docs/tz/10-cloud-drive-spec.md §6, §19.3).
+// Все четыре ключа restart-only: пул соединений строится один раз при старте, а
+// PRAGMA задаются в DSN и действуют на соединение (ADR 0001 §4.2), поэтому
+// «горячая» смена значения не дошла бы до уже открытых соединений и лишь
+// разошлась бы с фактическим состоянием базы.
+type DatabaseSettings struct {
+	// Enabled=false оставляет демон в модели до M12: отдельный legacy-корень
+	// раздачи допускается только в этом режиме (§19.6 п. 1).
+	Enabled bool `json:"enabled"` // restart
+	// Path — путь к файлу metadata.db; рядом с ним живут -wal и -shm.
+	Path string `json:"path"` // restart
+	// BusyTimeoutMs — busy_timeout на КАЖДОМ соединении пула (§6.1). Ноль
+	// запрещён: он превращает любую конкурентную запись в немедленный
+	// SQLITE_BUSY (§19.4 п. 17).
+	BusyTimeoutMs Milliseconds `json:"busy_timeout_ms"` // restart
+	// Synchronous — NORMAL или FULL. Значение выражено в конфиге, а не зашито в
+	// DSN, потому что §6.1 требует сверять фактическое значение PRAGMA с
+	// ожидаемым, а у ожидаемого обязан быть единственный источник.
+	Synchronous string `json:"synchronous"` // restart
+}
+
 // Settings — полная конфигурация демона: дерево из подгрупп выше.
 type Settings struct {
 	Server   ServerSettings   `json:"server"`
@@ -65,7 +86,16 @@ type Settings struct {
 	Events   EventsSettings   `json:"events"`
 	Auth     AuthSettings     `json:"auth"`
 	Log      LogSettings      `json:"log"`
+	Database DatabaseSettings `json:"database"`
 }
+
+// Значения database.synchronous (§19.4 п. 17). «OFF» запрещён: он допускает
+// потерю уже закоммиченных транзакций при падении процесса, что делает
+// недостижимыми инварианты §2.2 о согласованности БД и файловой системы.
+const (
+	SynchronousNormal = "NORMAL"
+	SynchronousFull   = "FULL"
+)
 
 // MinPBKDF2Iters — рекомендуемое число итераций PBKDF2 (порог безопасности из
 // docs/tz/06-security.md §2). Это СОВЕТ, не жёсткое требование при загрузке:
@@ -91,6 +121,12 @@ func Default() Settings {
 		Events:   EventsSettings{Enabled: true, DebounceMs: 500},
 		Auth:     AuthSettings{UsersFile: "users.json", PBKDF2Iters: MinPBKDF2Iters},
 		Log:      LogSettings{Level: "info"},
+		Database: DatabaseSettings{
+			Enabled:       true,
+			Path:          "metadata.db",
+			BusyTimeoutMs: 5000,
+			Synchronous:   SynchronousNormal,
+		},
 	}
 }
 
@@ -148,6 +184,19 @@ func (s Settings) Validate() string {
 	case "debug", "info", "warn", "error":
 	default:
 		return fmt.Sprintf("log.level %q must be one of debug|info|warn|error", s.Log.Level)
+	}
+	// docs/tz/10-cloud-drive-spec.md §19.4 п. 17.
+	switch s.Database.Synchronous {
+	case SynchronousNormal, SynchronousFull:
+	default:
+		return fmt.Sprintf("database.synchronous %q must be one of %s|%s",
+			s.Database.Synchronous, SynchronousNormal, SynchronousFull)
+	}
+	if s.Database.BusyTimeoutMs <= 0 {
+		return "database.busy_timeout_ms must be > 0"
+	}
+	if s.Database.Enabled && s.Database.Path == "" {
+		return "database.path must not be empty when database.enabled is true"
 	}
 	return ""
 }

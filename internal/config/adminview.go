@@ -17,6 +17,7 @@ type KeyInfo struct {
 func (s Settings) AdminView() []KeyInfo {
 	u := func(v uint64) string { return strconv.FormatUint(v, 10) }
 	i := func(v int) string { return strconv.Itoa(v) }
+	b := func(v bool) string { return strconv.FormatBool(v) }
 	return []KeyInfo{
 		{"server.port", i(s.Server.Port), false},
 		{"server.share_root", s.Server.ShareRoot, false},
@@ -31,5 +32,9 @@ func (s Settings) AdminView() []KeyInfo {
 		{"events.debounce_ms", i(s.Events.DebounceMs), false},
 		{"auth.pbkdf2_iters", i(s.Auth.PBKDF2Iters), false},
 		{"log.level", s.Log.Level, true},
+		{"database.enabled", b(s.Database.Enabled), false},
+		{"database.path", s.Database.Path, false},
+		{"database.busy_timeout_ms", i(s.Database.BusyTimeoutMs), false},
+		{"database.synchronous", s.Database.Synchronous, false},
 	}
 }

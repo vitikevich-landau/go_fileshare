@@ -70,6 +70,13 @@ var restartKeys = map[string]bool{
 	// изменение без эффекта.
 	"events.debounce_ms": true,
 	"events.enabled":     true,
+	// Пул соединений metadata DB строится один раз при старте, а PRAGMA заданы в
+	// DSN и действуют на соединение (ADR 0001 §4.2): горячая смена не дошла бы
+	// до уже открытых соединений (docs/tz/10-cloud-drive-spec.md §19.3).
+	"database.enabled":         true,
+	"database.path":            true,
+	"database.busy_timeout_ms": true,
+	"database.synchronous":     true,
 }
 
 // Set меняет один горячий ключ на value, валидирует получившийся снапшот и
