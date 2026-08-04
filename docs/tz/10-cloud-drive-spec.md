@@ -8309,6 +8309,16 @@ B0–B9, из которых B0 уже сдана — впереди девят�
   математика SCRAM отдельно от wire layout, arch-тест графа импортов §4.3, CI на
   ветках `feat/**`.
 
+**Чего в B0 НЕТ, вопреки первому впечатлению от списка выше.** Всё
+перечисленное сдано как БИБЛИОТЕКИ, но ни один из этих пакетов не подключён к
+работающему демону: `cmd/fshare-daemon` по-прежнему поднимает общий
+`vfs.New(cfg.Server.ShareRoot, …)` и `auth.Load(cfg.Auth.UsersFile)`,
+`server.Options` принимает только `*vfs.VFS` и `*auth.DB`, а вызовов
+`authz.Context` в сервере нет вообще. Значит **аутентифицированная v2-сессия
+сегодня по-прежнему ходит в общий share root**, и изоляция §7.2 не действует,
+хотя код для неё написан. Провязка — обязательный ПЕРВЫЙ пункт B1, и до неё ни
+один пункт DoD M12 об изоляции не проверяем.
+
 **Переход к одноуровневой схеме.** `feat/m12-pr3-services` вливается в
 `feat/m12`; получившееся состояние и есть ствол — из него создаётся
 `cloud-drive`, после чего `feat/m12` закрывается и B1 ответвляется уже от
@@ -8319,6 +8329,18 @@ B0–B9, из которых B0 уже сдана — впереди девят�
 
 Состав (пункты 4, 6–8 и 10–12 раздела M12 §25):
 
+- **провязка сервисов B0 в демон — первым коммитом, до всего остального.**
+  `cmd/fshare-daemon` перестаёт создавать общий `vfs.New(cfg.Server.ShareRoot,
+  …)` и `auth.Load(cfg.Auth.UsersFile)` и строит вместо них `UserService` и
+  `AuthorizationService` поверх metadata DB; `server.Options` меняет `*vfs.VFS`
+  и `*auth.DB` на эти сервисы; сессия любой версии протокола получает
+  `UserContext` и per-user `os.Root` по §5.1, а v2-сессия монтируется на home
+  своего пользователя read-only; порт `users.Sessions` реализуется поверх
+  `server.Registry`, чтобы отзыв §7.4 доставал до живых соединений. Вместе с
+  этим закрывается п. 9 §25 M12: `auth.users_file` объявляется deprecated,
+  SIGHUP перестаёт его читать, `ADMIN_RELOAD_USERS` меняет смысл на «перечитать
+  кэш пользователей из SQLite». Без этого коммита изоляция §7.2 остаётся
+  ненаступившей, а всё, что идёт ниже, строится поверх общего share root;
 - v3 handshake: `HELLO ProtoVersion=3`, `CAPABILITIES_REQUEST/RESPONSE`
   (0x60/0x61), биты `CapNamespaces`, `CapEventFilter`, `CapPaging`; `ERROR_V3`
   (0x6F); `RequestID` первым полем тела каждого v3 control-сообщения; правило
@@ -8776,23 +8798,34 @@ type LockManager interface {
 Фундамент M12 сдан пачкой B0 (§26): соседние документы `docs/tz`
 синхронизированы, SQLite-драйвер выбран по критериям §6.1, миграция `0001` со
 всеми таблицами §6 применяется, `users.json` импортирован с одинаковым для всех
-`auth_iters`, `UserID` и `UserContext` заведены для ЛЮБОЙ аутентифицированной
-сессии независимо от версии протокола, отдельный `os.Root` на home открыт и
-v2-сессия смонтирована на него read-only.
+`auth_iters`, написаны `UserService`, `AuthorizationService`, `UserContext` для
+ЛЮБОЙ сессии и раскладка §5.1 с per-user `os.Root`.
+
+**Написаны — но не подключены.** Демон всё ещё работает через общий
+`vfs.VFS` и `auth.DB` из `users.json`, `authz.Context` не вызывается нигде, и
+аутентифицированная v2-сессия по-прежнему видит общий share root. Пока это так,
+ни один пункт DoD M12 об изоляции не проверяем, сколько бы кода ни лежало в
+`internal/users` и `internal/authz`.
 
 Следующий шаг — пачка B1 (`feat/b1-v3-session`), и её внутренний порядок таков:
 
-1. объявить `resources` источником истины для list/stat/checksum и упразднить
+1. провязать `UserService` и `AuthorizationService` в `cmd/fshare-daemon` и
+   `server.Options` вместо `vfs.VFS` и `auth.DB`, выдать каждой сессии
+   `UserContext` и per-user `os.Root`, смонтировать v2-сессию на home
+   read-only, реализовать порт `users.Sessions` поверх `server.Registry` и
+   закрыть п. 9 §25 M12 (`auth.users_file` deprecated, SIGHUP его не читает,
+   `ADMIN_RELOAD_USERS` перечитывает кэш из SQLite);
+2. объявить `resources` источником истины для list/stat/checksum и упразднить
    файловый checksum-кэш;
-2. ввести `HELLO ProtoVersion=3` и `CAPABILITIES` с битами `CapNamespaces`,
+3. ввести `HELLO ProtoVersion=3` и `CAPABILITIES` с битами `CapNamespaces`,
    `CapEventFilter`, `CapPaging`;
-3. ввести v3 list/stat/download (`0x62`–`0x65`, `0xD0`–`0xD4`) поверх
+4. ввести v3 list/stat/download (`0x62`–`0x65`, `0xD0`–`0xD4`) поверх
    `resources` и `UserContext`, выдавая листинг страницами с подписанным page
    token; существующие v2-обработчики `LIST`/`STAT`/`DOWNLOAD` перевести на тот
    же `FileService`;
-4. перевести рассылку событий на per-recipient рендеринг;
-5. закрыть secure bootstrap, audit и скелет `--fsck`;
-6. написать isolation integration test — отдельно для `ProtoVersion=3` и для
+5. перевести рассылку событий на per-recipient рендеринг;
+6. закрыть secure bootstrap, audit и скелет `--fsck`;
+7. написать isolation integration test — отдельно для `ProtoVersion=3` и для
    `ProtoVersion=2`.
 
 Upload не начинается, пока B1 не влита. Такой порядок не даёт построить upload
