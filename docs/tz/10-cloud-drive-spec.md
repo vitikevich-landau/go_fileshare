@@ -6820,7 +6820,7 @@ fshare-daemon --migrate-users users.json [--overwrite-existing]
    новым кодом не является. Дублировать его новым номером запрещено.
 2. `CANCELLED = 14` существует (`internal/proto/proto.go:249`) и активно
    используется download-путём (`internal/server/download.go:97`). Пробел в
-   документации закрыт правкой PR0 (§26): код описан в
+   документации закрыт пачкой B0 (§26): код описан в
    `docs/tz/02-protocol-v2.md` §2.6 — когда отправляется, когда НЕ отправляется,
    что делает клиент, `Retryable = 0`. Код остаётся валидным и для v3-передач
    (§12.1, §12.2); в upload-пути v3 он не используется — там на `UPLOAD_CANCEL`
@@ -7776,8 +7776,8 @@ rehash соответствующего файла.
    `CapQuota`.
 2. Recovery markers, startup reconciliation и `FaultPoint`-хуки перенесены в
    M13: DoD M13 требует переживать injected faults, §5.4 делает маркер
-   обязательной частью atomic publish, а §26 уже включает в M13 PR «atomic
-   commit + recovery».
+   обязательной частью atomic publish, а §26 отдаёт маркеры и atomic publish
+   пачке B2, из которой atomic commit в B3 растёт напрямую.
 3. Пул transfer-соединений и transfer session token целиком отнесены к M14: до
    M14 нет TLS, а токен не выдаётся вне TLS. На M13 действует
    `MaxParallelTransfer = 1`, upload и download идут по control connection.
@@ -7866,7 +7866,7 @@ rehash соответствующего файла.
     `config.AdminView` показывает все ключи §19.3; `Dockerfile`,
     `docker-compose.yml`, README и примеры конфигурации переводятся на
     `storage.data_root`; соседние документы `docs/tz` приводятся в соответствие
-    (§26, PR0).
+    (§26, пачка B0).
 
 ### Definition of Done
 
@@ -8203,9 +8203,43 @@ rehash соответствующего файла.
 
 ---
 
-## 26. Рекомендуемый порядок PR внутри этапов
+## 26. Ветки реализации
 
-Каждый этап разбивается на небольшие вертикальные PR:
+**Ствол этой работы — не `main`, а параллельная ветка `cloud-drive`.** `main`
+остаётся на состоянии до M12 и в разработке M12–M18 не участвует: туда ничего не
+вливается, пока продукт не собран целиком. Вопрос «когда `cloud-drive`
+возвращается в `main`» решается отдельно и в §26 не входит.
+
+Ветвление одноуровневое: `cloud-drive` ← `feat/<ветка>`. Подветок нет,
+промежуточная ветка этапа (`feat/mNN`) больше не заводится. Одна пачка — одна
+ветка — один PR — один мердж в `cloud-drive`.
+
+Работа делится не на мелкие вертикальные PR, а на девять крупных пачек. Пачка
+не обязана совпадать с этапом §25: этапы остаются единицей ЗАМЫСЛА (scope и
+Definition of Done), пачки — единицей ПОСТАВКИ. Соответствие:
+
+| Пачка | Ветка | Этап §25 |
+| --- | --- | --- |
+| B0 (сдано) | `feat/m12` → становится `cloud-drive` | M12, фундамент |
+| B1 | `feat/b1-v3-session` | M12, остаток — закрывает DoD M12 |
+| B2 | `feat/b2-mutations` | M13, первая половина |
+| B3 | `feat/b3-upload` | M13, вторая половина — закрывает DoD M13 |
+| B4 | `feat/b4-tls` | M14 целиком |
+| B5 | `feat/b5-trash-versions` | M15 целиком |
+| B6 | `feat/b6-shares` | M16 целиком |
+| B7 | `feat/b7-journal` | M17, серверная половина |
+| B8 | `feat/b8-sync` | M17, клиентская половина — закрывает DoD M17 |
+| B9 | `feat/b9-scale-ops` | M18 целиком |
+
+Пачка большая намеренно: цена одного лишнего ревью крупной ветки ниже, чем цена
+цепочки из десяти взаимозависимых веток, каждая из которых требует ребейза
+после мерджа предыдущей. Если пачка растёт сверх ожидаемого — она дробится
+КОММИТАМИ, а не подветками.
+
+### 26.1. Порядок коммитов внутри ветки
+
+Внутри пачки коммиты идут снизу вверх, ровно тем порядком, который раньше
+задавал последовательность PR:
 
 1. ADR + domain types + schema migration;
 2. metadata repositories with tests;
@@ -8218,74 +8252,245 @@ rehash соответствующего файла.
 9. docs/config/examples;
 10. hardening review.
 
-Нельзя сначала добавить все wire messages без рабочего consumer. Каждый PR после
-foundation должен завершать хотя бы один сквозной сценарий.
+Правила, которые раньше действовали «на PR», действуют теперь на коммит:
 
-Отдельное правило: PR, вводящий новый опкод, обязан в том же PR внести его в
-`maxPayloadFor` (`internal/proto/frame.go:33-42`) и в таблицу §3.8; PR, вводящий
-конфиг-ключ, обязан в том же PR внести его в §19.3 и в `restartKeys`/`applyKey`.
-PR, меняющий поведение по умолчанию для существующих установок, обязан обновить
-`Dockerfile`, `docker-compose.yml` и README в себе же.
+- нельзя добавить wire messages без рабочего consumer: коммит с новым опкодом
+  обязан входить в цепочку, доводящую этот опкод до обработчика в той же ветке;
+- коммит, вводящий новый опкод, обязан в себе же внести его в `maxPayloadFor`
+  (`internal/proto/frame.go:33-42`) и в таблицу §3.8;
+- коммит, вводящий конфиг-ключ, обязан в себе же внести его в §19.3 и в
+  `restartKeys`/`applyKey`;
+- коммит, меняющий поведение по умолчанию для существующих установок, обязан
+  обновить `Dockerfile`, `docker-compose.yml` и README в себе же;
+- синхронизация соседних документов `docs/tz` — часть той же ветки, а не уборка
+  после неё.
 
-Пример M12:
+Правило «завершать хотя бы один сквозной сценарий» поднимается с PR на ветку:
+пачка не выносится на ревью, пока её gate не закрыт целиком. Промежуточные
+коммиты внутри ветки сквозного сценария закрывать не обязаны.
 
-```text
-PR0 синхронизация docs/tz: пометка 07-multiuser.md §4-§5 устаревшим,
-    обновление 08-roadmap.md (M12-M14 -> ссылка на документ 10, M15-M18),
-    внесение 10-cloud-drive-spec.md в docs/tz/README.md,
-    документирование CANCELLED = 14 в 02-protocol-v2.md
-PR1 ADR по SQLite-драйверу + internal/domain + миграция 0001 со всеми
-    таблицами §6
-PR2 репозитории users/resources с тестами + импорт users.json
-PR3 UserService, AuthorizationService, UserContext для любой сессии;
-    отзыв сессий и токенов по таблице §7.4
-PR4 v3 handshake: HELLO ProtoVersion=3, CAPABILITIES, ERROR_V3,
-    правило «ничего >= 0x60 в v2-сессию»
-PR5 LIST/STAT v3 поверх resources + подписанный page token
-    (QUOTA v3 в M12 не входит: бит CapQuota и QUOTA_REQUEST/RESPONSE
-    сдаются в M13)
-PR6 DOWNLOAD v3 через UserContext + per-recipient рендеринг EVENT
-PR7 secure bootstrap, --init-admin/--promote, audit_events
-PR8 скелет --fsck, deprecation share_root/checksum-кэша, AdminView,
-    Dockerfile/compose/README
-PR9 isolation integration tests (v3 и v2) + hardening review
-```
+### 26.2. Gate ветки
 
-Пример M13:
+Ветка вливается в `cloud-drive` только когда одновременно:
 
-```text
-PR1 quota repository + reserve/release tests + QUOTA_REQUEST/QUOTA_RESPONSE
-    (0x66/0x67) и бит CapQuota
-PR2 keyed lock manager с context + правило «lock до транзакции»
-PR3 recovery markers, фазы, startup reconciliation, FaultPoint-хуки
-PR4 upload begin + staging + one-shot small upload
-PR5 chunking, resume, synced_bytes, UPLOAD_STATUS
-PR6 atomic commit поверх PR3 + checksum verification + фаза versioned:
-    создание version blob и строки versions при versions.enabled
-PR7 TUI put и transfer queue (последовательная, MaxParallelTransfer = 1)
-PR8 mkdir/move/delete c ClientOperationKey и ExpectedRevision
-PR9 copy and directory operations
-PR10 adversarial/fault/load hardening
-```
+- закрыт gate пачки (ниже у каждой);
+- `go build ./...`, `go vet ./...` и `go test -race ./...` зелены на всех трёх
+  платформах матрицы CI;
+- arch-тест графа импортов (§4.3) проходит;
+- ключи конфигурации ветки присутствуют в §19.3, `restartKeys`/`applyKey` и
+  `config.AdminView`;
+- опкоды ветки присутствуют в §3.8 и `maxPayloadFor`.
 
-Синхронизация соседних документов `docs/tz` — обязательная часть этапа, а не
-уборка после него:
+### B0 — фундамент M12 (сдано)
 
-- `07-multiuser.md` §4–§5 помечаются устаревшими со ссылкой на настоящий
-  документ: распределение `UPLOAD_*` в группу `0x3x` и `ADMIN_USER_*` в
-  `0x5A–0x5F` отменено, последнее конфликтует с уже реализованными
-  `ADMIN_SHUTDOWN`/`ADMIN_RELOAD_USERS` (`internal/proto/proto.go:95-98`);
-- `08-roadmap.md` M12–M14 заменяются ссылкой на §25 настоящего документа,
-  добавляются M15–M18;
-- `10-cloud-drive-spec.md` вносится в таблицу документов `docs/tz/README.md`, а
-  строка `08-roadmap.md` в той же таблице получает диапазон M7–M18;
-- `02-protocol-v2.md` дополняется кодом `CANCELLED = 14` (текст даёт §22);
-- `01-architecture.md`, `03-server-daemon.md` и `09-go-port.md` перестают
-  относить SQLite к «этапу квот» (M13) и ссылаться на трёхэтапную перспективу
-  M12–M14: метабаза и миграция `0001` сдаются на M12, до квот;
-- `docs/interactive/index.html` — таблица роадмапа доводится до семи этапов:
-  это единственный документ вне `docs/tz`, который перечисляет этапы
-  самостоятельно, и он ссылается из обоих README.
+Ветка `feat/m12`, PR #7 и #8 влиты, PR #9 (`feat/m12-pr3-services`) в ревью.
+Состав:
+
+- синхронизация соседних документов `docs/tz`: `07-multiuser.md` §4–§5 помечены
+  устаревшими (распределение `UPLOAD_*` в группу `0x3x` и `ADMIN_USER_*` в
+  `0x5A–0x5F` отменено, последнее конфликтовало с уже реализованными
+  `ADMIN_SHUTDOWN`/`ADMIN_RELOAD_USERS`, `internal/proto/proto.go:95-98`);
+  `08-roadmap.md` M12–M14 заменены ссылкой на §25 и дополнены M15–M18;
+  `10-cloud-drive-spec.md` внесён в таблицу `docs/tz/README.md`, строка
+  `08-roadmap.md` получила диапазон M7–M18; `02-protocol-v2.md` дополнен кодом
+  `CANCELLED = 14`; `01-architecture.md`, `03-server-daemon.md` и
+  `09-go-port.md` перестали относить SQLite к «этапу квот»;
+  `docs/interactive/index.html` доведён до семи этапов;
+- ADR 0001 по выбору SQLite-драйвера по критериям §6.1, `internal/domain`,
+  миграция `0001` со ВСЕМИ таблицами §6, WAL, `busy_timeout`,
+  `PRAGMA foreign_keys` с обязательной обратной вычиткой;
+- репозитории `users`/`resources` с тестами, импорт `users.json`
+  (`--migrate-users`, §21.4);
+- `UserService`, `AuthorizationService`, `UserContext` для ЛЮБОЙ сессии; таблица
+  отзыва «операция → сессии → токены → shares» §7.4; инвариант
+  `LAST_ADMIN_REQUIRED`; `purge` как вторая фаза удаления;
+- раскладка §5.1, per-user `os.Root`, разбор `VirtualPath` §5.3 п. 7–9,
+  математика SCRAM отдельно от wire layout, arch-тест графа импортов §4.3, CI на
+  ветках `feat/**`.
+
+**Переход к одноуровневой схеме.** `feat/m12-pr3-services` вливается в
+`feat/m12`; получившееся состояние и есть ствол — из него создаётся
+`cloud-drive`, после чего `feat/m12` закрывается и B1 ответвляется уже от
+`cloud-drive`. Двухуровневых цепочек больше не создаётся, в `main` при этом
+ничего не уходит.
+
+### B1 — `feat/b1-v3-session`: v3-сессия и остаток M12
+
+Состав (пункты 4, 6–8 и 10–12 раздела M12 §25):
+
+- v3 handshake: `HELLO ProtoVersion=3`, `CAPABILITIES_REQUEST/RESPONSE`
+  (0x60/0x61), биты `CapNamespaces`, `CapEventFilter`, `CapPaging`; `ERROR_V3`
+  (0x6F); `RequestID` первым полем тела каждого v3 control-сообщения; правило
+  «кадрировщик знает все зарезервированные v3-коды и отвечает
+  `FEATURE_UNSUPPORTED` на нереализованные»; правило «сервер не отправляет в
+  v2-сессию кадр с опкодом `>= 0x60` и код ошибки `>= 100`»; детерминированный
+  даунгрейд v3-клиента против v2-сервера либо отказ по
+  `profile.min_proto_version`;
+- `LIST_REQUEST_V3`/`LIST_RESPONSE_V3`, `STAT_REQUEST_V3`/`STAT_RESPONSE_V3`
+  (0x62–0x65) поверх `resources`; подписанный page token и `page_token_key` в
+  metadata DB; объявление `resources` единственным источником истины для
+  структуры дерева, размеров, mtime и checksum (инвариант 14); упразднение
+  файлового checksum-кэша и deprecation `checksum.cache_file`;
+- `DOWNLOAD_*_V3` (0xD0–0xD4) через `UserContext`; существующие v2-обработчики
+  `LIST`/`STAT`/`DOWNLOAD` переводятся на тот же `FileService`;
+- per-recipient рендеринг событий: `EVENT_FS_V3` (0xA8) для v3-сессий, прежний
+  `0x41` для v2-сессий, запрет единого пред-кодированного кадра;
+- secure bootstrap: отказ старта без пользователя с ролью `admin` и
+  `state='active'`; `--init-admin` в интерактивной и неинтерактивной форме
+  (`--login`/`--password-file`, `FSHARE_INIT_ADMIN_PASSWORD_FILE`, stdin),
+  `--init-admin --force`, `--promote <login>`, `--insecure-no-auth` с
+  предупреждением и audit-записью;
+- audit: таблица `audit_events`, append-only через триггеры, индексы, retention
+  `audit.retention_days`, `audit.enabled` как управление только экспортом JSONL;
+- скелет `--fsck [--apply]` с классами расхождений 1–4, 9 и 10 §21.3;
+- deprecation и синхронизация окружения: `server.share_root` с предупреждением и
+  правилом непересечения с `storage.data_root`, `config.AdminView` со всеми
+  ключами §19.3, перевод `Dockerfile`, `docker-compose.yml`, README и примеров
+  конфигурации на `storage.data_root`;
+- isolation integration tests ОТДЕЛЬНО для `ProtoVersion=3` и `ProtoVersion=2` +
+  hardening review.
+
+QUOTA v3 в пачку не входит: бит `CapQuota` и `QUOTA_REQUEST`/`QUOTA_RESPONSE`
+сдаются в B2.
+
+**Gate:** Definition of Done M12 §25 целиком.
+
+### B2 — `feat/b2-mutations`: блокировки, atomic publish, квоты и мутации
+
+Состав:
+
+- keyed lock manager с `context` и правилом «lock всегда до write-транзакции»;
+- recovery markers, их фазы, startup reconciliation и `FaultPoint`-хуки в
+  `storage`;
+- atomic publish §5.4, включая фазу `versioned`: hardlink затираемого содержимого
+  в `versions/`, строка `versions` в той же транзакции, учёт сохраняемой версии в
+  квоте §11.4, ключ `versions.enabled` как единственный переключатель. API, TUI и
+  cleaner версий сюда НЕ входят — они в B5;
+- quota reservation: репозиторий, `reserve`/`release` с тестами,
+  `QUOTA_REQUEST`/`QUOTA_RESPONSE` (0x66/0x67), бит `CapQuota`, полоса квоты в
+  TUI;
+- бит `CapMutations`; `mkdir`/`move`/`copy`/`delete` с `ClientOperationKey`
+  (TTL-кэш идемпотентности в памяти процесса, `limits.idempotency_ttl_s`,
+  `limits.idempotency_entries`) и `ExpectedRevision` у MOVE и DELETE; MOVE —
+  единственный способ переименования; MOVE с `overwrite=true` под recovery marker
+  `Kind=move_overwrite` (§5.5, §9.3, §24.4); операции над каталогами и
+  server-side copy;
+- источником `EVENT_FS` становится сервис мутаций; watcher остаётся детектором
+  внешних изменений с дедупликацией по `(ResourceID, Revision)` и окном не меньше
+  `events.debounce_ms`;
+- TUI F5/F6/F7 (copy/move/mkdir/delete в пределах матрицы §18.1, суженной до
+  M18) и batch `mkdir`/`mv`/`cp`/`rm`.
+
+**Gate:** те пункты DoD M13, которые не требуют upload: `move` и `delete`
+переживают убийство процесса после каждой фазы recovery marker (§24.4) с исходом
+«полностью commit или полностью rollback»; повтор идемпотентной мутации с тем же
+`ClientOperationKey` на новом соединении не применяет мутацию повторно;
+`used_bytes` совпадает с пересчётом по §11.4 после серии copy/delete/overwrite;
+параллельные резервирования не превышают квоту. Полный DoD M13 закрывается в B3.
+
+### B3 — `feat/b3-upload`: upload
+
+Состав:
+
+- бит `CapUpload`; `UPLOAD_BEGIN`, staging, one-shot small upload;
+- chunking, resume, `synced_bytes` как durable-точка возобновления,
+  `UPLOAD_STATUS_REQUEST`/`UPLOAD_STATUS`, `client_upload_key` с частичным
+  уникальным индексом, обязательный `ExpectedChecksum` (`ChecksumAlgo = 2`),
+  cleaner просроченных загрузок;
+- atomic commit поверх маркеров B2 + checksum verification; детерминированный
+  исход двух upload в один путь для каждого `overwrite_mode`;
+- `QUOTA_EXCEEDED` на `UPLOAD_BEGIN`, до передачи байт (§8.2, §11.4);
+- `MaxParallelTransfer = 1`: upload и download идут по control connection (пул
+  transfer-соединений и transfer session token — в B4);
+- TUI put и последовательная transfer queue, batch `put`;
+- классы 5 и 8 §21.3 в `fsck` (осиротевший staging, uploads без staging);
+- adversarial/fault/load hardening.
+
+**Gate:** Definition of Done M13 §25 целиком.
+
+### B4 — `feat/b4-tls`: TLS и production hardening
+
+Состав — раздел M14 §25 целиком: отдельный TLS-listener и разведённая семантика
+`tls.enabled`/`tls.require`, бит `CapTLSRequired` и код `TLS_REQUIRED`; TOFU и
+запрет auto-pin; `tls.autogen_self_signed` с печатью SPKI-pin и ошибкой
+`TLS_MATERIAL_UNAVAILABLE`; раунд `AUTH_PARAMS_REQUEST/RESPONSE` (0xE0/0xE1) с
+per-user KDF-параметрами и фиктивными параметрами для несуществующего логина, и
+только после него — право `user passwd` задавать индивидуальную стоимость KDF;
+пул transfer-соединений и transfer session token (`CapTransferPool`,
+`limits.max_transfer_conns_per_session`, `limits.transfer_token_ttl_s`);
+hardened Docker init; secret-safe logging и ключ `log.format`; удаление ключей
+`server.share_root`, `checksum.cache_file`, `auth.users_file` и флага
+`--share-root`.
+
+**Gate:** Definition of Done M14 §25 целиком.
+
+### B5 — `feat/b5-trash-versions`: корзина, версии и durable recovery
+
+Состав — раздел M15 §25 целиком: корзина как soft delete без перемещения
+содержимого; API и TUI истории версий (список, скачивание версии,
+`VERSION_RESTORE`) поверх сданного в B2 создания version blob; retention-cleaner
+версий и корзины; новые значения `RecoveryRecord.Kind` (`restore`, `purge`,
+`version_delete`) и их фазы; lease/refcount на любой blob и очередь `blob_gc` с
+`storage.gc_interval_ms` и `storage.gc_max_attempts`; offline backup/restore с
+`manifest.json` и обязательным прогоном `fsck`; `fsck` доводится до полного
+перечня классов §21.3; audit expansion.
+
+**Gate:** Definition of Done M15 §25 целиком — это MVP облачного диска.
+
+### B6 — `feat/b6-shares`: публичные ссылки и ACL
+
+Состав — раздел M16 §25 целиком: `shares` DB и сервис; HTTPS-only gateway с
+отказом старта на конфигурации «включён, TLS не терминирует, слушает не на
+loopback»; пароль ссылки PHC-строкой Argon2id и обязательный поток `/unlock` →
+unlock-токен → `/s/{token}` → `/download`; состояния `active`/`suspended`/
+`revoked` и их связь с `user disable`/`enable` и DELETE поддерева; Range
+download; публичный ACL с переспросом authorization service от имени
+`owner_user_id` и неразличимым 404; security headers и запрет писать полный
+token, URI и `Referer` в лог; admin/share audit.
+
+**Gate:** Definition of Done M16 §25 целиком.
+
+### B7 — `feat/b7-journal`: durable change journal
+
+Состав — серверная половина M17: бит `CapChangeJournal`; `CHANGES_GET`/
+`CHANGES_RESPONSE` и `BASELINE_GET`/`BASELINE_RESPONSE` в 0xA0–0xA7 (0xA8 занят
+`EVENT_FS_V3`, 0xA9–0xAF зарезервированы, §3.8); курсор подписывается тем же
+ключом, что и page token; tombstones; `journal_state.min_retained_seq`,
+`baseline_id` и проверка `CURSOR_EXPIRED` по условию §14.6
+(`cursor + 1 < min_retained_seq`) — на этой пачке она проверяется тестовым
+принудительным продвижением границы, естественное истечение появляется с
+включением compaction в B9.
+
+**Gate:** сквозной сценарий против тестового клиента: клиент, отсутствовавший
+несколько дней, догоняет журнал без пропущенных удалений; commit курсора
+переживает падение процесса; `CURSOR_EXPIRED` выдаётся по §14.6 независимо от
+того, кто продвинул `min_retained_seq`. Полный DoD M17 закрывается в B8.
+
+### B8 — `feat/b8-sync`: `fshare-sync`
+
+Состав — клиентская половина M17: новый бинарь `fshare-sync`; локальная БД
+`sync_entries` со всеми колонками §15.3, `sync_intents`, `sync_meta`;
+эмпирическое определение профиля ФС; ignore-правила; трёхстороннее разрешение
+конфликтов; intent-журнал §15.14 и клиентские fault points §24.4; daemon/service
+mode; секция `sync` в §19 с `sync.delete_policy = adopt_local` по умолчанию и
+обязательным dry-run перед первым циклом нового каталога.
+
+**Gate:** Definition of Done M17 §25 целиком.
+
+### B9 — `feat/b9-scale-ops`: масштаб, UX и эксплуатация
+
+Состав — раздел M18 §25 целиком: persistent transfer queue; background copy
+jobs; search/metadata index; Prometheus-эндпоинт, отдающий тот же набор значений,
+что и `ADMIN_STATS_V3_RESPONSE` (`0xCE`/`0xCF`); admin DB maintenance;
+journal/version compaction (с этого момента `CURSOR_EXPIRED` наступает
+естественно); maintenance-режим с заморозкой мутаций кодом
+`OPERATION_IN_PROGRESS` и online backup поверх него; переключение типа панели в
+TUI и полная матрица направлений §18.1; performance tuning; release workflow
+отдельным job в `.github/workflows`; packaging/systemd/installers; документация
+по развёртыванию с обязательным требованием отключить логирование URI для `/s/*`
+на reverse-proxy.
+
+**Gate:** Definition of Done M18 §25 целиком плюс acceptance checklist §28.
 
 ---
 
@@ -8565,33 +8770,29 @@ type LockManager interface {
 
 ---
 
-## 30. Первый практический шаг
+## 30. Текущий практический шаг
 
-Начинать реализацию следует с M12 foundation:
+Фундамент M12 сдан пачкой B0 (§26): соседние документы `docs/tz`
+синхронизированы, SQLite-драйвер выбран по критериям §6.1, миграция `0001` со
+всеми таблицами §6 применяется, `users.json` импортирован с одинаковым для всех
+`auth_iters`, `UserID` и `UserContext` заведены для ЛЮБОЙ аутентифицированной
+сессии независимо от версии протокола, отдельный `os.Root` на home открыт и
+v2-сессия смонтирована на него read-only.
 
-1. синхронизировать соседние документы `docs/tz` (§26, PR0), чтобы отменённые
-   планы кодов не попали в первый же PR;
-2. создать `internal/domain` и `internal/metadata`;
-3. выбрать и зафиксировать SQLite driver по критериям §6.1;
-4. добавить migration `0001` со всеми таблицами §6;
-5. импортировать users.json, заполнив `salt`, `kdf_algo` и `auth_iters`
-   одинаковым для всех значением;
-6. ввести `UserID` и `UserContext` для ЛЮБОЙ аутентифицированной сессии,
-   независимо от версии протокола;
-7. открыть отдельный `os.Root` на home пользователя и смонтировать на него
-   v2-сессию read-only;
-8. объявить `resources` источником истины для list/stat/checksum и упразднить
+Следующий шаг — пачка B1 (`feat/b1-v3-session`), и её внутренний порядок таков:
+
+1. объявить `resources` источником истины для list/stat/checksum и упразднить
    файловый checksum-кэш;
-9. ввести `HELLO ProtoVersion=3` и `CAPABILITIES` с битами `CapNamespaces`,
+2. ввести `HELLO ProtoVersion=3` и `CAPABILITIES` с битами `CapNamespaces`,
    `CapEventFilter`, `CapPaging`;
-10. ввести v3 list/stat/download (`0x62`–`0x65`, `0xD0`–`0xD4`) поверх
-    `resources` и `UserContext`, выдавая листинг страницами с подписанным page
-    token; существующие v2-обработчики `LIST`/`STAT`/`DOWNLOAD` перевести на тот
-    же `FileService`;
-11. перевести рассылку событий на per-recipient рендеринг;
-12. написать isolation integration test — отдельно для `ProtoVersion=3` и для
-    `ProtoVersion=2`;
-13. только после этого начинать upload.
+3. ввести v3 list/stat/download (`0x62`–`0x65`, `0xD0`–`0xD4`) поверх
+   `resources` и `UserContext`, выдавая листинг страницами с подписанным page
+   token; существующие v2-обработчики `LIST`/`STAT`/`DOWNLOAD` перевести на тот
+   же `FileService`;
+4. перевести рассылку событий на per-recipient рендеринг;
+5. закрыть secure bootstrap, audit и скелет `--fsck`;
+6. написать isolation integration test — отдельно для `ProtoVersion=3` и для
+   `ProtoVersion=2`.
 
-Такой порядок не даёт построить upload поверх старой модели общего share root,
-которую затем пришлось бы переписывать.
+Upload не начинается, пока B1 не влита. Такой порядок не даёт построить upload
+поверх старой модели общего share root, которую затем пришлось бы переписывать.
