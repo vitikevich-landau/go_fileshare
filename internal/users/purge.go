@@ -54,7 +54,13 @@ func (s *Service) Purge(ctx context.Context, userID domain.UserID) error {
 			"public resources (§6.2, §7.3)", ErrSystemAccount)
 	}
 
-	err := s.db.Write(ctx, func(tx *sql.Tx) error {
+	release, err := s.locks.acquire(ctx, userID)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	err = s.db.Write(ctx, func(tx *sql.Tx) error {
 		u, err := s.users.ByIDTx(ctx, tx, userID)
 		if err != nil {
 			return err

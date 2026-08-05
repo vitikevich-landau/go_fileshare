@@ -129,7 +129,15 @@ func (s *Service) SetState(ctx context.Context, userID domain.UserID, state doma
 		return fmt.Errorf("%w: state %q is not in the §6.2 dictionary", ErrBadRequest, state)
 	}
 
-	err := s.db.Write(ctx, func(tx *sql.Tx) error {
+	// Замок держится ДО конца отзыва: иначе параллельные enable и disable
+	// коммитятся в одном порядке, а ссылки и сессии приводят в другой (userLocks).
+	release, err := s.locks.acquire(ctx, userID)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	err = s.db.Write(ctx, func(tx *sql.Tx) error {
 		before, err := s.users.ByIDTx(ctx, tx, userID)
 		if err != nil {
 			return err
@@ -172,7 +180,13 @@ func (s *Service) SetRole(ctx context.Context, userID domain.UserID, role domain
 		return fmt.Errorf("%w: role %q is not in the §6.2 dictionary", ErrBadRequest, role)
 	}
 
-	err := s.db.Write(ctx, func(tx *sql.Tx) error {
+	release, err := s.locks.acquire(ctx, userID)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	err = s.db.Write(ctx, func(tx *sql.Tx) error {
 		if err := s.users.SetRole(ctx, tx, userID, role); err != nil {
 			return err
 		}
@@ -200,7 +214,13 @@ func (s *Service) SetPassword(ctx context.Context, userID domain.UserID, in NewS
 		return fmt.Errorf("%w: the system account has no usable password (§6.2)", ErrSystemAccount)
 	}
 
-	err := s.db.Write(ctx, func(tx *sql.Tx) error {
+	release, err := s.locks.acquire(ctx, userID)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	err = s.db.Write(ctx, func(tx *sql.Tx) error {
 		u, err := s.users.ByIDTx(ctx, tx, userID)
 		if err != nil {
 			return err
@@ -235,6 +255,12 @@ func (s *Service) SetQuota(ctx context.Context, userID domain.UserID, quotaBytes
 	if err != nil {
 		return err
 	}
+
+	release, err := s.locks.acquire(ctx, userID)
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	err = s.db.Write(ctx, func(tx *sql.Tx) error {
 		return s.users.SetQuota(ctx, tx, userID, quota)

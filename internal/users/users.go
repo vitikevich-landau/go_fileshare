@@ -284,6 +284,11 @@ type Service struct {
 	tokens   Tokens
 	shares   Shares
 
+	// locks сериализует «транзакция + отзыв» по пользователю: без этого две
+	// команды §7.4 к одной учётке коммитятся в одном порядке, а отзывают в
+	// другом. Подробности — в userLocks.
+	locks *userLocks
+
 	authIters int
 }
 
@@ -322,6 +327,7 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		sessions:  cfg.Sessions,
 		tokens:    cfg.Tokens,
 		shares:    cfg.Shares,
+		locks:     newUserLocks(),
 		authIters: cfg.AuthIters,
 	}
 	if s.sessions == nil {
