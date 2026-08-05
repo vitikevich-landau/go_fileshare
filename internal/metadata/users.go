@@ -57,8 +57,11 @@ type User struct {
 	// QuotaBytes = 0 означает unlimited (§6.2).
 	QuotaBytes int64
 	// UsedBytes и ReservedBytes определены §11.4; никакая другая часть
-	// документа не вправе задавать им иной смысл. Репозиторий их только читает:
-	// пишет их арифметика квот (§11.4), приезжающая с QuotaService.
+	// документа не вправе задавать им иной смысл. Арифметика принадлежит
+	// QuotaService, и репозиторий её не воспроизводит: единственный писатель
+	// здесь — AddUsedBytes, и существует он ровно для той дельты §11.4, чья
+	// операция сдаётся раньше самого QuotaService (передача public-ресурсов при
+	// purge).
 	UsedBytes     int64
 	ReservedBytes int64
 
@@ -133,6 +136,27 @@ const userColumns = `id, login, role, state, kdf_algo, salt, stored_key, auth_it
 // ByID возвращает пользователя по идентификатору.
 func (us *Users) ByID(ctx context.Context, id domain.UserID) (User, error) {
 	row := us.r.QueryRowContext(ctx, `SELECT `+userColumns+` FROM users WHERE id = ?`, int64(id))
+	u, err := scanUser(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return User{}, fmt.Errorf("%w: user %d", ErrNotFound, id)
+	}
+	return u, err
+}
+
+// ByIDTx возвращает пользователя ПО ТОЙ ЖЕ транзакции, в которой его затем
+// меняют.
+//
+// Метод существует по той же причине, что и CountActiveAdmins с параметром tx:
+// §23.2 требует выполнять мутацию и проверку её предусловий в ОДНОЙ транзакции.
+// Операции §7.4 без этого невыразимы — «в какое состояние переводим» зависит от
+// того, в каком пользователь был, а прочитанное мимо транзакции значение к
+// моменту UPDATE уже могло устареть.
+//
+// Читающий handle для этой роли не годится принципиально: он открыт как mode=ro
+// на своём снапшоте WAL и изменений, сделанных внутри чужой незакоммиченной
+// транзакции, не видит вовсе.
+func (us *Users) ByIDTx(ctx context.Context, tx *sql.Tx, id domain.UserID) (User, error) {
+	row := tx.QueryRowContext(ctx, `SELECT `+userColumns+` FROM users WHERE id = ?`, int64(id))
 	u, err := scanUser(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, fmt.Errorf("%w: user %d", ErrNotFound, id)
@@ -293,6 +317,21 @@ VALUES (?, 0, ?, 0, ?)`, int64(userID), string(baselineID), int64(domain.NowMill
 // pending_delete_at_ms: схема требует, чтобы колонка была заполнена РОВНО тогда,
 // когда состояние равно pending_delete.
 //
+// Уже записанный момент перевода СОХРАНЯЕТСЯ. §6.2 определяет колонку как «момент
+// перевода» в pending_delete, то есть момент ПЕРВОГО перевода, а повторный
+// `user delete` над той же записью — законная операция: UserService разрешает
+// перевод в то же состояние, чтобы заново применить таблицу §7.4 после
+// прерванного отзыва. Перезаписывай колонку — и каждая такая попытка отодвигала бы
+// возраст записи, то есть искажала историю и отсрочивала любую обработку по
+// давности.
+//
+// Сохранение выражено в SQL, а не чтением перед записью: SET-выражения SQLite
+// считаются по ИСХОДНЫМ значениям строки, поэтому coalesce берёт прежний момент,
+// когда он был, и текущее время, когда его не было. Читать строку заранее не
+// требуется, и гонки между чтением и записью не возникает. Опираться на то, что
+// колонка пуста у непомеченной записи, позволяет CHECK схемы:
+// (state = 'pending_delete') = (pending_delete_at_ms IS NOT NULL).
+//
 // Сессии, токены и shares метод не трогает: таблица «операция → сессии → токены →
 // shares» §7.4 — это работа UserService, у которого есть реестр сессий. Repository
 // меняет строку, и только её.
@@ -300,12 +339,13 @@ func (us *Users) SetState(ctx context.Context, tx *sql.Tx, id domain.UserID, sta
 	if !state.Valid() {
 		return fmt.Errorf("metadata: set state of user %d: %q is not in the §6.2 dictionary", id, state)
 	}
-	var pendingAt any
-	if state == domain.UserPendingDelete {
-		pendingAt = int64(domain.NowMillis())
-	}
-	return execOne(ctx, tx, id, `UPDATE users SET state = ?, pending_delete_at_ms = ?, updated_at_ms = ?
-WHERE id = ?`, string(state), pendingAt, int64(domain.NowMillis()), int64(id))
+	now := int64(domain.NowMillis())
+	return execOne(ctx, tx, id, `UPDATE users
+SET state = ?,
+    pending_delete_at_ms = CASE WHEN ? = ? THEN coalesce(pending_delete_at_ms, ?) END,
+    updated_at_ms = ?
+WHERE id = ?`,
+		string(state), string(state), string(domain.UserPendingDelete), now, now, int64(id))
 }
 
 // SetRole меняет роль пользователя.

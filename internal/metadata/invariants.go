@@ -165,6 +165,52 @@ func verifyAuthItersAgreement(ctx context.Context, r *sql.DB) error {
 		describeAuthIters(groups))
 }
 
+// VerifyAuthIters сверяет ДЕЙСТВУЮЩЕЕ число итераций с колонкой
+// users.auth_iters всех записей (§6.2 п. 3, §19.4 п. 19).
+//
+// Проверка отличается от verifyAuthItersAgreement предметом, а не строгостью: та
+// сверяет записи между собой, эта — записи с конфигурацией. Одной первой
+// недостаточно, и это не теоретическое рассуждение. До раунда AUTH_PARAMS (§3.3)
+// клиент выводит ключ по числу итераций из HELLO_OK, то есть по действующему
+// auth.pbkdf2_iters, а stored_key посчитан с тем значением, которое лежит в
+// колонке. Стоит их развести — и не входит НИ ОДИН пользователь, притом что
+// записи между собой согласованы идеально, а сервер отвечает AUTH_FAIL, то есть
+// ровно тем же, чем отвечает на неверный пароль. Диагностировать это по логу
+// невозможно; поэтому расхождение обязано остановить старт и назвать оба
+// значения.
+//
+// Исключение системного аккаунта — то же и по той же причине, что в
+// verifyAuthItersAgreement: его значение проставляет миграция, а пароля, которым
+// его можно было бы пересчитать, у него нет.
+//
+// Метод живёт на репозитории, а не в VerifyInvariants, потому что VerifyInvariants
+// проверяет БД саму по себе и конфигурации не видит. Точка контроля — сборка
+// сервиса, который это значение использует: не собравшийся UserService не даёт
+// демону начать обслуживание, что и требует §19.4 п. 19.
+func (us *Users) VerifyAuthIters(ctx context.Context, want int) error {
+	if want <= 0 {
+		return fmt.Errorf("metadata: auth.pbkdf2_iters = %d, must be > 0", want)
+	}
+	groups, err := authItersGroups(ctx, us.r)
+	if err != nil {
+		return err
+	}
+	// Пустая таблица (кроме системного аккаунта) — обычное состояние свежей
+	// установки до --init-admin: сверять не с чем.
+	for _, g := range groups {
+		if g.iters == int64(want) {
+			continue
+		}
+		return fmt.Errorf(
+			"users.auth_iters does not match the configured auth.pbkdf2_iters = %d (%s): before the "+
+				"AUTH_PARAMS round of M14 the client derives its key from the value announced in HELLO_OK, "+
+				"so nobody can authenticate at all; restore the previous auth.pbkdf2_iters or reset every "+
+				"password with `user passwd` (§6.2 п. 3, §19.4 п. 19)",
+			want, describeAuthIters(groups))
+	}
+	return nil
+}
+
 // authItersGroup — одно значение auth_iters и записи, которые его держат.
 type authItersGroup struct {
 	iters       int64

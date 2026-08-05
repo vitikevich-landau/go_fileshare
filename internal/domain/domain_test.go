@@ -408,3 +408,14 @@ func TestMaxNameLenMatchesProto(t *testing.T) {
 			domain.MaxNameLen, proto.MaxNameLen)
 	}
 }
+
+// TestMaxPathLenMatchesProto — то же требование для предела полного VirtualPath
+// (§5.3 п. 7): разбирает путь сервисный слой, а по проводу его читает
+// r.str(proto.MaxPathLen), поэтому больший серверный предел дал бы путь, который
+// сервер принимает, а кадр передать не в состоянии.
+func TestMaxPathLenMatchesProto(t *testing.T) {
+	if domain.MaxPathLen != proto.MaxPathLen {
+		t.Fatalf("domain.MaxPathLen = %d, proto.MaxPathLen = %d: значения разъехались",
+			domain.MaxPathLen, proto.MaxPathLen)
+	}
+}
